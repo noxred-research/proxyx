@@ -1,0 +1,50 @@
+# Session proxy (`proxyx-intercept`). Pass it with `--config examples/intercept.toml`, or
+# install it as /etc/proxyx/intercept.toml. Environment variables are
+# `PROXYX_INTERCEPT_<KEY>` and `__` nests (`PROXYX_INTERCEPT_CA__TYPE`); see
+# docs/configuration.md.
+
+connect_addr = "0.0.0.0:8443"   # HTTP CONNECT and plain-HTTP forward proxy
+socks_addr = "0.0.0.0:1080"
+api_addr = "0.0.0.0:8888"       # /health /metrics
+
+redis_url = "redis://localhost:6379"   # sessions, and the capture stream by default
+# broker_kind = "redis_stream"           # or "kafka", "rabbitmq": see the [kafka] / [rabbitmq] examples below
+
+# Hosts that are never captured, whatever a session asks for.
+no_capture_hosts = []
+
+# The CA that signs intercepted leaf certificates. `generate` creates ca.der and ca.key.der in
+# data_dir on first start, or loads them (development only). The control plane in `generate`
+# mode shares the same files, so both processes must use the same data_dir. For real use,
+# give both sides the same CA with `file` or `env`.
+[ca]
+type = "generate"
+data_dir = "data"
+
+[ratelimit]
+backend = "redis"          # or "limiter" with limiter_addr = "127.0.0.1:39091"
+default_burst = 1000
+default_rpm = 6000
+
+# The captures log. Redis Streams is the default; the control plane must use the same broker.
+# Set `broker_kind = "kafka"` (or "rabbitmq") in the top part of this file, above the first [table];
+# "redpanda" is a deprecated alias of "kafka".
+#
+# [kafka]                           # broker_kind = "kafka"
+# brokers = "kafka-0:9092,kafka-1:9092,kafka-2:9092"
+# topic = "proxyx.captures"
+# compression = "none"             # none, gzip, lz4, snappy, zstd
+# [kafka.sasl]                     # optional: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+# mechanism = "SCRAM-SHA-512"
+# username = "proxyx"
+# password = "..."
+#
+# [rabbitmq]                        # broker_kind = "rabbitmq"
+# url = "amqps://proxyx:...@rabbit.internal:5671/proxyx"
+# exchange = "proxyx.captures"
+# partitions = 12                  # must equal the control plane's
+# [rabbitmq.tls]
+# ca_cert = "/etc/proxyx/secrets/rabbit-ca.pem"
+
+[request_log]
+stream_name = "proxyx:request_log"      # Redis Streams only

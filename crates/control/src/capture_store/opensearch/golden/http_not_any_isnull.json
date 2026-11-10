@@ -1,0 +1,40 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "bool": {
+                "filter": [
+                  {
+                    "exists": {
+                      "field": "tool_call_id"
+                    }
+                  }
+                ],
+                "must_not": [
+                  {
+                    "term": {
+                      "tool_call_id": "a"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "exists": {
+                "field": "tool_call_id"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

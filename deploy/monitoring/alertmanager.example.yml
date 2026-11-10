@@ -1,0 +1,71 @@
+# Example Alertmanager configuration for the ProxyX alerts in prometheus-rules.yml.
+#
+# It routes by `severity` (critical or warning) and groups by alert name, role and the
+# labels that identify what broke. Replace the receivers with your own: the URLs, addresses
+# and keys below are placeholders and do nothing as written.
+#
+# Check:  amtool check-config deploy/monitoring/alertmanager.example.yml
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: team-default
+  group_by: [alertname, role, provider, instance]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Critical alerts page. Repeat more often than the default until someone acts.
+    - matchers:
+        - severity = "critical"
+      receiver: oncall-pager
+      group_wait: 15s
+      repeat_interval: 1h
+      continue: false
+    # Warnings go to a chat channel; they are for working hours.
+    - matchers:
+        - severity = "warning"
+      receiver: team-chat
+      repeat_interval: 12h
+
+inhibit_rules:
+  # A scrape target that is down explains most other alerts of the same instance.
+  - source_matchers:
+      - alertname =~ "ProxyX(Gateway|Warmer|Intercept|ControlAPI|Ingester|Limiter|Edge)Down"
+    target_matchers:
+      - severity =~ "warning|critical"
+    equal: [instance]
+  # With PostgreSQL down the snapshot age rises and config reloads fail for that reason.
+  - source_matchers:
+      - alertname = "ProxyXPostgresDown"
+    target_matchers:
+      - alertname =~ "ProxyXSnapshotStale|ProxyXConfigRejected"
+  # With Redis down the cache drains and the sweeper has nothing sensible to say.
+  - source_matchers:
+      - alertname = "ProxyXRedisDown"
+    target_matchers:
+      - alertname =~ "ProxyXCacheLow|ProxyXCacheBelowMinReady|ProxyXGatewayNoCapacity|ProxyXSweeperRising"
+  # An open provider breaker explains failing creates and refused tunnels for that provider.
+  - source_matchers:
+      - alertname = "ProxyXProviderBreakerOpen"
+    target_matchers:
+      - alertname =~ "ProxyXWarmCreatesFailing|ProxyXGatewayProviderUnavailable"
+    equal: [provider]
+  # An open ingester circuit explains the failing flushes and the commit lag that follow.
+  - source_matchers:
+      - alertname = "ProxyXIngesterCircuitOpen"
+    target_matchers:
+      - alertname =~ "ProxyXIngesterFlushFailing|ProxyXCaptureCommitLagHigh"
+    equal: [table]
+
+receivers:
+  - name: team-default
+  - name: oncall-pager
+    webhook_configs:
+      - url: https://pager.example.org/hooks/proxyx
+        send_resolved: true
+  - name: team-chat
+    webhook_configs:
+      - url: https://chat.example.org/hooks/proxyx
+        send_resolved: true

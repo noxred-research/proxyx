@@ -1,0 +1,33 @@
+# Build output
+/target
+**/target
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/pool.toml
+/intercept.toml
+/control.toml
+*.local.toml
+/secrets
+/data/inventory
+*.pem
+*.key
+*.der
+
+# Python (prober)
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Tooling and editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+perf.data*
+flamegraph.svg

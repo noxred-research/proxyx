@@ -1,0 +1,38 @@
+# Decodo residential (docs read 2026-10-15,
+# https://help.decodo.com/docs/residential-proxy-advanced-parameters):
+#   user-{user}-country-{cc}-city-{city}-session-{id}-sessionduration-{min}
+# Strict: `session_iplock-{id}` replaces `session-{id}`. The docs show
+# `session_iplock-name-sessionduration-60`; the reading that `name` stands for the id
+# is [INFERENCE] until a staging session confirms it.
+
+[[adapter]]
+id = "decodo_res"
+kind = "rotating"
+subtype = "residential"
+host = "gate.decodo.com"
+port = 7000
+user_file = "decodo_user"
+pass_file = "decodo_pass"
+user = "user-{base_user}{opts}"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city-{v}"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+strict_frag = "-session_iplock-{v}"
+
+[[adapter.option]]
+name = "ttl"
+to = "user"
+frag = "-sessionduration-{v}"
+max = 1440

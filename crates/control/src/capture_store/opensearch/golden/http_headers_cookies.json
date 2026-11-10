@@ -1,0 +1,58 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "terms": {
+                "source_id": [
+                  "s1",
+                  "s2"
+                ]
+              }
+            },
+            {
+              "term": {
+                "source": "crawler"
+              }
+            },
+            {
+              "wildcard": {
+                "mime_type": {
+                  "case_insensitive": true,
+                  "value": "*json*"
+                }
+              }
+            },
+            {
+              "term": {
+                "request_sends_cookies": true
+              }
+            },
+            {
+              "term": {
+                "response_sets_cookies": false
+              }
+            },
+            {
+              "term": {
+                "request_header_kv": "x-trace:abc"
+              }
+            },
+            {
+              "term": {
+                "response_header_kv": "server:nginx"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

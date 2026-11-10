@@ -1,0 +1,22 @@
+# VPN egress sidecar: a VPN tunnel (WireGuard, OpenVPN or Tailscale) with a SOCKS5 proxy
+# (microsocks) in front of it. Point a static inventory entry of the `vpn-pool` adapter
+# at its SOCKS5 port to leave the internet from the VPN exit. See entrypoint.egress.sh for the
+# environment variables.
+#
+#   docker build -f docker/Dockerfile.egress -t proxyx-egress:dev docker
+#   docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
+#     -e VPN_TYPE=wireguard -e VPN_CONFIG=/vpn/wg0.conf -v ./wg0.conf:/vpn/wg0.conf:ro \
+#     proxyx-egress:dev
+
+FROM tailscale/tailscale:stable AS tailscale
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates iproute2 iptables iputils-ping microsocks openresolv openvpn wireguard-tools \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscaled /usr/local/bin/
+COPY entrypoint.egress.sh /usr/local/bin/entrypoint.egress.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.egress.sh
+EXPOSE 1080
+ENTRYPOINT ["/usr/local/bin/entrypoint.egress.sh"]

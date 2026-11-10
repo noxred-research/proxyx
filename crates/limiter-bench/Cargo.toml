@@ -1,0 +1,13 @@
+[package]
+name = "proxyx-limiter-bench"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "limiter-bench"
+path = "src/main.rs"
+
+[dependencies]
+limiter-client = { path = "../limiter-client", package = "proxyx-limiter-client" }

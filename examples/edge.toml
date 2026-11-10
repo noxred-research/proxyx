@@ -1,0 +1,154 @@
+# `proxyx edge`: a self-hosted forward proxy over this machine's IP addresses. Pass it
+# with `proxyx edge --config examples/edge.toml`, or install it as /etc/proxyx/edge.toml
+# (see deploy/systemd/proxyx-edge.service). `proxyx edge --check --config FILE`
+# validates it, including that every address named below is assigned to this host.
+# SIGHUP reloads it without dropping open tunnels. Every key is documented in
+# docs/configuration.md and docs/edge-proxy.md.
+#
+# The addresses here are documentation addresses (192.0.2.0/24, 2001:db8::/32): replace
+# them with the IPs of your machine. `examples/edge-loopback.toml` runs anywhere.
+
+[server]
+ops_listen = "127.0.0.1:9180"       # /metrics /healthz /readyz
+default_pool = "exits"              # used when nothing more specific picks a pool
+max_connections = 20000
+max_connections_per_src = 500       # one client address may hold at most this many
+
+[dns]
+nameservers = ["1.1.1.1", "9.9.9.9"]   # empty: the system resolver
+ip_version = "prefer_ipv4"             # prefer_ipv6, ipv4_only, ipv6_only
+
+[timeouts]
+connect = "10s"
+idle = "10m"          # a tunnel with no byte for this long is closed
+total = "0"           # longest one request or tunnel may last; 0 is no limit
+
+# Keepalive and limits on one request.
+[tcp.client]
+keepalive_time = "60s"
+[tcp.upstream]
+keepalive_time = "60s"
+
+# Circuit breakers (parents and egress addresses) and the active health checks.
+[breaker.parent]
+failure_threshold = 3
+open_duration = "30s"
+[breaker.egress]
+failure_threshold = 3
+open_duration = "30s"
+[health]
+interval = "10s"
+# parent_target = "1.1.1.1:443"      # each probe opens a tunnel to this through every parent
+
+[access_log]
+output = "/var/log/proxyx-edge/access.log"   # or "stdout", "stderr", "off"
+format = "squid"                              # "combined" or "json" also work
+
+# --- listeners ---------------------------------------------------------------------------
+# One port serves HTTP proxy, CONNECT and SOCKS4/4a/5, told apart by the first byte.
+[[listener]]
+name = "public"
+listen = "0.0.0.0:3128"
+auth = "users"
+udp = true                       # SOCKS5 UDP ASSOCIATE
+
+# A second listener that always leaves from one address (3proxy `proxy -e`), for a
+# customer that needs a fixed exit IP, with a source-address login instead of a password.
+[[listener]]
+name = "fixed-exit"
+listen = "192.0.2.10:3129"
+auth = "none"
+pool = "primary"
+
+# --- egress addresses ----------------------------------------------------------------------
+[[pool]]
+name = "primary"
+addresses = ["192.0.2.10"]
+strategy = "first"
+
+[[pool]]
+name = "exits"
+# Every address on eth0 that can be an exit: no loopback, link-local or multicast.
+interface = "eth0"
+exclude = ["192.0.2.10/32"]      # keep the management address out of the rotation
+strategy = "round_robin"         # random, least_connections, sticky, first
+
+[[pool]]
+name = "v6"
+# A whole routed IPv6 block: every connection draws a fresh address from it.
+# Needs `ip route add local 2001:db8:1234::/64 dev lo` on the host.
+prefixes = ["2001:db8:1234::/64"]
+strategy = "sticky"              # the same session id keeps the same address
+
+# --- users ---------------------------------------------------------------------------------
+[auth]
+login_options = true             # alice-sid-job42, alice-pool-v6, alice-ip-3
+users_file = "/etc/proxyx/edge.htpasswd"   # user:hash lines (bcrypt, apr1, sha-crypt, argon2)
+
+[[user]]
+name = "alice"                   # password comes from users_file
+groups = ["staff"]
+pool = "exits"
+allowed_pools = ["v6", "primary"]
+allow_ip_select = true
+max_connections = 200
+
+[[user]]
+name = "guest"
+password_hash = "$2y$10$replace.with.the.output.of.htpasswd.-nbB.guest.secret"
+max_connections = 5
+
+# --- access rules: the first match wins, no match is a deny ---------------------------------
+[[rule]]
+name = "no-mail"
+action = "deny"
+when = { port = ["25", "465", "587"] }
+
+[[rule]]
+name = "staff"
+action = "allow"
+when = { group = ["staff"] }
+
+[[rule]]
+name = "guests-web"
+action = "allow"
+when = { user = ["guest"], port = ["80", "443"] }
+
+# Private networks stay unreachable unless a rule says allow_internal = true.
+
+# --- per-rule egress (squid tcp_outgoing_address) -------------------------------------------
+[[egress]]
+when = { domain = [".example.net"] }
+address = "192.0.2.11"           # this destination always sees one fixed IP
+
+# --- limits: every matching rule applies -----------------------------------------------------
+[[limit]]
+name = "guest-bandwidth"
+when = { user = ["guest"] }
+bandwidth_down = "2MB"           # bytes per second; "10Mbit/s", "512KiB" also work
+bandwidth_up = "1MB"
+
+[[limit]]
+name = "per-user-rate"
+when = { authenticated = true }
+scope = "user"
+request_rate = "600/min"
+
+# --- header policy for forwarded HTTP ---------------------------------------------------------
+[http]
+forwarded_for = "delete"         # on, off, delete, truncate, transparent
+via = false
+
+# --- parent proxies (optional) -----------------------------------------------------------------
+# [[parent]]
+# name = "upstream-a"
+# type = "http"                  # or "socks5"
+# address = "gw.example.org:3128"
+# username = "relay"
+# password = "secret"
+# weight = 3
+#
+# [[route]]
+# when = { domain = [".blocked-here.example"] }
+# route = "parent"               # never direct for these destinations
+# parents = ["upstream-a"]

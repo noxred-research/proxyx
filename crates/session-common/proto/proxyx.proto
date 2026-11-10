@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package proxyx;
+
+// Wire envelope for messages on the captures topic / Redis stream.
+message RequestLogMessage {
+  oneof kind {
+    CapturedRequest request = 1;
+    SessionEndEvent session_end = 2;
+    CapturedWsMessage ws_message = 3;
+  }
+}
+
+message Header {
+  string name = 1;
+  string value = 2;
+}
+
+// Captured HTTP exchange. Bodies are raw captured bytes.
+message CapturedRequest {
+  // UUIDv7 raw 16 bytes. Idempotency key against the destination row.
+  bytes event_id = 1;
+  // Session UUID raw 16 bytes.
+  bytes session_id = 2;
+  string proxy_id = 3;
+  string org_id = 4;
+  string source = 5;
+  // Optional source_id; empty string means "none".
+  string source_id = 6;
+  // Capture wall-clock time, nanoseconds since UNIX epoch.
+  int64 timestamp_nanos = 7;
+  // (peerdb_version field removed; API mints its own `inserted_at`
+  // on insert as the ReplacingMergeTree version key.)
+  reserved 8;
+
+  string method = 9;
+  string scheme = 10;
+  string host = 11;
+  uint32 port = 12;
+  string path = 13;
+
+  repeated Header request_headers = 14;
+  bytes request_body = 15;
+  uint64 request_body_size = 16;
+  bool request_body_truncated = 17;
+
+  uint32 response_status = 18;
+  repeated Header response_headers = 19;
+  bytes response_body = 20;
+  uint64 response_body_size = 21;
+  bool response_body_truncated = 22;
+
+  uint64 duration_ms = 23;
+  uint64 ratelimit_wait_ms = 24;
+}
+
+// Emitted by the API when a session is deleted.
+message SessionEndEvent {
+  bytes session_id = 1;
+  string org_id = 2;
+  string source = 3;
+  string source_id = 4;
+  int64 timestamp_nanos = 5;
+}
+
+
+// WebSocket message captured from a MITM-intercepted upgrade.
+//
+// One row per logical (reassembled, decompressed) protocol message — not per
+// frame. Linked back to the parent `101 Switching Protocols` row in
+// `http_captures` via `parent_event_id`. Control frames (PING/PONG) are not
+// emitted unless the proxy is configured to capture them; CLOSE always is.
+message CapturedWsMessage {
+  // UUIDv7 raw 16 bytes. Idempotency key per message.
+  bytes event_id = 1;
+  // UUIDv7 raw 16 bytes — `event_id` of the 101 row in `http_captures`.
+  bytes parent_event_id = 2;
+  // Session UUID raw 16 bytes.
+  bytes session_id = 3;
+  string proxy_id = 4;
+  string org_id = 5;
+  string source = 6;
+  // Optional source_id; empty string means "none".
+  string source_id = 7;
+  // Capture wall-clock time, nanoseconds since UNIX epoch. Set when the
+  // logical message is fully reassembled (FIN frame).
+  int64 timestamp_nanos = 8;
+
+  WsDirection direction = 9;
+  WsOpcode opcode = 10;
+
+  // Reassembled, decompressed payload. Empty when payload_size == 0.
+  bytes payload = 11;
+  // Decompressed size BEFORE truncation. payload.len() == min(payload_size,
+  // max_ws_payload_capture).
+  uint64 payload_size = 12;
+  bool payload_truncated = 13;
+  // RSV1 was set on the leading frame (permessage-deflate). Indicates the
+  // wire frames were compressed; payload here is already inflated.
+  bool was_compressed = 14;
+
+  // Set only when opcode == WS_OPCODE_CLOSE. Per RFC 6455 §5.5.1.
+  uint32 close_code = 15;
+  string close_reason = 16;
+
+  // Hoisted from the parent for query convenience. Same value as the 101
+  // row's `host` in `http_captures`.
+  string host = 17;
+}
+
+enum WsDirection {
+  WS_DIRECTION_UNSPECIFIED = 0;
+  WS_DIRECTION_C2S = 1;  // client → server
+  WS_DIRECTION_S2C = 2;  // server → client
+}
+
+enum WsOpcode {
+  WS_OPCODE_UNSPECIFIED = 0;
+  WS_OPCODE_TEXT = 1;
+  WS_OPCODE_BINARY = 2;
+  WS_OPCODE_CLOSE = 8;
+  WS_OPCODE_PING = 9;   // captured only when capture_ws_control_frames=true
+  WS_OPCODE_PONG = 10;  // captured only when capture_ws_control_frames=true
+}

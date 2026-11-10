@@ -1,0 +1,18 @@
+# This machine's own IP addresses as static inventory. There is no upstream proxy: a
+# tunnel is opened straight to the target from the local address named by the `host` of
+# an inventory entry, bound as the source address of the socket. The entry's `ip` is the
+# exit address the verification expects (the same address on a plain server, the public
+# address of the 1:1 NAT or elastic IP on a cloud VM). `port` is not used (write 0), and
+# the entry takes no `credentials`. Every address in the inventory must be assigned to
+# an interface of the machine that runs the gateway. See examples/inventory.toml and
+# docs/providers.md.
+#
+# The adapter file has no `host`, `port`, credential or option keys: all of them describe
+# an upstream proxy and are refused for `scheme = "local"`. `allowed_ports`,
+# `max_conns_per_ip` and `echo_url` work as for any adapter.
+
+[[adapter]]
+id = "local"
+kind = "static"
+subtype = "datacenter"
+scheme = "local"

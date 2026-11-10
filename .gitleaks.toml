@@ -1,0 +1,33 @@
+# Secret-scan configuration (https://github.com/gitleaks/gitleaks). Run:
+#   gitleaks detect --no-git --source . --config .gitleaks.toml --redact -v
+title = "proxyx"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "proxyx-api-key"
+description = "ProxyX control-plane API key"
+regex = '''pxk_[A-Za-z0-9_-]{43}'''
+
+[[rules]]
+id = "proxyx-org-key"
+description = "ProxyX pool gateway org key"
+regex = '''\bak_[A-Za-z0-9_-]{43}\b'''
+
+[allowlist]
+description = "throwaway test fixtures"
+paths = ['''(^|/)tests?/fixtures/''']
+# RFC 6455 sample WebSocket key, documentation placeholders and inventory credential file names.
+regexes = [
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+  '''ak_YOUR_KEY''',
+  '''ak_EXAMPLE_ONLY_NOT_A_REAL_KEY''',
+  '''oxylabs_isp_203-0-113-50''',
+  # Synthetic keys of the bench and MCP test fixtures.
+  '''ak_benchbenchbenchbenchbenchbenchbenchbench000''',
+  '''ak_A{43}''',
+  '''ak_orgkeyorgkeyorgkeyorgkeyorgkey0123456789abc''',
+  '''ak_newkeynewkeynewkeynewkeynewkey0123456789xyz''',
+  '''llm-api-key-0123456789''',
+]

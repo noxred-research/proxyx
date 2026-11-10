@@ -1,0 +1,124 @@
+{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "org_id": "org-1"
+          }
+        },
+        {
+          "bool": {
+            "minimum_should_match": 1,
+            "should": [
+              {
+                "range": {
+                  "status_code": {
+                    "lt": 404
+                  }
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "status_code": 404
+                      }
+                    },
+                    {
+                      "range": {
+                        "timestamp": {
+                          "lt": 1700000000123
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "status_code": 404
+                      }
+                    },
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "range": {
+                        "session_offset": {
+                          "lt": 3
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "status_code": 404
+                      }
+                    },
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "term": {
+                        "session_offset": 3
+                      }
+                    },
+                    {
+                      "range": {
+                        "id": {
+                          "lt": "018f0000-0000-7000-8000-000000000001"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "search_after": [
+    404,
+    1700000000123,
+    3,
+    "018f0000-0000-7000-8000-000000000001"
+  ],
+  "sort": [
+    {
+      "status_code": {
+        "order": "desc"
+      }
+    },
+    {
+      "timestamp": {
+        "order": "desc"
+      }
+    },
+    {
+      "session_offset": {
+        "order": "desc"
+      }
+    },
+    {
+      "id": {
+        "order": "desc"
+      }
+    }
+  ]
+}

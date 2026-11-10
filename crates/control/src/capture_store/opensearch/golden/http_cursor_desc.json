@@ -1,0 +1,166 @@
+{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "org_id": "org-1"
+          }
+        },
+        {
+          "bool": {
+            "minimum_should_match": 1,
+            "should": [
+              {
+                "range": {
+                  "timestamp": {
+                    "lt": 1700000900000
+                  }
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000900000
+                      }
+                    },
+                    {
+                      "range": {
+                        "session_offset": {
+                          "lt": 9
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000900000
+                      }
+                    },
+                    {
+                      "term": {
+                        "session_offset": 9
+                      }
+                    },
+                    {
+                      "range": {
+                        "id": {
+                          "lt": "018f0000-0000-7000-8000-000000000001"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "bool": {
+            "minimum_should_match": 1,
+            "should": [
+              {
+                "range": {
+                  "timestamp": {
+                    "gt": 1700000000123
+                  }
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "range": {
+                        "session_offset": {
+                          "gt": 7
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "term": {
+                        "session_offset": 7
+                      }
+                    },
+                    {
+                      "range": {
+                        "id": {
+                          "gt": "018f0000-0000-7000-8000-000000000001"
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "term": {
+                        "session_offset": 7
+                      }
+                    },
+                    {
+                      "term": {
+                        "id": "018f0000-0000-7000-8000-000000000001"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "search_after": [
+    1700000900000,
+    9,
+    "018f0000-0000-7000-8000-000000000001"
+  ],
+  "sort": [
+    {
+      "timestamp": {
+        "order": "desc"
+      }
+    },
+    {
+      "session_offset": {
+        "order": "desc"
+      }
+    },
+    {
+      "id": {
+        "order": "desc"
+      }
+    }
+  ]
+}

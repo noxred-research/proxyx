@@ -1,0 +1,42 @@
+# A `proxyx edge` configuration that runs on any Linux machine with no setup: the whole
+# 127.0.0.0/8 range is local, so 127.0.0.2, 127.0.0.3 and 127.0.0.4 work as three exit
+# addresses without `ip addr add`. Use it to try the proxy and to see the egress
+# selection:
+#
+#   proxyx edge --config examples/edge-loopback.toml
+#   curl -x http://alice:wonderland@127.0.0.1:3128 http://origin.test:8080/ip
+#   curl -x http://alice-sid-job1:wonderland@127.0.0.1:3128 http://origin.test:8080/ip
+#
+# `origin.test` is mapped to 127.0.0.1 below (and any server on 127.0.0.1:8080 that prints
+# the address that connected to it shows which exit was used). Loopback destinations
+# are private, so the last rule opts them in: never do that on a public proxy.
+
+[server]
+ops_listen = "127.0.0.1:9180"
+default_pool = "loopback"
+
+[dns.hosts]
+"origin.test" = ["127.0.0.1"]
+
+[[listener]]
+name = "main"
+listen = "127.0.0.1:3128"
+auth = "users"
+
+[auth]
+login_options = true
+
+[[user]]
+name = "alice"
+password = "wonderland"
+allowed_pools = ["loopback"]
+
+[[pool]]
+name = "loopback"
+addresses = ["127.0.0.2", "127.0.0.3", "127.0.0.4"]
+strategy = "sticky"      # alice-sid-<id> keeps one address; without a sid the user name decides
+
+[[rule]]
+name = "demo"
+action = "allow"
+allow_internal = true

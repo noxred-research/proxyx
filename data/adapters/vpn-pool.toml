@@ -1,0 +1,16 @@
+# A local SOCKS5 egress proxy, for example one `docker/entrypoint.egress.sh` sidecar per VPN
+# exit (a SOCKS5 server listening on SOCKS_PORT behind a WireGuard, OpenVPN or Tailscale
+# tunnel). Each static inventory entry names the sidecar's host and port, and a
+# `credentials` file in the secrets directory holding `username:password` when the sidecar
+# sets SOCKS_USER and SOCKS_PASS. See examples/inventory.toml.
+# There is no public-address rule: these addresses are private by design, so this adapter
+# omits `public_only`. Use it only for upstreams you operate.
+
+[[adapter]]
+id = "vpn-pool"
+kind = "static"
+subtype = "datacenter"
+scheme = "socks5"
+credentials_optional = true
+user = "{base_user}"
+pass = "{base_pass}"

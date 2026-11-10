@@ -1,0 +1,17 @@
+[package]
+name = "proxyx-dial"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+common = { path = "../pool-common", package = "proxyx-pool-common" }
+libc.workspace = true
+nix.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

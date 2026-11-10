@@ -1,0 +1,51 @@
+[Unit]
+Description=ProxyX limiter: in-memory token buckets for the session proxy
+Documentation=https://github.com/noxred-research/proxyx/blob/main/docs/configuration.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=proxyx
+Group=proxyx
+ExecStart=/usr/local/bin/proxyx limiter ${PROXYX_LIMITER_ADDR}
+KillSignal=SIGTERM
+# The limiter exits at once on SIGTERM; its state is not durable by design.
+TimeoutStopSec=10
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+# Defaults for the listen address and the operations port (/healthz, /readyz,
+# /metrics); override them, and set the other PROXYX_LIMITER_* settings, in
+# /etc/proxyx/limiter.env.
+Environment=PROXYX_LIMITER_ADDR=127.0.0.1:39091
+Environment=PROXYX_LIMITER_METRICS_ADDR=127.0.0.1:39092
+EnvironmentFile=-/etc/proxyx/limiter.env
+
+# Hardening: the role needs the network and its own files, nothing else.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

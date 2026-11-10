@@ -1,0 +1,43 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "minimum_should_match": 1,
+          "should": [
+            {
+              "bool": {
+                "must_not": [
+                  {
+                    "exists": {
+                      "field": "account_id"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "bool": {
+                "filter": [
+                  {
+                    "match_none": {}
+                  },
+                  {
+                    "exists": {
+                      "field": "account_id"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

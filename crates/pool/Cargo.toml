@@ -1,0 +1,31 @@
+[package]
+name = "proxyx-pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+
+[dependencies]
+anyhow.workspace = true
+api = { path = "../pool-api", package = "proxyx-pool-api" }
+common = { path = "../pool-common", package = "proxyx-pool-common" }
+gateway = { path = "../gateway", package = "proxyx-gateway" }
+provider = { path = "../provider", package = "proxyx-provider" }
+store = { path = "../store", package = "proxyx-store" }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+verify = { path = "../verify", package = "proxyx-verify" }
+warmer = { path = "../warmer", package = "proxyx-warmer" }
+[dev-dependencies]
+base64.workspace = true
+parking_lot.workspace = true
+redis.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+uuid.workspace = true

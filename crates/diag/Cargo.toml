@@ -1,0 +1,30 @@
+[package]
+name = "proxyx-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-check framework: report model, renderers and the generic dependency checks"
+
+[lints]
+workspace = true
+
+# A light crate on purpose: the session proxy links BoringSSL and the control plane
+# links OpenSSL, so nothing here may pull in either of them (and so no dependency on
+# the control, edge or intercept crates). Both sides reuse this one.
+[dependencies]
+base64.workspace = true
+rcgen.workspace = true
+redis.workspace = true
+reqwest.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+proxyx-db = { path = "../db" }
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

@@ -1,0 +1,119 @@
+# Global policy with every default spelled out. Loaded from `<data_dir>/policies`.
+# Format: docs/policies.md. Every key shown here is the default; the file is the reference.
+# Durations are seconds or `30s`, `5m`, `2h`, `1d`.
+#
+# Precedence, field by field: global < route_class < org. An org value never
+# exceeds a `limits` or `cost` ceiling.
+
+[[policy]]
+name = "global"
+scope = "global"
+
+# Kinds in preference order. An org policy may change the order.
+kinds = ["static", "rotating"]
+# Provider order. Unset (the default): every configured provider.
+# providers = ["oxylabs_isp"]
+# Regions in fallback order. Required; there is no default.
+regions = ["fr", "de"]
+# Only "shared" is accepted. For a unit that one org alone may use, set a customer upstream.
+pool = "shared"
+
+# Per region. Rotating: ready sessions. Static: healthy leasable IPs.
+min_ready = 10
+# Defaults that follow min_ready (so an org that changes min_ready keeps them in step):
+# max_ready = 2 x min_ready (20)
+# low_watermark = min_ready / 2 (5)
+# Ready below low_watermark for this long raises the cache-low alert.
+low_for = "2m"
+
+lease_ttl = "10m"
+lease_wait = "3s"
+create_deadline = "6s"
+rest_after_release = "30s"
+# org | target | connection
+sticky_scope = "org"
+# allow | deny, when every reputation scorer is down and no cached score exists.
+on_score_unavailable = "allow"
+
+# Unset by default (no cap):
+# orgs_hard = 2
+# max_tunnels_per_org = 200
+# Unset by default (80% of the provider limit):
+# max_conns_per_ip = 40
+
+# Overrides of min_ready per region (exact region, else country). Empty by default.
+[policy.min_ready_by_region]
+# "fr/paris" = 20
+
+[policy.criteria]
+max_risk = 75
+max_ttfb_ms = 3000
+max_load_ms = 10000
+min_success = 0.66
+browser_sample = 0.05
+verdict_max_age = "24h"
+
+# What happens when nothing can be leased. Static IPs cannot be created.
+[policy.on_empty]
+static = "wait"
+rotating = "create"
+
+# Block rules.
+[policy.block]
+target_cooldown = "30m"
+escalate_targets = 3
+escalate_signals = 5
+signal_window = "30m"
+max_cooldown_share = 0.5
+
+# Static IPs: rest, quarantine, re-checks and the replacement rule.
+[policy.static]
+cooldown = "15m"
+quarantine_after = 3
+retest_every = "6h"
+recheck_every = "30m"
+replace_after_checks = 3
+replace_min_sources = 2
+replace_blocked_share = 0.6
+replace_quarantine_for = "24h"
+
+# SIM boxes (static subtype mobile_box).
+[policy.mobile_box]
+rotate_attempts = 3
+rotate_timeout = "120s"
+rotate_min_interval = "60s"
+rotate_per_hour = 6
+drain_wait = "60s"
+offline_after = "60s"
+
+# Rotating sessions.
+[policy.rotating]
+ready_ttl = "30m"
+# max_age: unset (80% of the provider maximum).
+min_remaining = "5m"
+# drain | reuse_same_org
+after_release = "drain"
+refill_concurrency = 2
+refill_rate = 10
+headroom = 0
+keepalive = "30s"
+recheck_every = "5m"
+
+# IP changes and drops per hour before a session drains.
+[policy.rotating.stability]
+changes_per_hour = 2
+drops_per_hour = 3
+
+# Spend. Rotating: max_gb_per_day, max_creates_per_hour. Static: fair_use_gb_per_ip_month,
+# which is per IP and shared by every org on the IP, so only global and route_class
+# policies may set it (an org policy that sets it is refused).
+[policy.cost]
+max_gb_per_day = 5
+max_creates_per_hour = 600
+fair_use_gb_per_ip_month = 80
+
+# Ceilings that no org value can exceed. None by default.
+[policy.limits]
+# max_gb_per_day = 20
+# max_creates_per_hour = 1200
+# fair_use_gb_per_ip_month = 200

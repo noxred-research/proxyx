@@ -1,0 +1,48 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "len.request_body": {
+                        "gt": 10
+                      }
+                    }
+                  },
+                  {
+                    "bool": {
+                      "must_not": [
+                        {
+                          "term": {
+                            "len.request_body": 20
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "range": {
+                "duration_ms": {
+                  "lt": 1000
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

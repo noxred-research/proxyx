@@ -1,0 +1,32 @@
+# Pages the light probe and the browser prober load through a candidate.
+# Targets of a region are: global, then its country, then its city, each URL
+# once. `global` is the baseline every region gets; each served country adds
+# its own Google site, so an IP is also tried against the site its users see
+# (not every country is `google.<cc>`: gb is google.co.uk, jp google.co.jp).
+# Format: docs/providers.md. Only http(s) URLs.
+#
+# The prober's browsers reach the internet through the gateway's probe
+# listener, which opens only the hosts of these pages plus `extra_hosts` (and
+# their subdomains), on ports 80 and 443: a probe token that leaks from a
+# browser process is not an open proxy. `extra_hosts` are the hosts a
+# page needs that are not its own: Google sends EU visitors to
+# consent.google.com and serves the page's assets from gstatic.com. Any other
+# host is refused (`destination_denied`), so a page whose load needs a new host
+# fails until it is listed here.
+
+global = ["https://www.google.com/"]
+extra_hosts = ["google.com", "gstatic.com"]
+
+[region]
+us = ["https://www.google.com/"]
+gb = ["https://www.google.co.uk/"]
+de = ["https://www.google.de/"]
+fr = ["https://www.google.fr/"]
+nl = ["https://www.google.nl/"]
+es = ["https://www.google.es/"]
+it = ["https://www.google.it/"]
+ca = ["https://www.google.ca/"]
+au = ["https://www.google.com.au/"]
+jp = ["https://www.google.co.jp/"]
+br = ["https://www.google.com.br/"]
+in = ["https://www.google.co.in/"]

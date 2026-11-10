@@ -1,0 +1,42 @@
+# Bright Data (docs read 2026-10-15, https://docs.brightdata.com/proxy-networks/config-options):
+#   brd-customer-{id}-zone-{zone}[-country-{cc}][-session-{id}][-const]   static: -ip-{ip}
+# The gateway host and port are the public super proxy.
+
+[[adapter]]
+id = "brightdata_res"
+kind = "rotating"
+subtype = "residential"
+host = "brd.superproxy.io"
+port = 33335
+user_file = "bd_res_user"
+pass_file = "bd_res_pass"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+max_len = 32
+
+[[adapter.option]]
+name = "strict"
+to = "user"
+frag = "-const"
+
+[[adapter]]
+id = "brightdata_isp"
+kind = "static"
+subtype = "isp"
+host = "brd.superproxy.io"
+port = 33335
+user_file = "bd_isp_user"
+pass_file = "bd_isp_pass"
+
+[[adapter.option]]
+name = "ip"
+to = "user"
+frag = "-ip-{v}"

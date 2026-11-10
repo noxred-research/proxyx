@@ -1,0 +1,18 @@
+# Oxylabs ISP rotating entry on port 8000: `-country-{CC}` picks the pool by region.
+# https://developers.oxylabs.io/products/proxies/dedicated-isp-proxies/self-service/proxy-rotation
+
+[[adapter]]
+id = "oxylabs_isp_pool"
+kind = "static"
+subtype = "isp"
+host = "disp.oxylabs.io"
+port = 8000
+user_file = "oxylabs_isp_user"
+pass_file = "oxylabs_isp_pass"
+user = "user-{base_user}{opts}"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+case = "upper"

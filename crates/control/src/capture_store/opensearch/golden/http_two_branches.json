@@ -1,0 +1,58 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "minimum_should_match": 1,
+          "should": [
+            {
+              "bool": {
+                "filter": [
+                  {
+                    "wildcard": {
+                      "host": {
+                        "case_insensitive": true,
+                        "value": "*stripe*"
+                      }
+                    }
+                  },
+                  {
+                    "range": {
+                      "status_code": {
+                        "gte": 500
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "bool": {
+                "filter": [
+                  {
+                    "wildcard": {
+                      "path": {
+                        "case_insensitive": true,
+                        "value": "*/api*"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "status_code": 429
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

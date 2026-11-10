@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/noxred-research/proxyx/security/advisories/new
+    about: Report vulnerabilities privately. Never open a public issue for one. See SECURITY.md.
+  - name: Report a conduct concern
+    url: https://github.com/noxred-research/proxyx/security/advisories/new
+    about: Private report to the maintainers; start the title with "Conduct report:". See CODE_OF_CONDUCT.md.
+  - name: Read the documentation
+    url: https://github.com/noxred-research/proxyx/blob/main/docs/README.md
+    about: Design, integrations, operations and runbooks.

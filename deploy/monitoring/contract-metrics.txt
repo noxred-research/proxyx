@@ -1,0 +1,6 @@
+# Metric names that alert rules and the dashboard may use before they appear in
+# docs/metrics/*.md. ci/check-alert-metrics.py accepts a name when it is documented there
+# or listed here. Remove a line once the name is documented in docs/metrics.
+#
+# Session proxy (crates/session-common/src/metrics.rs, served on the admin port).
+# (empty: every metric the rules use is documented)

@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a new capability or a change in behavior
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Check the [roadmap](https://github.com/noxred-research/proxyx/blob/main/CHANGELOG.md) first; the item may already be
+        planned. Features that change what the crawler may fetch, click, submit or store are reviewed against
+        the [security policy](https://github.com/noxred-research/proxyx/blob/main/SECURITY.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do today, and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should proxyx do? Name the crate, command, flag or API route if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and data impact
+      description: Would this change what ProxyX accepts, routes, intercepts, stores or sends to a third party? How would it stay safe by default?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to implement it?
+      options:
+        - "Yes"
+        - "Yes, with guidance"
+        - "No"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true

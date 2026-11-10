@@ -1,0 +1,99 @@
+name: Bug report
+description: Something does not work as documented
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        **Do not report security vulnerabilities here.** Use private vulnerability reporting, see
+        [SECURITY.md](https://github.com/noxred-research/proxyx/blob/main/SECURITY.md). Do not paste credentials, cookies, tokens, real personal data
+        or captured third-party content.
+  - type: input
+    id: version
+    attributes:
+      label: proxyx version or commit
+      description: Output of `proxyx --version` (or `proxyx-intercept --version`), or the commit you built.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Pool gateway (CONNECT, SOCKS5, leasing)
+        - Pool warmer or verification
+        - Providers, policies or inventory
+        - Session proxy (interception, capture)
+        - Control plane (sessions API, query, GraphQL, exports)
+        - Capture ingest (broker, ClickHouse)
+        - Rate-limit service
+        - Authentication, destination denial or secrets
+        - Deployment (Docker, Compose)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - From source
+        - Docker Compose
+        - Helm or Kubernetes
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see? Include the full error message.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact command line or request JSON, with secrets removed. A loopback fixture is ideal.
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and architecture, Rust version if built from source, Chromium build if the browser plane is involved, PostgreSQL version if the API or worker is involved.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redacted log lines. Run with `--verbose` or `RUST_LOG=debug` for more detail.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+        - label: I removed credentials, tokens, cookies and third-party content from everything I pasted.
+          required: true

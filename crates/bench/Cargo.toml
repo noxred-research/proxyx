@@ -1,0 +1,80 @@
+[package]
+name = "proxyx-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Microbenchmarks and a load tool for the ProxyX gateway and session proxy"
+
+[lints]
+workspace = true
+
+[lib]
+name = "proxyx_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "proxyx-bench"
+path = "src/main.rs"
+
+# One bench file per linked-artifact family: the session proxy links BoringSSL,
+# the control plane links OpenSSL, and one binary cannot hold both.
+[[bench]]
+name = "pool_micro"
+harness = false
+
+[[bench]]
+name = "limiter_micro"
+harness = false
+
+[[bench]]
+name = "intercept_micro"
+harness = false
+required-features = ["intercept-bench"]
+
+[[bench]]
+name = "control_micro"
+harness = false
+required-features = ["control-bench"]
+
+# The two benches that link a TLS-carrying crate are behind features, and the two
+# features must never be enabled together: `proxyx-intercept` links BoringSSL and
+# `proxyx-control` links OpenSSL (through rdkafka), they export the same C
+# symbols, and a binary that gets both fails to link. Run them one at a time:
+#   cargo bench -p proxyx-bench --features intercept-bench --bench intercept_micro
+#   cargo bench -p proxyx-bench --features control-bench --bench control_micro
+[features]
+default = []
+intercept-bench = ["dep:proxyx-intercept"]
+control-bench = ["dep:proxyx-control"]
+
+[dependencies]
+proxyx-control = { path = "../control", optional = true }
+proxyx-intercept = { path = "../intercept", optional = true }
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+common = { path = "../pool-common", package = "proxyx-pool-common" }
+hdrhistogram.workspace = true
+httparse.workspace = true
+rcgen.workspace = true
+redis.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+store = { path = "../store", package = "proxyx-store" }
+tokio.workspace = true
+time.workspace = true
+tokio-rustls.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+dial = { path = "../dial", package = "proxyx-dial" }
+limiter-client = { path = "../limiter-client", package = "proxyx-limiter-client" }
+limiter-core = { path = "../limiter-core", package = "proxyx-limiter-core" }
+limiter-server = { path = "../limiter-server", package = "proxyx-limiter-server" }
+policy = { path = "../policy", package = "proxyx-policy" }
+provider = { path = "../provider", package = "proxyx-provider" }
+serde_json.workspace = true
+toml.workspace = true

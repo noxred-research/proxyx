@@ -1,0 +1,27 @@
+[package]
+name = "proxyx-limiter-client"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "limiter_client"
+path = "src/lib.rs"
+
+[features]
+default = ["async"]
+# Adds the tokio-based async client (AsyncClient/AsyncBucket/AsyncConnection)
+# alongside the synchronous one. Opt out with `default-features = false` for a
+# tokio-free sync-only build.
+async = ["dep:tokio"]
+
+[dependencies]
+limiter-proto = { path = "../limiter-proto", package = "proxyx-limiter-proto" }
+parking_lot = "0.12"
+socket2.workspace = true
+tokio = { version = "1", features = ["net", "io-util", "time"], optional = true }
+
+[dev-dependencies]
+# For the async_bench example (requires a runtime + timer).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

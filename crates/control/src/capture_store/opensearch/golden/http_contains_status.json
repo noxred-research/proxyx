@@ -1,0 +1,32 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "wildcard": {
+                "host": {
+                  "case_insensitive": true,
+                  "value": "*Stripe\\*\\?*"
+                }
+              }
+            },
+            {
+              "range": {
+                "status_code": {
+                  "gte": 500
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

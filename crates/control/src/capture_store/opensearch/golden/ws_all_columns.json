@@ -1,0 +1,185 @@
+{
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "org_id": "org-1"
+          }
+        },
+        {
+          "bool": {
+            "filter": [
+              {
+                "term": {
+                  "source_id": "s1"
+                }
+              },
+              {
+                "term": {
+                  "source": "crawler"
+                }
+              },
+              {
+                "term": {
+                  "session_id": "sess"
+                }
+              },
+              {
+                "term": {
+                  "parent_event_id": "018f0000-0000-7000-8000-000000000001"
+                }
+              },
+              {
+                "term": {
+                  "host": "ws.example.com"
+                }
+              },
+              {
+                "wildcard": {
+                  "payload": {
+                    "case_insensitive": true,
+                    "value": "*ticker*"
+                  }
+                }
+              },
+              {
+                "term": {
+                  "direction": "s2c"
+                }
+              },
+              {
+                "bool": {
+                  "minimum_should_match": 1,
+                  "should": [
+                    {
+                      "term": {
+                        "opcode": "text"
+                      }
+                    },
+                    {
+                      "term": {
+                        "opcode": "binary"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "range": {
+                  "len.close_reason": {
+                    "gt": 0
+                  }
+                }
+              },
+              {
+                "term": {
+                  "close_code": 1000
+                }
+              },
+              {
+                "range": {
+                  "payload_size": {
+                    "lte": 4096
+                  }
+                }
+              },
+              {
+                "term": {
+                  "was_compressed": false
+                }
+              },
+              {
+                "term": {
+                  "payload_is_text": true
+                }
+              },
+              {
+                "term": {
+                  "payload_truncated": false
+                }
+              }
+            ]
+          }
+        },
+        {
+          "bool": {
+            "minimum_should_match": 1,
+            "should": [
+              {
+                "range": {
+                  "timestamp": {
+                    "lt": 1700000000123
+                  }
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "range": {
+                        "session_offset": {
+                          "lt": 5
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "bool": {
+                  "filter": [
+                    {
+                      "term": {
+                        "timestamp": 1700000000123
+                      }
+                    },
+                    {
+                      "term": {
+                        "session_offset": 5
+                      }
+                    },
+                    {
+                      "range": {
+                        "id": {
+                          "lt": "018f0000-0000-7000-8000-000000000001"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "search_after": [
+    1700000000123,
+    5,
+    "018f0000-0000-7000-8000-000000000001"
+  ],
+  "sort": [
+    {
+      "timestamp": {
+        "order": "desc"
+      }
+    },
+    {
+      "session_offset": {
+        "order": "desc"
+      }
+    },
+    {
+      "id": {
+        "order": "desc"
+      }
+    }
+  ]
+}

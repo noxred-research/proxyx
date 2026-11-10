@@ -1,0 +1,18 @@
+[package]
+name = "proxyx-limiter-server"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+
+[dependencies]
+limiter-core = { path = "../limiter-core", package = "proxyx-limiter-core" }
+limiter-proto = { path = "../limiter-proto", package = "proxyx-limiter-proto" }
+parking_lot = "0.12"
+socket2.workspace = true
+
+[dev-dependencies]
+limiter-client = { path = "../limiter-client", package = "proxyx-limiter-client" }
+limiter-proto = { path = "../limiter-proto", package = "proxyx-limiter-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

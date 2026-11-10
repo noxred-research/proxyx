@@ -1,0 +1,61 @@
+[package]
+name = "proxyx-intercept"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "proxyx-intercept"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tikv-jemallocator.workspace = true
+common = { path = "../session-common", package = "proxyx-session-common" }
+limiter-client = { path = "../limiter-client", package = "proxyx-limiter-client" }
+diag = { path = "../diag", package = "proxyx-diag" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+http.workspace = true
+httparse.workspace = true
+h2.workspace = true
+
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+boring.workspace = true
+tokio-boring.workspace = true
+
+uuid.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+moka.workspace = true
+parking_lot.workspace = true
+time.workspace = true
+base64.workspace = true
+sha1.workspace = true
+figment.workspace = true
+tokio-util.workspace = true
+sentry.workspace = true
+
+prost.workspace = true
+futures-util = "0.3"
+redis.workspace = true
+axum.workspace = true
+flate2.workspace = true
+pprof.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "handshake",
+] }
