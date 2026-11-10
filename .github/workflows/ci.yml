@@ -234,11 +234,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
-        with:
-          tool: cargo-nextest
+      # `cargo test`, not nextest: the Redis- and Postgres-backed suites serialise their
+      # tests inside one test binary, which nextest's process per test would defeat.
       - name: Unit and integration tests (real Postgres and Valkey)
-        run: cargo nextest run --no-fail-fast --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
   prober:
     runs-on: ubuntu-latest

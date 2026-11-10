@@ -3,6 +3,7 @@ name = "proxyx-ops"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "`proxyx doctor` and `proxyx assess`: role self-checks and pool health assessment"
 
 [lints]

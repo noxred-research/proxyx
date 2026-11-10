@@ -3,6 +3,7 @@ name = "proxyx-intercept"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "proxyx-intercept"
@@ -29,7 +30,6 @@ h2.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
-rustls-pemfile.workspace = true
 boring.workspace = true
 tokio-boring.workspace = true
 

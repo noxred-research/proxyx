@@ -284,9 +284,11 @@ impl RabbitMqConfig {
                     .with_context(|| format!("reading rabbitmq.tls.client_cert {cert}"))?;
                 let key_pem = std::fs::read(key)
                     .with_context(|| format!("reading rabbitmq.tls.client_key {key}"))?;
-                let der = rustls_pemfile::private_key(&mut &key_pem[..])
-                    .context("parsing rabbitmq.tls.client_key")?
-                    .context("no private key in rabbitmq.tls.client_key")?;
+                let der = {
+                    use rustls::pki_types::pem::PemObject as _;
+                    rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+                        .context("parsing rabbitmq.tls.client_key")?
+                };
                 Some(OwnedIdentity::PKCS8 {
                     pem,
                     key: der.secret_der().to_vec(),

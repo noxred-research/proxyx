@@ -3,6 +3,7 @@ name = "proxyx-session-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 tokio.workspace = true
@@ -31,7 +32,6 @@ lapin.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 parking_lot.workspace = true
 prometheus.workspace = true
 

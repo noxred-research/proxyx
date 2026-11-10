@@ -264,18 +264,17 @@ fn to_rskafka_sasl(sasl: &SaslConfig) -> Result<rskafka::client::SaslConfig> {
 }
 
 fn build_rustls_config(tls: &TlsConfig) -> Result<Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::pem::PemObject as _;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use std::io::BufReader;
 
     let mut root_store = rustls::RootCertStore::empty();
 
     if let Some(ca_path) = &tls.ca_cert {
         let ca_pem =
             std::fs::read(ca_path).with_context(|| format!("reading CA cert from {ca_path}"))?;
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut BufReader::new(&ca_pem[..]))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .context("parsing CA PEM")?;
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("parsing CA PEM")?;
         for cert in certs {
             root_store
                 .add(cert)
@@ -291,14 +290,11 @@ fn build_rustls_config(tls: &TlsConfig) -> Result<Arc<rustls::ClientConfig>> {
                 .with_context(|| format!("reading client cert from {cert_path}"))?;
             let key_pem = std::fs::read(key_path)
                 .with_context(|| format!("reading client key from {key_path}"))?;
-            let certs: Vec<CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .context("parsing client cert PEM")?;
+            let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("parsing client cert PEM")?;
             let key: PrivateKeyDer<'static> =
-                rustls_pemfile::private_key(&mut BufReader::new(&key_pem[..]))
-                    .context("parsing client key PEM")?
-                    .context("no private key found in PEM file")?;
+                PrivateKeyDer::from_pem_slice(&key_pem).context("parsing client key PEM")?;
             builder
                 .with_client_auth_cert(certs, key)
                 .context("building rustls client config with mTLS")?

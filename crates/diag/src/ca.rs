@@ -260,17 +260,19 @@ fn decode(raw: &[u8], encoding: CaEncoding, kind: Kind) -> Result<Vec<u8>, Strin
 }
 
 fn pem_der(raw: &[u8], kind: Kind) -> Result<Vec<u8>, String> {
-    let mut reader = raw;
+    use rustls_pki_types::pem::{Error as PemError, PemObject as _};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     match kind {
-        Kind::Certificate => rustls_pemfile::certs(&mut reader)
-            .next()
-            .ok_or("no CERTIFICATE block in the PEM")?
-            .map(|c| c.as_ref().to_vec())
-            .map_err(|e| format!("bad PEM: {e}")),
-        Kind::Key => rustls_pemfile::private_key(&mut reader)
-            .map_err(|e| format!("bad PEM: {e}"))?
-            .map(|k| k.secret_der().to_vec())
-            .ok_or_else(|| "no private key block in the PEM".to_owned()),
+        Kind::Certificate => match CertificateDer::from_pem_slice(raw) {
+            Ok(cert) => Ok(cert.as_ref().to_vec()),
+            Err(PemError::NoItemsFound) => Err("no CERTIFICATE block in the PEM".to_owned()),
+            Err(e) => Err(format!("bad PEM: {e}")),
+        },
+        Kind::Key => match PrivateKeyDer::from_pem_slice(raw) {
+            Ok(key) => Ok(key.secret_der().to_vec()),
+            Err(PemError::NoItemsFound) => Err("no private key block in the PEM".to_owned()),
+            Err(e) => Err(format!("bad PEM: {e}")),
+        },
     }
 }
 

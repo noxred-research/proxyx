@@ -117,7 +117,7 @@ tokio-boring = "5"
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.12", features = ["std"] }
 rustls-native-certs = "0.8"
 hmac = "0.12"
 sha1 = "0.10"
@@ -146,7 +146,8 @@ rdkafka = { version = "0.39", features = ["ssl", "tokio", "zstd"] }
 
 # Object storage (traffic view exports)
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+# `default-features = false` drops the legacy hyper 0.14 / rustls 0.21 client the `rustls` feature adds.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1"
 azure_core = "1"
 azure_identity = "1"
