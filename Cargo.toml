@@ -119,7 +119,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
 rustls-pki-types = { version = "1.12", features = ["std"] }
 rustls-native-certs = "0.8"
-hmac = "0.12"
+hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.10"
 rsa = "0.9"
@@ -177,7 +177,7 @@ rand = "0.8"
 libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["net", "socket"] }
 socket2 = { version = "0.6", features = ["all"] }
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 # Benchmarks
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
