@@ -125,7 +125,7 @@ sha2 = "0.10"
 rsa = "0.9"
 
 # Storage
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
