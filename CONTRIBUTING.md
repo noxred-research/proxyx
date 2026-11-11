@@ -38,7 +38,7 @@ Test only against local services and systems you own. See [Responsible use](READ
 ## Development setup
 
 - **Rust toolchain.** The version in [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it automatically.
-- **Native build dependencies.** CMake, Clang, `perl`, `pkg-config`, OpenSSL and SASL development headers. BoringSSL (session proxy) and librdkafka (control plane) build from source. The protobuf compiler is vendored.
+- **Native build dependencies.** CMake, Clang, `perl`, `pkg-config` and the OpenSSL development headers. BoringSSL (session proxy) and librdkafka (control plane) build from source. The protobuf compiler is vendored.
 - **Build.** `cargo build --workspace`.
 - **Datastores for tests.** Many tests need a real PostgreSQL and a Redis-compatible server on loopback. Set `PROXYX_TEST_DATABASE_URL` (for example `postgres://proxyx:proxyx@127.0.0.1:5432/proxyx_test`) and `PROXYX_TEST_REDIS_URL` (for example `redis://127.0.0.1:6379`). Tests that need them print `SKIP` and pass when the variables are unset, so a green run without them proves less than a run with them. Use a disposable Redis: tests write and delete keys.
 - **Whole stack.** `docker compose -f docker/docker-compose.yml up -d --build --wait` starts every role against local datastores.
