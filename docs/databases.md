@@ -39,6 +39,8 @@ proxyx migrate control --target database
 ```
 
 The migration tables are `_sqlx_migrations` on every backend. Migrations are safe to run from several processes at once: PostgreSQL takes an advisory lock, MariaDB takes `GET_LOCK` (waiting up to an hour), SQLite takes an exclusive lock on `<database file>.migrate-lock`, so the later process finds nothing to apply. The connection that migrates has its statement and lock limits lifted and restored afterwards.
+Migration commands make one bounded connection attempt. An invalid URL, an in-memory SQLite URL or a
+rejected database login fails with its cause instead of entering the serving roles' dependency retry loop.
 
 A SQLite database file is created by the first connection (`mode=rwc` in the URL); the directory must exist and be writable. The control plane's SQLite and MariaDB schemas are created in the shape the PostgreSQL migrations reach, so a few migration versions (the vestigial `http_captures` table, `pg_partman`) are no-ops there; the versions stay equal everywhere.
 
@@ -106,3 +108,7 @@ PROXYX_TEST_BACKEND=mariadb cargo test -p proxyx-store -p proxyx-pool-api -p pro
 ```
 
 `PROXYX_TEST_BACKEND` is `postgres` (default), `mariadb` or `sqlite`. A suite whose variable is unset skips with a message. `crates/store/tests/contract.rs` and `crates/control/tests/db_backends.rs` run on every backend whose variable is set, in one run.
+
+Gateway, pool API and warmer integration tests also need `PROXYX_TEST_REDIS_URL`. These suites honor an
+explicit database number in that URL. Use a dedicated test database: the warmer suite clears its selected
+Redis database between tests.

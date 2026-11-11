@@ -107,6 +107,7 @@ history = 120
 # endpoint = "http://127.0.0.1:11434/v1"        # base URL or the full .../chat/completions URL
 # model = "llama3.1"
 # api_key_file = "/etc/proxyx/secrets/llm-key"  # omit for a local server without a key
+# ca_file = "/etc/proxyx/secrets/llm-ca.pem"   # PEM of the private CA that signed an https endpoint's certificate
 # timeout_secs = 60
 # max_input_chars = 24000
 # max_output_tokens = 1024

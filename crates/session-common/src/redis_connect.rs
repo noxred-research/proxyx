@@ -36,6 +36,9 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// Blocking stream reads use their own connection, so this does not cut them.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Longest wait between two reconnect attempts of the shared manager.
+const RECONNECT_MAX_DELAY_MS: u64 = 1_000;
+
 /// The `ConnectionManager` every role uses: reconnects by itself, bounded by
 /// [`IO_TIMEOUT`].
 async fn manager(client: redis::Client) -> Result<ConnectionManager> {
@@ -43,9 +46,18 @@ async fn manager(client: redis::Client) -> Result<ConnectionManager> {
 }
 
 async fn manager_with(client: redis::Client, timeout: Duration) -> Result<ConnectionManager> {
+    // redis-rs hands `factor` to a backoff whose first delay is one second and
+    // whose ceiling is one minute, so unconfigured the manager waits up to a
+    // minute between reconnect attempts and a restarted Redis stays
+    // unreachable (and every call that waits on the reconnect stays blocked)
+    // for over a minute. Capped, each attempt is one to two seconds apart.
+    // The six default attempts stay: the capture publisher waits out a whole
+    // round per try, and a longer round is a longer window before a capture
+    // is dropped.
     let config = ConnectionManagerConfig::new()
         .set_connection_timeout(timeout)
-        .set_response_timeout(timeout);
+        .set_response_timeout(timeout)
+        .set_max_delay(RECONNECT_MAX_DELAY_MS);
     // The manager's own connection timeout covers the TCP connect; the setup
     // exchange after it has no bound of its own, so a peer that accepts and
     // then stays silent would hang the start. Allow a few attempts, no more.
@@ -258,6 +270,98 @@ mod tests {
             .expect("a silent peer must not connect");
         assert!(err.to_string().contains("did not answer"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Answers `PING` with `+PONG` and every other command with `+OK`, until
+    /// the returned handle is aborted (which also drops its connections).
+    fn fake_redis(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                connections.spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut read = BufReader::new(read);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let args: usize = line.trim_start_matches('*').trim().parse().unwrap_or(0);
+                        let mut first = String::new();
+                        for index in 0..args {
+                            line.clear();
+                            let _ = read.read_line(&mut line).await;
+                            let len: usize =
+                                line.trim_start_matches('$').trim().parse().unwrap_or(0);
+                            let mut arg = vec![0u8; len + 2];
+                            if read.read_exact(&mut arg).await.is_err() {
+                                return;
+                            }
+                            if index == 0 {
+                                first = String::from_utf8_lossy(&arg[..len]).to_ascii_uppercase();
+                            }
+                        }
+                        let reply: &[u8] = if first == "PING" {
+                            b"+PONG\r\n"
+                        } else {
+                            b"+OK\r\n"
+                        };
+                        if write.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// After the server comes back, the shared manager must serve commands
+    /// again within a couple of seconds. redis-rs's own backoff would leave it
+    /// failing for up to a minute: the reconnect delay is capped.
+    #[tokio::test]
+    async fn the_manager_serves_again_soon_after_redis_restarts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = fake_redis(listener);
+        let client = redis::Client::open(format!("redis://{addr}/")).unwrap();
+        let mut conn = manager_with(client, Duration::from_millis(500))
+            .await
+            .unwrap();
+        let pong: String = redis::cmd("PING").query_async(&mut conn).await.unwrap();
+        assert_eq!(pong, "PONG");
+
+        server.abort();
+        let _ = server.await;
+        // Long enough for the default backoff to reach multi-second waits.
+        let outage = Instant::now();
+        while outage.elapsed() < Duration::from_secs(5) {
+            let down: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            assert!(down.is_err(), "the server is gone");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let server = fake_redis(listener);
+        let back = Instant::now();
+        let mut recovered = false;
+        while back.elapsed() < Duration::from_secs(4) {
+            let reply: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut conn).await;
+            if matches!(reply.as_deref(), Ok("PONG")) {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        server.abort();
+        assert!(
+            recovered,
+            "no PING answered within 4s of the server returning"
+        );
     }
 
     #[tokio::test]

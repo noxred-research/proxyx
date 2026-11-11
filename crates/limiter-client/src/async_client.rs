@@ -3,7 +3,7 @@
 //! `Limits`, `Outcome`, `Snapshot`) with the sync client. Gated behind the
 //! `async` feature.
 
-use crate::resilience::{retryable_disconnect, set_keepalive, Health};
+use crate::resilience::{set_keepalive, Health};
 use crate::{
     CircuitState, ClientConfig, ClientStats, FailMode, Limits, Outcome, ResilienceConfig, Snapshot,
 };
@@ -30,15 +30,12 @@ fn invalid(msg: &'static str) -> io::Error {
 /// connect, and frames requests/responses through `limiter-proto`.
 pub struct AsyncConnection {
     stream: TcpStream,
-    peer: std::net::SocketAddr,
     req: Vec<u8>,
     resp: Vec<u8>,
     /// Set for connections the pooled client opens: exchanges are bounded by
     /// the I/O timeout and report their outcome to the circuit breaker.
     health: Option<Arc<Health>>,
     last_used: Instant,
-    reused: bool,
-    response_started: bool,
 }
 
 /// Run one exchange under the connection's I/O timeout and report the outcome.
@@ -112,30 +109,18 @@ impl AsyncConnection {
     }
 
     fn from_stream(stream: TcpStream, health: Option<Arc<Health>>) -> io::Result<Self> {
-        let peer = stream.peer_addr()?;
         Ok(Self {
             stream,
-            peer,
             req: Vec::with_capacity(4096),
             resp: Vec::with_capacity(4096),
             health,
             last_used: Instant::now(),
-            reused: false,
-            response_started: false,
         })
     }
 
     async fn read_frame_bytes(&mut self) -> io::Result<()> {
         self.resp.resize(4, 0);
-        let mut received = 0;
-        while received < 4 {
-            let count = self.stream.read(&mut self.resp[received..4]).await?;
-            if count == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            self.response_started = true;
-            received += count;
-        }
+        self.stream.read_exact(&mut self.resp[..4]).await?;
         let frame_len =
             u32::from_be_bytes([self.resp[0], self.resp[1], self.resp[2], self.resp[3]]) as usize;
         if !(5..=MAX_FRAME_BYTES).contains(&frame_len) {
@@ -147,25 +132,10 @@ impl AsyncConnection {
         Ok(())
     }
 
-    async fn exchange_once(&mut self) -> io::Result<()> {
-        self.response_started = false;
-        self.stream.write_all(&self.req).await?;
-        self.read_frame_bytes().await
-    }
-
+    /// Never replay an exchange: a lost response may follow an applied mutation.
     async fn exchange(&mut self) -> io::Result<Frame<'_>> {
-        let reused = std::mem::take(&mut self.reused);
-        let result = self.exchange_once().await;
-        if reused && !self.response_started && result.as_ref().is_err_and(retryable_disconnect) {
-            let health = self
-                .health
-                .as_ref()
-                .ok_or_else(|| invalid("pooled connection has no health state"))?;
-            self.stream = Self::connect_stream(self.peer, health).await?;
-            self.exchange_once().await?;
-        } else {
-            result?;
-        }
+        self.stream.write_all(&self.req).await?;
+        self.read_frame_bytes().await?;
         parse_frame(&self.resp)?.ok_or_else(|| invalid("incomplete response frame"))
     }
 
@@ -267,9 +237,8 @@ impl AsyncInner {
         self.health.allow()?;
         {
             let mut pool = self.pool.lock();
-            while let Some(mut conn) = pool.pop() {
+            while let Some(conn) = pool.pop() {
                 if conn.last_used.elapsed() < self.health.config.max_idle {
-                    conn.reused = true;
                     return Ok(conn);
                 }
             }

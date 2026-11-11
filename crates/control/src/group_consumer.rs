@@ -15,8 +15,9 @@ use rdkafka::consumer::{BaseConsumer, Consumer, ConsumerContext, Rebalance, Stre
 
 struct GroupContext {
     tracker: Mutex<AckTracker>,
-    /// Up after a message was received, down when librdkafka reports that
-    /// every broker is unreachable.
+    /// Starts down. Up after a message was received or a metadata request
+    /// succeeded, down again when librdkafka reports that every broker is
+    /// unreachable.
     state: Arc<ConnState>,
 }
 
@@ -151,10 +152,10 @@ impl KafkaGroupConsumer {
             .set("auto.offset.reset", "earliest")
             .set("partition.assignment.strategy", "cooperative-sticky");
 
-        // Assumed up until librdkafka reports every broker down; `poll`
-        // checks again while it is down.
+        // Starts down: the first message or a successful metadata request
+        // (which needs a working TLS and SASL handshake) marks it up, and
+        // `poll` retries the request while it is down.
         let state = ConnState::new("kafka", "consumer");
-        state.set(true);
         let context = GroupContext {
             tracker: Mutex::new(AckTracker::default()),
             state: Arc::clone(&state),

@@ -266,6 +266,7 @@ pub async fn authenticate(
         return Ok(None);
     }
     let Some((user, pass)) = creds else {
+        count_failure(shared, listener, LoginFailure::Missing);
         return Err(LoginFailure::Missing);
     };
     let fail = shared.fail_limiter();

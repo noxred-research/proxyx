@@ -162,29 +162,100 @@ fn escape_wildcard(value: &str) -> String {
     out
 }
 
-fn int_leaf(field: &str, f: &IntFilter) -> Option<Value> {
-    Some(match f {
-        IntFilter::Exact { value } => json!({ "term": { field: value } }),
-        IntFilter::Lt { value } => json!({ "range": { field: { "lt": value } } }),
-        IntFilter::Lte { value } => json!({ "range": { field: { "lte": value } } }),
-        IntFilter::Gt { value } => json!({ "range": { field: { "gt": value } } }),
-        IntFilter::Gte { value } => json!({ "range": { field: { "gte": value } } }),
+/// The inclusive range of values a numeric field can hold. The store rejects
+/// a term or range bound outside the field's type with a server error, so a
+/// comparison against such a value is decided here: it holds for every row
+/// or for none.
+#[derive(Clone, Copy)]
+pub(super) struct Bounds {
+    min: i64,
+    max: i64,
+}
+
+/// A `long` field.
+pub(super) const LONG: Bounds = Bounds {
+    min: i64::MIN,
+    max: i64::MAX,
+};
+
+/// An `integer` field.
+pub(super) const INTEGER: Bounds = Bounds {
+    min: i32::MIN as i64,
+    max: i32::MAX as i64,
+};
+
+/// A comparison against a numeric field.
+enum IntLeaf {
+    Query(Value),
+    /// True for every value the field can hold.
+    Always,
+    /// False for every value the field can hold.
+    Never,
+}
+
+fn int_leaf(field: &str, bounds: Bounds, f: &IntFilter) -> Option<IntLeaf> {
+    let query = |op: &str, value: i64| IntLeaf::Query(json!({ "range": { field: { op: value } } }));
+    let Bounds { min, max } = bounds;
+    Some(match *f {
+        IntFilter::Exact { value } if (min..=max).contains(&value) => {
+            IntLeaf::Query(json!({ "term": { field: value } }))
+        }
+        IntFilter::Exact { .. } => IntLeaf::Never,
+        IntFilter::Lt { value } if value > max => IntLeaf::Always,
+        IntFilter::Lt { value } if value <= min => IntLeaf::Never,
+        IntFilter::Lt { value } => query("lt", value),
+        IntFilter::Lte { value } if value >= max => IntLeaf::Always,
+        IntFilter::Lte { value } if value < min => IntLeaf::Never,
+        IntFilter::Lte { value } => query("lte", value),
+        IntFilter::Gt { value } if value >= max => IntLeaf::Never,
+        IntFilter::Gt { value } if value < min => IntLeaf::Always,
+        IntFilter::Gt { value } => query("gt", value),
+        IntFilter::Gte { value } if value > max => IntLeaf::Never,
+        IntFilter::Gte { value } if value <= min => IntLeaf::Always,
+        IntFilter::Gte { value } => query("gte", value),
         _ => return None,
     })
 }
 
-/// Lower `f` on a numeric `field` for the rows where it is TRUE (`truth`) or
-/// FALSE.
-pub(super) fn int_filter(field: &str, nullable: bool, f: &IntFilter, truth: bool) -> Value {
-    if let Some(query) = int_leaf(field, f) {
-        return leaf(truth, nullable, field, query);
+/// Rows that hold a value for `field`.
+fn present(nullable: bool, field: &str) -> Value {
+    if nullable { exists(field) } else { match_all() }
+}
+
+/// Lower `f` on a numeric `field` of the given `bounds` for the rows where
+/// it is TRUE (`truth`) or FALSE.
+pub(super) fn int_filter(
+    field: &str,
+    nullable: bool,
+    bounds: Bounds,
+    f: &IntFilter,
+    truth: bool,
+) -> Value {
+    match int_leaf(field, bounds, f) {
+        Some(IntLeaf::Query(query)) => return leaf(truth, nullable, field, query),
+        // A comparison is NULL, not FALSE, on a row without a value.
+        Some(IntLeaf::Always) => {
+            return if truth {
+                present(nullable, field)
+            } else {
+                match_none()
+            };
+        }
+        Some(IntLeaf::Never) => {
+            return if truth {
+                match_none()
+            } else {
+                present(nullable, field)
+            };
+        }
+        None => {}
     }
     match f {
         IntFilter::All { filters } => {
             let parts = filters
                 .0
                 .iter()
-                .map(|c| int_filter(field, nullable, c, truth))
+                .map(|c| int_filter(field, nullable, bounds, c, truth))
                 .collect();
             if truth { and(parts) } else { or(parts) }
         }
@@ -192,11 +263,11 @@ pub(super) fn int_filter(field: &str, nullable: bool, f: &IntFilter, truth: bool
             let parts = filters
                 .0
                 .iter()
-                .map(|c| int_filter(field, nullable, c, truth))
+                .map(|c| int_filter(field, nullable, bounds, c, truth))
                 .collect();
             if truth { or(parts) } else { and(parts) }
         }
-        IntFilter::Not { filter } => int_filter(field, nullable, filter, !truth),
+        IntFilter::Not { filter } => int_filter(field, nullable, bounds, filter, !truth),
         _ => match_none(),
     }
 }
@@ -204,15 +275,22 @@ pub(super) fn int_filter(field: &str, nullable: bool, f: &IntFilter, truth: bool
 fn string_filter(col: &Col, f: &StringFilter, truth: bool) -> Result<Value> {
     let field = col.name;
     Ok(match f {
-        StringFilter::Contains { value } => leaf(
-            truth,
-            col.nullable,
-            field,
-            json!({ "wildcard": { field: {
-                "value": format!("*{}*", escape_wildcard(value)),
-                "case_insensitive": true,
-            } } }),
-        ),
+        StringFilter::Contains { value } => {
+            let query = match regex::contains_pattern(value).map_err(|reason| {
+                StoreError::Rejected(format!("contains {value:?} on {field}: {reason}"))
+            })? {
+                // ASCII text: the `wildcard` query's own folding is exact.
+                None => json!({ "wildcard": { field: {
+                    "value": format!("*{}*", escape_wildcard(value)),
+                    "case_insensitive": true,
+                } } }),
+                Some(pattern) => json!({ "regexp": { field: {
+                    "value": pattern,
+                    "case_insensitive": true,
+                } } }),
+            };
+            leaf(truth, col.nullable, field, query)
+        }
         StringFilter::Exact { value } if value.is_empty() && col.kind == Kind::Wildcard => leaf(
             truth,
             col.nullable,
@@ -232,6 +310,11 @@ fn string_filter(col: &Col, f: &StringFilter, truth: bool) -> Result<Value> {
                      capture store: {reason}"
                 ))
             })?;
+            // A regexp that accepts a single string is an equality; the
+            // `wildcard` field type mishandles it as a regexp.
+            if let Some(exact) = translated.exact {
+                return string_filter(col, &StringFilter::Exact { value: exact }, truth);
+            }
             let mut body = json!({ "value": translated.pattern });
             if translated.case_insensitive {
                 body["case_insensitive"] = json!(true);
@@ -243,7 +326,7 @@ fn string_filter(col: &Col, f: &StringFilter, truth: bool) -> Result<Value> {
                 json!({ "regexp": { field: body } }),
             )
         }
-        StringFilter::Length { value } => int_filter(col.len, col.nullable, value, truth),
+        StringFilter::Length { value } => int_filter(col.len, col.nullable, LONG, value, truth),
         StringFilter::IsNull | StringFilter::IsPresent => {
             let want_null = matches!(f, StringFilter::IsNull) == truth;
             match (col.nullable, want_null) {
@@ -340,13 +423,13 @@ fn lower_branch(b: &QueryBranch) -> Result<Value> {
     push_string(&mut c, &ACCOUNT_ID, &b.account_id)?;
     push_string(&mut c, &TOOL_CALL_ID, &b.tool_call_id)?;
     if let Some(f) = &b.status_code {
-        c.push(int_filter("status_code", false, f, true));
+        c.push(int_filter("status_code", false, INTEGER, f, true));
     }
     if let Some(f) = &b.response_size {
-        c.push(int_filter("response_size", false, f, true));
+        c.push(int_filter("response_size", false, LONG, f, true));
     }
     if let Some(f) = &b.duration_ms {
-        c.push(int_filter("duration_ms", false, f, true));
+        c.push(int_filter("duration_ms", false, LONG, f, true));
     }
     push_string(&mut c, &MIME_TYPE, &b.mime_type)?;
     push_bool(&mut c, "request_sends_cookies", b.request_sends_cookies);
@@ -569,10 +652,10 @@ fn ws_branch(b: &WsQueryBranch) -> Result<Value> {
     push_string(&mut c, &WS_OPCODE, &b.opcode)?;
     push_string(&mut c, &WS_CLOSE_REASON, &b.close_reason)?;
     if let Some(f) = &b.close_code {
-        c.push(int_filter("close_code", false, f, true));
+        c.push(int_filter("close_code", false, INTEGER, f, true));
     }
     if let Some(f) = &b.payload_size {
-        c.push(int_filter("payload_size", false, f, true));
+        c.push(int_filter("payload_size", false, LONG, f, true));
     }
     push_bool(&mut c, "was_compressed", b.was_compressed);
     push_bool(&mut c, "payload_is_text", b.payload_is_text);
@@ -826,6 +909,128 @@ mod tests {
         let boundaries = crate::query::cursor_boundaries(&q).unwrap();
         let err = http_query(&q, &boundaries, true).unwrap_err();
         assert!(matches!(err, StoreError::Rejected(m) if m.contains("word boundary")));
+    }
+
+    #[test]
+    fn a_regex_with_one_possible_match_is_an_equality() {
+        let regex = |value: &str| StringFilter::RegexMatch {
+            value: value.into(),
+        };
+        assert_eq!(
+            string_filter(&PATH, &regex("^x{100}$"), true).unwrap(),
+            json!({ "term": { "path": "x".repeat(100) } })
+        );
+        assert_eq!(
+            string_filter(&RESPONSE_BODY, &regex("^.{0}$"), true).unwrap(),
+            json!({ "term": { "len.response_body": 0 } })
+        );
+        // Negation keeps SQL's NULL semantics on a nullable column.
+        assert_eq!(
+            string_filter(&CORRELATION_ID, &regex("^$"), false).unwrap(),
+            json!({ "bool": {
+                "filter": [{ "exists": { "field": "correlation_id" } }],
+                "must_not": [{ "term": { "correlation_id": "" } }],
+            } })
+        );
+        // Anything that can match more than one string stays a regexp.
+        for re2 in ["x{100}", "^x{100}", "^x{100,101}$", "(?i)^x$"] {
+            assert!(
+                string_filter(&PATH, &regex(re2), true).unwrap()["regexp"].is_object(),
+                "{re2}"
+            );
+        }
+    }
+
+    #[test]
+    fn contains_folds_non_ascii_case_with_a_regexp() {
+        let contains = |value: &str| StringFilter::Contains {
+            value: value.into(),
+        };
+        assert_eq!(
+            string_filter(&RESPONSE_BODY, &contains("ÜNÏ"), true).unwrap(),
+            json!({ "regexp": { "response_body": {
+                "value": ".*[Üü]N[Ïï].*",
+                "case_insensitive": true,
+            } } })
+        );
+        assert_eq!(
+            string_filter(&RESPONSE_BODY, &contains("Trip*?"), true).unwrap(),
+            json!({ "wildcard": { "response_body": {
+                "value": "*Trip\\*\\?*",
+                "case_insensitive": true,
+            } } })
+        );
+    }
+
+    #[test]
+    fn int_filters_outside_the_field_type_are_decided_without_the_store() {
+        let value = 1_i64 << 40;
+        let cmp = |filter: IntFilter, nullable: bool, truth: bool| {
+            int_filter("f", nullable, INTEGER, &filter, truth)
+        };
+        let present = |nullable: bool| if nullable { exists("f") } else { match_all() };
+        for nullable in [false, true] {
+            for (filter, always) in [
+                (IntFilter::Lt { value }, true),
+                (IntFilter::Lte { value }, true),
+                (IntFilter::Gt { value }, false),
+                (IntFilter::Gte { value }, false),
+                (IntFilter::Exact { value }, false),
+                (IntFilter::Gt { value: -value }, true),
+                (IntFilter::Gte { value: -value }, true),
+                (IntFilter::Lt { value: -value }, false),
+                (IntFilter::Lte { value: -value }, false),
+                (IntFilter::Exact { value: i64::MAX }, false),
+                (IntFilter::Lte { value: i64::MAX }, true),
+            ] {
+                // TRUE on every row that has a value, or on none; FALSE the other way.
+                let (when_true, when_false) = if always {
+                    (present(nullable), match_none())
+                } else {
+                    (match_none(), present(nullable))
+                };
+                assert_eq!(cmp(filter.clone(), nullable, true), when_true, "{filter:?}");
+                assert_eq!(
+                    cmp(filter.clone(), nullable, false),
+                    when_false,
+                    "{filter:?}"
+                );
+            }
+        }
+        // The edges of the type are still sent to the store.
+        let max = i64::from(i32::MAX);
+        assert_eq!(
+            cmp(IntFilter::Exact { value: max }, false, true),
+            json!({ "term": { "f": max } })
+        );
+        assert_eq!(
+            cmp(IntFilter::Gt { value: max - 1 }, false, true),
+            json!({ "range": { "f": { "gt": max - 1 } } })
+        );
+        assert_eq!(
+            cmp(IntFilter::Lte { value: max }, false, true),
+            present(false)
+        );
+        // Combinators decide each operand.
+        let any = IntFilter::Any {
+            filters: NonEmpty(vec![
+                IntFilter::Exact { value },
+                IntFilter::Exact { value: 404 },
+            ]),
+        };
+        assert_eq!(
+            cmp(any, false, true),
+            or(vec![match_none(), json!({ "term": { "f": 404 } })])
+        );
+        let not = IntFilter::Not {
+            filter: Box::new(IntFilter::Gt { value }),
+        };
+        assert_eq!(cmp(not, false, true), match_all());
+        // `long` fields take every i64.
+        assert_eq!(
+            int_filter("g", false, LONG, &IntFilter::Gt { value }, true),
+            json!({ "range": { "g": { "gt": value } } })
+        );
     }
 
     #[test]

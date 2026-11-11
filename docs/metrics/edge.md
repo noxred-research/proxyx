@@ -133,7 +133,7 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 - **Type:** counter
 - **Labels:** `kind` (parent, egress, chain), `result` (ok, failed)
 - **Source:** event, `crates/edge/src/health.rs`, every `health.interval`
-- **Meaning:** Active probes. Parent probes use configured TCP, HTTP status/body or operator command checks, or the legacy TCP/CONNECT probe. Chain probes traverse every selected hop to a representative target. Egress checks verify listed addresses and routed prefixes remain assigned and bindable. Probe duration feeds latency selection; unmeasured nodes do not acquire fictitious zero latency.
+- **Meaning:** Active probes. Parent probes use configured TCP, HTTP status/body or operator command checks, or the legacy TCP/CONNECT probe. Chain probes traverse every selected hop to a representative target. Egress checks verify listed addresses remain assigned and bindable, and sample routed-prefix source bindability. Prefix checks do not inspect routes or prove reachability when nonlocal binding is enabled. Probe duration feeds latency selection; unmeasured nodes do not acquire fictitious zero latency.
 - **Query:** `sum by (kind) (rate(proxyx_edge_health_checks_total{result="failed"}[5m]))`
 
 ### `proxyx_edge_parent_conn_reuse_total`

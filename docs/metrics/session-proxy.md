@@ -149,6 +149,13 @@ Labels use closed sets only, so they never carry hosts, URLs, ids, or raw paths.
 - **Meaning:** Requests admitted without a rate-limit verdict because the backend failed and `ratelimit.failopen_policy` is `grant_tokens` (the default). With the `redis` backend an org's local bucket stays fail-open after its first error, and every request it admits counts here. Traffic is then unlimited for that org on this proxy.
 - **Query:** `sum by (backend) (rate(proxyx_intercept_ratelimit_failopen_total[5m])) > 0`
 
+### `proxyx_intercept_scheduler_lag_seconds`
+- **Type:** histogram (0.001 to 5 s, 10 buckets)
+- **Labels:** none
+- **Source:** event, `crates/intercept/src/profiling.rs` `on_tick`
+- **Meaning:** How late the 10 ms runtime probe tick fired, in seconds. The probe runs, and the series exists, only when the process was started with `PROXYX_INTERCEPT_PROFILING=1` (or `true`); otherwise the metric is absent from `/metrics`. Each observation is one tick, so a healthy runtime has almost all of them in the lowest buckets. Ticks later than 50 ms are also recorded as events at `GET /debug/stalls`.
+- **Query:** `histogram_quantile(0.99, sum by (le) (rate(proxyx_intercept_scheduler_lag_seconds_bucket[5m])))`
+
 ## Ingester
 
 ### `proxyx_ingester_messages_total`

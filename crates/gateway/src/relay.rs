@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::metrics::Metrics;
-use common::session::BYTES_PER_GB;
+use common::session::gb_to_bytes;
 use common::types::{Kind, OrgId, Partition, ProviderId, Target};
 use dial::ProxyStream;
 use policy::{AfterRelease, Pool};
@@ -337,7 +337,7 @@ async fn meter_fair_use(gw: &Gateway, lease: &LeaseData, bytes: u64, now: Offset
     let Some(gb) = lease.fair_use_gb else {
         return;
     };
-    let limit = (gb * BYTES_PER_GB) as u64;
+    let limit = gb_to_bytes(gb);
     match redis(
         "meter fair use",
         gw.hot

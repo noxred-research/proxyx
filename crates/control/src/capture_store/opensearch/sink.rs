@@ -142,6 +142,7 @@ impl RetryPolicy {
 enum ItemFate {
     Written,
     Retry,
+    Authorization(String),
     Poison(String),
 }
 
@@ -161,11 +162,16 @@ fn item_fate(item: &Value) -> ItemFate {
         429 | 500..=599 => ItemFate::Retry,
         _ => {
             let error = op.map(|o| &o["error"]).unwrap_or(&Value::Null);
-            ItemFate::Poison(format!(
+            let reason = format!(
                 "HTTP {status}: {}: {}",
                 error["type"].as_str().unwrap_or("unknown"),
                 error["reason"].as_str().unwrap_or("no reason given"),
-            ))
+            );
+            if matches!(status, 401 | 403) {
+                ItemFate::Authorization(reason)
+            } else {
+                ItemFate::Poison(reason)
+            }
         }
     }
 }
@@ -234,11 +240,21 @@ impl BulkWriter {
             let failure = match self.send_chunk(&chunk).await {
                 Ok(results) => {
                     let mut again = Vec::new();
+                    let mut authorization_error = None;
                     for (&i, fate) in pending.iter().zip(results) {
                         match fate {
                             ItemFate::Retry => again.push(i),
+                            ItemFate::Authorization(reason) => {
+                                authorization_error.get_or_insert(reason);
+                            }
                             settled => fates[i] = Some(settled),
                         }
+                    }
+                    if let Some(reason) = authorization_error {
+                        return Some(RequestFailure {
+                            transient: false,
+                            error: anyhow::anyhow!("_bulk item authorization failed: {reason}"),
+                        });
                     }
                     if again.is_empty() {
                         return None;
@@ -320,7 +336,7 @@ where
             match fate {
                 Some(ItemFate::Written) => {}
                 Some(ItemFate::Poison(reason)) => outcome.poison.push((i, reason)),
-                Some(ItemFate::Retry) | None => outcome.retry.push(i),
+                Some(ItemFate::Retry | ItemFate::Authorization(_)) | None => outcome.retry.push(i),
             }
         }
         if !outcome.retry.is_empty() {
@@ -442,5 +458,45 @@ impl CaptureSink for OpenSearchSink {
 
     fn circuit_open(&self) -> bool {
         self.http.circuit_open() || self.ws.circuit_open()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_item_statuses_distinguish_authorization_from_poison() {
+        for status in [200, 201, 299, 409] {
+            assert!(matches!(
+                item_fate(&json!({"create": {"status": status}})),
+                ItemFate::Written
+            ));
+        }
+        for status in [429, 500, 503, 599] {
+            assert!(matches!(
+                item_fate(&json!({"create": {"status": status}})),
+                ItemFate::Retry
+            ));
+        }
+        for status in [401, 403] {
+            let fate = item_fate(&json!({
+                "create": {
+                    "status": status,
+                    "error": {"type": "security_exception", "reason": "access denied"}
+                }
+            }));
+            let ItemFate::Authorization(reason) = fate else {
+                panic!("HTTP {status} must retain the document for authorization recovery");
+            };
+            assert_eq!(
+                reason,
+                format!("HTTP {status}: security_exception: access denied")
+            );
+        }
+        assert!(matches!(
+            item_fate(&json!({"create": {"status": 400}})),
+            ItemFate::Poison(_)
+        ));
     }
 }

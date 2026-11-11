@@ -220,7 +220,7 @@ pub(crate) fn ensure_object(body: &[u8]) -> Result<(), ApiError> {
     }
 }
 
-fn json_content_type(headers: &HeaderMap) -> bool {
+pub(crate) fn json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

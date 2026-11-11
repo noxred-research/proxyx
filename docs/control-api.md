@@ -5,11 +5,11 @@
 | Command | Role |
 |---|---|
 | `proxyx control api` | REST (`/rpc/*`) and GraphQL (`/graphql`) server: sessions, orgs, traffic queries, traffic view exports; also runs the background reapers |
-| `proxyx control ingester` | consumes the captures log and writes ClickHouse (see [capture-pipeline.md](capture-pipeline.md)); serves health and metrics on its own port |
-| `proxyx control keys create\|list\|disable` | manage API keys (needs Postgres only) |
+| `proxyx control ingester` | consumes the captures log and writes the configured capture store (see [capture-pipeline.md](capture-pipeline.md)); serves health and metrics on its own port |
+| `proxyx control keys create\|list\|disable` | manage API keys (needs the relational database only) |
 | `proxyx control schema export\|validate\|manifest` | GraphQL federation schema tooling (needs no infrastructure) |
 
-`proxyx migrate control [--target all|postgres|clickhouse|opensearch|broker] [--check]` applies (or verifies) the Postgres schema, the schema of the capture store and the captures log of the broker: `all` takes the store from `capture_store.backend` and the broker from `broker_kind` (a Kafka topic, or the RabbitMQ exchanges and queues; Redis Streams needs none); `clickhouse`, `opensearch` and `broker` name one part. `--target clickhouse` no longer creates the broker topic, use `all` or `broker`. Each command takes `--config <file>`, which overrides the environment.
+`proxyx migrate control [--target all|database|clickhouse|opensearch|broker] [--check]` applies (or verifies) the relational schema, capture-store schema and broker topology. `database` selects PostgreSQL, MariaDB or SQLite from `database_url`; `postgres` remains an alias. `all` takes the store from `capture_store.backend` and the broker from `broker_kind` (a Kafka topic, or RabbitMQ exchanges and queues; Redis Streams needs none). Standalone `clickhouse`, `opensearch` and `broker` targets do not connect to the relational database. `--target clickhouse` does not create broker topology; use `all` or `broker`. Each command takes `--config <file>`, which overrides the environment.
 
 Configuration comes from `./control.toml` (or `/etc/proxyx/control.toml`), environment variables `PROXYX_CONTROL_<KEY>` (`__` nests, for example `PROXYX_CONTROL_CLICKHOUSE__URL`) and `--config`; see [configuration.md](configuration.md). The session data plane that consumes what this API creates is described in [session-proxy.md](session-proxy.md); the overall layout is in [architecture.md](architecture.md).
 
@@ -17,7 +17,7 @@ Configuration comes from `./control.toml` (or `/etc/proxyx/control.toml`), envir
 flowchart LR
     S[Service client] -->|"/rpc, Bearer pxk_ service key"| API[control api :9000]
     U[Operator or UI] -->|"/graphql, user or admin key"| API
-    API --> PG[(Postgres<br/>orgs, keys, session_lifecycle, view jobs)]
+    API --> PG[(Relational database<br/>orgs, keys, session_lifecycle, view jobs)]
     API --> R[(Redis<br/>session JSON, rate limits)]
     API --> CH[(ClickHouse<br/>reads)]
     API -->|SessionEnd| B[(Broker)]
@@ -37,7 +37,7 @@ flowchart LR
 | `api_addr` | `0.0.0.0:9000` | `control api`: `/rpc/*`, `/graphql`, health, metrics |
 | `ingester_health_addr` | `0.0.0.0:9001` | `control ingester`: `GET /health`, `GET /metrics` |
 
-Unauthenticated routes of the API: `GET /health`, `GET /health/live`, `GET /health/ready`, `GET /health/store`, `GET /health/broker`, `GET /rpc/health` (`/health/live` always returns `200` with an empty body; `/health/ready`, `/health` and `/rpc/health` return `200` only when Postgres (`SELECT 1`) and Redis (`PING`) both answer within 2 s, else `503`; the capture store is not part of readiness; `/health/store` probes it and `/health/broker` reports the captures-log producer, see below) and `GET /metrics`. The ingester's `/health` returns `200` while its consumer task runs, the capture store's circuit breaker is closed and the broker connection is up (Kafka, RabbitMQ), and `503` otherwise; `/metrics` is the Prometheus endpoint (catalogue: [metrics/session-proxy.md](metrics/session-proxy.md)). Requests carry W3C `traceparent` through to the server span.
+Unauthenticated routes of the API: `GET /health`, `GET /health/live`, `GET /health/ready`, `GET /health/store`, `GET /health/broker`, `GET /rpc/health` (`/health/live` always returns `200` with an empty body; `/health/ready`, `/health` and `/rpc/health` return `200` only when the relational database (`SELECT 1`) and Redis (`PING`) both answer within 2 s, else `503`; the capture store is not part of readiness; `/health/store` probes it and `/health/broker` reports the captures-log producer, see below) and `GET /metrics`. The ingester's `/health` returns `200` while its consumer task runs, the capture store's circuit breaker is closed and the broker connection is up (Kafka, RabbitMQ), and `503` otherwise; `/metrics` is the Prometheus endpoint (catalogue: [metrics/session-proxy.md](metrics/session-proxy.md)). Requests carry W3C `traceparent` through to the server span.
 
 ## Authentication
 
@@ -52,7 +52,7 @@ An error response from authentication has an empty body. `401` means missing or 
 
 ### `keys` (default): Bearer API keys
 
-Send `Authorization: Bearer pxk_...` (scheme is case-insensitive). A key is `pxk_` followed by 43 base64url characters (32 random bytes). Only its SHA-256 is stored in the Postgres table `api_keys`; the key is printed once, when created.
+Send `Authorization: Bearer pxk_...` (scheme is case-insensitive). A key is `pxk_` followed by 43 base64url characters (32 random bytes). Only its SHA-256 is stored in the relational database's `api_keys` table; the key is printed once, when created.
 
 | Kind | Bound to | Principal | Can call |
 |---|---|---|---|
@@ -60,7 +60,7 @@ Send `Authorization: Bearer pxk_...` (scheme is case-insensitive). A key is `pxk
 | `user` | one org | user with that org | `/graphql`, scoped to its org |
 | `admin` | no org | user with the `superadmin` role | `/graphql`, every org, and the superadmin mutations |
 
-Manage keys from any host that can reach Postgres (`database_url`):
+Manage keys from any host that can reach the configured relational database (`database_url`):
 
 ```sh
 proxyx control keys create --kind service --org acme --name crawler
@@ -191,7 +191,7 @@ Response `201`:
 | `400` | empty `org_id` or `source_id`; invalid override entry; malformed body |
 | `403` | org is not the principal's org |
 | `409` | an active session exists for the same `(org_id, source, source_id)` with different `upstream_overrides` or `insecure_upstream_tls` |
-| `500` | Redis or Postgres failure |
+| `500` | Redis or relational database failure |
 
 ```sh
 px -X POST $API/rpc/sessions -d '{
@@ -203,7 +203,7 @@ px -X POST $API/rpc/sessions -d '{
 ##### What creating a session does
 
 1. Looks for an active `session_lifecycle` row for `(org_id, source, source_id)`; if found, attaches (below).
-2. Otherwise reads the org row from Postgres. The org's rate limits (falling back to `default_rate_limit_rpm`/`default_rate_limit_burst` when the columns are `NULL`, or when the org does not exist) and egress proxy are copied into the session. If either limit is above 0, they are also written to Redis `{prefix}:ratelimit:{org}:config`.
+2. Otherwise reads the org row from the relational database. The org's rate limits (falling back to `default_rate_limit_rpm`/`default_rate_limit_burst` when the columns are `NULL`, or when the org does not exist) and egress proxy are copied into the session. If either limit is above 0, they are also written to Redis `{prefix}:ratelimit:{org}:config`.
 3. Writes the session JSON to `{prefix}:session:{session_id}:data` with an expiry of `ttl_secs`, and inserts the `session_lifecycle` row (`state = 'active'`, `ref_count = 1`). If the insert fails, the Redis key is deleted again; a unique violation (a concurrent create won) turns into an attach to the winner.
 
 A session's `org_id`, `source` and `source_id` become `org_id`, `source` and `source_id` of every capture made through it.
@@ -342,6 +342,8 @@ Full capture, with bodies. Header sets are JSON objects here:
 
 `POST /rpc/ws/search` and `/rpc/ws/count` take the same envelope with WebSocket branches and `payload_max_fetch_size` instead of the two body caps; there is no `end_cursor`. `GET /rpc/orgs/{org}/ws-messages/{id}` returns one message with its payload; `GET /rpc/orgs/{org}/captures/{parent_event_id}/ws-messages?cursor=&limit=&order=&payload_max_fetch_size=` returns one conversation (all messages of a `101` handshake row, whose `id` is the `parent_event_id`), served from the `ws_messages_by_parent` view.
 
+Malformed cursors return `400` on WebSocket search, count and conversation playback, before the capture store is queried.
+
 Message summaries:
 
 ```json
@@ -392,13 +394,13 @@ Selected by `op`:
 |---|---|---|
 | `contains` | `value` | case-insensitive substring |
 | `exact` | `value` | equality, case-sensitive |
-| `regex_match` | `value` | RE2, unanchored, case-sensitive (use `(?i)`); validated before the query, `400` if invalid |
+| `regex_match` | `value` | RE2, unanchored, case-sensitive (use `(?i)`), `.` does not match a newline (use `(?s)` to allow it; the OpenSearch store rejects `(?s)`); validated before the query, `400` if invalid |
 | `length` | `value` (an int filter) | octet length of the column |
 | `is_null`, `is_present` | none | `IS NULL` / `IS NOT NULL` |
 | `all`, `any` | `filters` (non-empty list) | AND / OR of nested filters |
 | `not` | `filter` | negation |
 
-For single alphanumeric tokens of at least three characters, a `contains` on a body column also uses a bloom-filter token probe, so such searches prune data without changing the result.
+`contains` matches any substring, including part of a word (`line` in `line1`), on every column and in both stores.
 
 #### Int filters
 
@@ -439,7 +441,7 @@ An org row holds default rate limits and one optional egress proxy. Sessions cop
 
 Creating an org and setting its limits also write the effective values (`burst`, `rpm`, after applying the control plane defaults) to Redis `{prefix}:ratelimit:{org}:config`, which the Redis rate-limit backend reads on each refill, so new limits reach running proxies without a new session. The write is best effort: a Redis failure is logged and the call still succeeds. The `limiter` backend instead uses the limits stored in the session. Defaults are `default_rate_limit_rpm` and `default_rate_limit_burst`, both 0 unless configured.
 
-`GET .../rate-limit-state` returns `{"org_id","exists","tokens","burst","rpm","last_refill_ms"}`: `burst` and `rpm` come from the Redis hash `{prefix}:ratelimit:{org}:config`, and `tokens` and `last_refill_ms` (the hash field `last_ms`) from `{prefix}:ratelimit:{org}`. `exists` is true once the proxy has touched the bucket. The GraphQL `rateLimitState` field returns the same values.
+`GET .../rate-limit-state` returns `{"org_id","exists","tokens","burst","rpm","last_refill_ms"}`: `burst` and `rpm` come from the Redis hash `{prefix}:ratelimit:{org}:config`, and `tokens` and `last_refill_ms` (the hash field `last_ms`) from `{prefix}:ratelimit:{org}`. `exists` is true when either bucket tokens or a configured burst exists, so creating an org or setting its limits can make it true before any proxied request. Missing token and refill values are returned as zero. The GraphQL `rateLimitState` field returns the same values.
 
 ### Certificate
 
@@ -456,9 +458,9 @@ px $API/rpc/views/2c9f...
 # 200 {"view_id":"2c9f...","status":"completed","s3_key":"traffic-views/acme/2c9f....parquet"}
 ```
 
-`POST /rpc/views` takes `{"org_id"?, "branches": [...]}` with the same HTTP branches as search (cursor, order and body options do not apply). The `view_id` is a UUIDv5 of the org and the canonical branches, so submitting an identical query returns the same view instead of exporting again. Response status: `200` if already `completed`, otherwise `202`. `status` is `pending`, `running`, `completed` or `failed`; a `failed` job is retried by the next `POST`.
+`POST /rpc/views` takes `{"org_id"?, "branches": [...]}` with the same HTTP branches as search (cursor, order and body options do not apply). The `view_id` is a UUIDv5 of the org and the canonical branches, so submitting an identical query returns the same view instead of exporting again. Response status: `200` if already `completed`, otherwise `202`. `status` is `pending`, `running`, `completed` or `failed`. A failed job retains its error until the next `POST` retries it. Each retry has a fresh ClickHouse query id, so a previous attempt's query log cannot determine the new attempt's status; the view id and object key stay the same.
 
-`GET /rpc/views/{view_id}` returns `view_id`, `status` and, when present, `s3_key`, `error`, `read_rows`, `written_rows`, `total_rows` (approximate while running). Polling is debounced to one ClickHouse check per 3 s per view. It reconciles the Postgres job row with `system.processes` and `system.query_log` (on every replica) and the object store; a job whose export cannot be found is reset to `pending` so the next `POST` re-exports. `404` for an unknown view or another org's view.
+`GET /rpc/views/{view_id}` returns `view_id`, `status` and, when present, `s3_key`, `error`, `read_rows`, `written_rows`, `total_rows` (approximate while running). Polling is debounced to one ClickHouse check per 3 s per view. It reconciles the database job row with `system.processes`, `system.query_log` and the object store. When ClickHouse defines a `cluster` macro, those checks scan every replica; stock single-node servers use local system tables. A job whose export cannot be found is reset to `pending` so the next `POST` re-exports. `404` for an unknown view or another org's view.
 
 The REST response carries no download link; the signed URL is returned by the GraphQL `trafficView` query and `createTrafficView` mutation.
 
@@ -468,6 +470,7 @@ The REST response carries no download link; the signed URL is returned by the Gr
 | `traffic_views_bucket` | empty | S3 bucket, or Azure container |
 | `traffic_views_azure_account` | empty | Azure storage account (required for `azure`) |
 | `traffic_views_s3_region` | `us-east-1` | region of the S3 bucket |
+| `traffic_views_s3_endpoint` | unset | optional HTTP(S) endpoint for S3-compatible storage; uses path-style URLs for both ClickHouse writes and API object checks/deletes |
 | `traffic_views_ttl_secs` | 86400 | completed exports are deleted this long after completion |
 | `cloudfront_domain`, `cloudfront_key_pair_id`, `cloudfront_private_key` | empty | S3 download URLs are CloudFront-signed; without all three there is no URL |
 | `export_preferred_block_size_bytes` | 33554432 | ClickHouse read block size for wide rows |
@@ -477,10 +480,10 @@ The REST response carries no download link; the signed URL is returned by the Gr
 
 Backends:
 
-- **S3.** ClickHouse writes with `s3()` using the API's own AWS credentials, which are sent in the `INSERT` statement and therefore appear in ClickHouse's query log. Download URLs are CloudFront canned-policy signed URLs valid for one hour.
-- **Azure Blob Storage.** ClickHouse writes with `azureBlobStorage()` and no credentials (its own workload identity); the API uses its workload identity for existence checks, deletes and user-delegation SAS read URLs valid for one hour.
+- **S3.** ClickHouse writes with `s3()` using the API's own AWS credentials, which are sent in the `INSERT` statement and therefore appear in ClickHouse's query log. `traffic_views_s3_region` configures both export URLs and SDK signing. For MinIO or another compatible service, set `traffic_views_s3_endpoint` to an HTTP(S) URL reachable from both the API and ClickHouse; optional path prefixes are preserved. Endpoint URLs must not contain credentials, a query or a fragment. Download URLs remain CloudFront canned-policy signed URLs valid for one hour.
+- **Azure Blob Storage.** ClickHouse writes with `azureBlobStorage()` and no credentials (its own workload identity); the API uses its workload identity for existence checks, deletes and user-delegation SAS read URLs valid for one hour. The API start fails with `creating Azure workload identity credential` unless the Entra workload-identity variables (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_FEDERATED_TOKEN_FILE`) are set, and both sides address `https://{account}.blob.core.windows.net`. A storage emulator such as Azurite cannot stand in: ClickHouse's credential-less `azureBlobStorage()` asks for an Entra bearer token, which it refuses to send over plain HTTP, and the SAS URLs need a user-delegation key from Entra. Live delivery needs an Azure storage account, a ClickHouse server whose identity may write the container, and an identity for the API with the data actions to read, delete and request user-delegation keys.
 
-Objects are named `traffic-views/{org_id}/{view_id}.parquet`. The export selects every column of the base table with bodies, without a cursor, and does not de-duplicate rows still present on disk twice. The reaper (every 60 s) deletes the object first and the job row second for completed views older than `traffic_views_ttl_secs`, measured from completion, in batches of 500.
+Objects are named `traffic-views/{org_id}/{view_id}.parquet`. In the object key (and `s3_key`) the characters `*`, `?`, `{`, `}`, `/`, `%` and control characters of the org id are written as `%XX` (an org id of only dots is written that way entirely), because ClickHouse reads `*`, `?`, `{` and `}` in an S3 path as a glob and refuses to write to it and rejects empty segments; every other character stays as is, so ordinary org ids keep the key shown above. The download URL percent-encodes the key as a URL path. The export selects every column of the base table with bodies, without a cursor, and does not de-duplicate rows still present on disk twice. The reaper (every 60 s) deletes the object first and the job row second for completed views older than `traffic_views_ttl_secs`, measured from completion, in batches of 500.
 
 ## GraphQL
 
@@ -507,7 +510,7 @@ curl -sS $API/graphql -H "Authorization: Bearer $USER_KEY" -H 'Content-Type: app
 | `httpRequest(id, orgId)` | one capture with bodies |
 | `wsTraffic(input)` | search WebSocket messages |
 | `wsMessage(id, orgId)` | one WebSocket message |
-| `traffic(input)` | unified, time-ordered feed of HTTP and WS (`kind`: `ALL`, `HTTP`, `WS`), merged under one cursor |
+| `traffic(input)` | unified, time-ordered feed of HTTP and WS (`kind`: `ALL`, `HTTP`, `WS`), merged under one cursor. A filter that exists for only one kind (`method`, `path`, `statusCode`, `correlationId`, `toolCallId` for HTTP; `direction`, `opcode`, `sessionId`, `parentEventId` for WS) does not restrict the other kind; use `kind` to select one. |
 | `wsConversations(input)` | one row per conversation with message counts and first and last time (no cursor; at most 5000) |
 | `trafficView(viewId, orgId)` | poll an export; includes `signedUrl` once completed |
 
@@ -540,6 +543,8 @@ proxyx control schema manifest --out dist --version "$GIT_SHA"
 
 `proxyx control ingester` listens on `ingester_health_addr` (default `0.0.0.0:9001`): `GET /health` is `200` while the consumer loop runs, the broker connection is up (Kafka and RabbitMQ track it) and the capture store's circuit breaker is closed, and `503` (body `consumer stopped`, `broker connection down` or `capture store circuit breaker open`) otherwise; `GET /metrics` exposes `proxyx_ingester_*` and `proxyx_capture_commit_lag_seconds`. It has no other routes.
 
+API and ingester listener bind failures terminate the command with an error instead of leaving a listenerless process running. On shutdown, the API allows in-flight requests up to 30 seconds to drain. An unexpected ingester consumer exit cancels the health server, drains the pipeline and terminates the command.
+
 ## Background work and configuration
 
 The API process runs the session reapers and view expiry every 60 s; the ingester runs the consumer and the ClickHouse flushers. Keys that matter for the API (all `PROXYX_CONTROL_*`):
@@ -549,7 +554,7 @@ The API process runs the session reapers and view expiry every 60 s; the ingeste
 | `env` | `dev` | `dev` skips the CIDR allowlist in `trusted_headers` mode |
 | `auth_mode` | `keys` | `keys` or `trusted_headers` |
 | `internal_allowed_cidrs` | empty | for `trusted_headers` outside dev |
-| `database_url` | empty | Postgres; required |
+| `database_url` | empty | PostgreSQL, MariaDB or SQLite URL; required for API, ingester, keys and the `database`/`all` migration targets |
 | `api_addr` | `0.0.0.0:9000` | |
 | `ingester_health_addr` | `0.0.0.0:9001` | |
 | `redis_url`, `redis_key_prefix` | `redis://127.0.0.1:6379`, `proxyx` | must match the proxy |

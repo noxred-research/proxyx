@@ -4,12 +4,13 @@
 //! the previous entry, so a deleted or edited line breaks the chain and `verify` finds it. A
 //! mutating call is recorded twice: an `intent` entry before the backend is touched (the call
 //! is refused when that write fails) and a `result` entry after. The file is created `0600` and
-//! opened in append mode; for stronger guarantees set the append-only attribute (`chattr +a`).
+//! opened in append mode. Each record locks the file while reading the tail and appending, so
+//! independent processes share one chain. For stronger guarantees set the append-only attribute
+//! (`chattr +a`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -62,17 +63,10 @@ pub struct Entry<'a> {
     pub duration_ms: Option<u64>,
 }
 
-struct Inner {
-    file: File,
-    seq: u64,
-    prev: String,
-}
-
 /// The audit log writer.
 pub struct Audit {
     path: PathBuf,
     engagement: Option<String>,
-    inner: Mutex<Inner>,
 }
 
 impl std::fmt::Debug for Audit {
@@ -178,34 +172,38 @@ impl Audit {
     /// Open (creating it) the log at `path` and continue its hash chain.
     ///
     /// # Errors
-    /// When the file or its directory cannot be created or the existing tail cannot be read.
+    /// When the file or its directory cannot be created, the file cannot be locked, or the
+    /// existing tail cannot be read.
     pub fn open(path: &Path, engagement: Option<String>) -> io::Result<Self> {
         if let Some(dir) = path.parent()
             && !dir.as_os_str().is_empty()
         {
             std::fs::create_dir_all(dir)?;
         }
-        let (seq, prev) = Self::tail_state(path)?;
+        let mut file = Self::locked_file(path)?;
+        Self::tail_state(&mut file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            engagement,
+        })
+    }
+
+    /// Open an independent handle; dropping it releases the exclusive lock on every exit path.
+    fn locked_file(path: &Path) -> io::Result<File> {
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.create(true).read(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
         let file = options.open(path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            engagement,
-            inner: Mutex::new(Inner { file, seq, prev }),
-        })
+        file.lock()?;
+        Ok(file)
     }
 
-    /// The sequence number and hash of the last entry of an existing log.
-    fn tail_state(path: &Path) -> io::Result<(u64, String)> {
-        let Ok(mut file) = File::open(path) else {
-            return Ok((0, GENESIS.to_owned()));
-        };
+    /// The sequence number and hash of the last entry, read while holding the file lock.
+    fn tail_state(file: &mut File) -> io::Result<(u64, String)> {
         let length = file.metadata()?.len();
         let window = length.min(1024 * 1024);
         file.seek(SeekFrom::Start(length - window))?;
@@ -218,8 +216,13 @@ impl Audit {
         };
         let value: Value = serde_json::from_str(last)
             .map_err(|_| io::Error::other("the audit log's last line is not valid JSON"))?;
-        let seq = value["seq"].as_u64().unwrap_or(0);
-        let hash = value["hash"].as_str().unwrap_or(GENESIS).to_owned();
+        let seq = value["seq"]
+            .as_u64()
+            .ok_or_else(|| io::Error::other("the audit log's last line has no sequence number"))?;
+        let hash = value["hash"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("the audit log's last line has no hash"))?
+            .to_owned();
         Ok((seq, hash))
     }
 
@@ -230,22 +233,22 @@ impl Audit {
     /// Append one entry and return its sequence number.
     ///
     /// # Errors
-    /// When the write fails. The chain does not advance in that case.
+    /// When opening, locking, reading the tail or writing fails. A broken tail is not reset.
     pub fn record(&self, entry: &Entry<'_>) -> io::Result<u64> {
         let arguments = redacted(entry.arguments);
         let caller = serde_json::to_value(entry.caller).unwrap_or(Value::Null);
         let detail = crate::redact::redact_text(entry.detail.unwrap_or(""));
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let seq = inner.seq + 1;
+        let mut file = Self::locked_file(&self.path)?;
+        let (last_seq, prev) = Self::tail_state(&mut file)?;
+        let seq = last_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("the audit log's sequence number is exhausted"))?;
         let ts = now_rfc3339();
-        let engagement = self.engagement.clone().unwrap_or_default();
+        let engagement = self.engagement.as_deref().unwrap_or_default();
         let hash = entry_hash(
             seq,
             &ts,
-            &inner.prev,
+            &prev,
             entry.phase.as_str(),
             entry.tool,
             entry.outcome,
@@ -254,12 +257,12 @@ impl Audit {
             entry.duration_ms.unwrap_or(0),
             &arguments,
             &caller,
-            &engagement,
+            engagement,
         );
         let line = json!({
             "seq": seq,
             "ts": ts,
-            "prev": inner.prev,
+            "prev": prev,
             "hash": hash,
             "phase": entry.phase.as_str(),
             "caller": caller,
@@ -273,10 +276,8 @@ impl Audit {
         });
         let mut bytes = serde_json::to_vec(&line).map_err(io::Error::other)?;
         bytes.push(b'\n');
-        inner.file.write_all(&bytes)?;
-        inner.file.flush()?;
-        inner.seq = seq;
-        inner.prev = hash;
+        file.write_all(&bytes)?;
+        file.flush()?;
         Ok(seq)
     }
 
@@ -431,6 +432,101 @@ mod tests {
         std::fs::write(&path, edited).expect("edit log");
         let report = verify(&path).expect("verify edited");
         assert_eq!(report.broken.map(|(line, _)| line), Some(2));
+    }
+
+    #[test]
+    fn independent_writers_share_the_latest_chain_tail() {
+        let path = temp("independent");
+        let stdio = Audit::open(&path, None).expect("open stdio");
+        let http = Audit::open(&path, None).expect("open http");
+        let stdio_caller = caller();
+        let http_caller = Caller {
+            transport: "http",
+            ..caller()
+        };
+        for (index, (audit, caller)) in [
+            (&stdio, &stdio_caller),
+            (&http, &http_caller),
+            (&stdio, &stdio_caller),
+            (&http, &http_caller),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = audit
+                .record(&Entry {
+                    phase: Phase::Result,
+                    caller,
+                    tool: "health",
+                    arguments: &json!({}),
+                    outcome: "ok",
+                    detail: None,
+                    change_id: None,
+                    duration_ms: Some(1),
+                })
+                .expect("record");
+            assert_eq!(seq, index as u64 + 1);
+        }
+        let report = verify(&path).expect("verify");
+        assert_eq!((report.entries, report.broken), (4, None));
+    }
+
+    #[test]
+    fn concurrent_independent_writers_preserve_the_chain() {
+        let path = temp("concurrent");
+        let first = Audit::open(&path, None).expect("open first");
+        let second = Audit::open(&path, None).expect("open second");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for audit in [&first, &second] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let caller = caller();
+                    barrier.wait();
+                    for _ in 0..20 {
+                        audit
+                            .record(&Entry {
+                                phase: Phase::Result,
+                                caller: &caller,
+                                tool: "health",
+                                arguments: &json!({}),
+                                outcome: "ok",
+                                detail: None,
+                                change_id: None,
+                                duration_ms: Some(1),
+                            })
+                            .expect("record");
+                    }
+                });
+            }
+        });
+        let report = verify(&path).expect("verify");
+        assert_eq!((report.entries, report.broken), (40, None));
+    }
+
+    #[test]
+    fn broken_tail_refuses_append_and_releases_the_file_lock() {
+        let path = temp("broken-tail");
+        let first = Audit::open(&path, None).expect("open first");
+        let second = Audit::open(&path, None).expect("open second");
+        let caller = caller();
+        let arguments = json!({});
+        let entry = Entry {
+            phase: Phase::Intent,
+            caller: &caller,
+            tool: "put_policy",
+            arguments: &arguments,
+            outcome: "intent",
+            detail: None,
+            change_id: None,
+            duration_ms: None,
+        };
+        for broken in ["not-json\n", "{}\n", "{\"seq\":1}\n"] {
+            std::fs::write(&path, broken).expect("break tail");
+            assert!(first.record(&entry).is_err());
+            assert!(second.record(&entry).is_err());
+            assert_eq!(std::fs::read_to_string(&path).expect("read log"), broken);
+        }
     }
 
     #[test]

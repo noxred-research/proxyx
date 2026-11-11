@@ -7,9 +7,9 @@
 //!
 //! Exports are **fire-and-forget**: `create_view` submits the INSERT query
 //! to ClickHouse with `wait_end_of_query=0` (returns immediately) and a
-//! deterministic `query_id` derived from the `view_id`. ClickHouse
-//! continues the query independently of the proxyx process lifetime.
-//! The ClickHouse specifics live behind [`ViewExporter`].
+//! `query_id` that names this attempt (view id plus a fresh UUID, stored on
+//! the job row). ClickHouse continues the query independently of the proxyx
+//! process lifetime. The ClickHouse specifics live behind [`ViewExporter`].
 //!
 //! All state reconciliation happens in `poll_view_status`, called by the
 //! `GET /rpc/views/{view_id}` handler. It checks, in order:
@@ -59,15 +59,45 @@ pub(crate) fn compute_view_id(org_id: &str, branches: &[QueryBranch]) -> Uuid {
     Uuid::new_v5(&VIEW_NS, &canonical)
 }
 
+/// Object key of the export of `view_id`.
+///
+/// ClickHouse treats `*`, `?`, `{` and `}` in an object path as glob
+/// metacharacters even when they arrive percent-encoded, and refuses to write
+/// to such a path (`the table is in readonly mode`); it also rejects an empty
+/// path segment (`//`), and the URL parser silently drops tabs and newlines.
+/// The org id is arbitrary text, so those characters, other control
+/// characters, `/` (so an org id can neither nest into another org's prefix
+/// nor produce empty or dot segments that URL path normalisation would
+/// collapse), `%` (the escape character) and an org id made only of dots are
+/// written as `%XX` in the key itself. The key is then an ordinary literal
+/// name for ClickHouse, the SDK and CloudFront alike, and distinct org ids
+/// keep distinct prefixes. Org ids without these characters keep the key they
+/// always had.
 pub(crate) fn s3_key(org_id: &str, view_id: Uuid) -> String {
-    format!("traffic-views/{org_id}/{view_id}.parquet")
+    let dots_only = org_id.bytes().all(|byte| byte == b'.');
+    let mut key = String::from("traffic-views/");
+    for character in org_id.chars() {
+        if dots_only
+            || character.is_control()
+            || matches!(character, '%' | '/' | '*' | '?' | '{' | '}')
+        {
+            let mut utf8 = [0u8; 4];
+            for byte in character.encode_utf8(&mut utf8).bytes() {
+                key.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            key.push(character);
+        }
+    }
+    format!("{key}/{view_id}.parquet")
 }
 
-/// ClickHouse query_id for a view export. Deterministic so we can find
-/// the query in `system.processes` / `system.query_log` without storing
-/// extra state.
-fn ch_query_id(view_id: Uuid) -> String {
-    format!("proxyx-export-{view_id}")
+/// ClickHouse query_id of one export attempt: the view id plus a fresh
+/// UUID. The view id (and so the object key) is deterministic, the attempt
+/// is not: a retry after a failure must not meet the query log of the failed
+/// attempt. The id in use is stored on the job row.
+fn new_attempt_id(view_id: Uuid) -> String {
+    format!("proxyx-export-{view_id}-{}", Uuid::new_v4())
 }
 
 /// Progress of a running export.
@@ -85,8 +115,8 @@ pub enum ExportOutcome {
 
 /// The part of a capture store that writes Parquet exports to object
 /// storage. Exports are identified by an export id (the ClickHouse
-/// `query_id`) that is derived from the view id, so progress and outcome can
-/// be found again without storing more state.
+/// `query_id`) that names one attempt and is stored on the job row, so
+/// progress and outcome can be found again.
 #[async_trait::async_trait]
 pub trait ViewExporter: Send + Sync {
     /// Start writing the export of `query` to `key` in `store` and return
@@ -140,14 +170,15 @@ pub(crate) async fn create_view(
     query: TrafficQuery,
 ) -> Result<ViewJobResult> {
     let view_id = compute_view_id(org_id, &query.branches.0);
-    let qid = ch_query_id(view_id);
     let key = s3_key(org_id, view_id);
 
-    // Upsert: insert or reclaim failed rows.
+    // Upsert: insert or reclaim failed rows. The row keeps the attempt id of
+    // a job in progress; the new id only lands on a created or reclaimed row.
     let row = db
-        .upsert_view_job(view_id, org_id, &qid)
+        .upsert_view_job(view_id, org_id, &new_attempt_id(view_id))
         .await
         .context("failed to upsert view job")?;
+    let qid = &row.query_id;
 
     // If already completed, just return.
     if row.status == "completed" {
@@ -164,7 +195,7 @@ pub(crate) async fn create_view(
     if row.status == "pending" {
         let mut query = query;
         crate::query::bound_to_sessions(db, &mut query).await?;
-        fire_export(config, store, exporter, db, view_id, &query, &qid, &key).await?;
+        fire_export(config, store, exporter, db, view_id, &query, qid, &key).await?;
     }
 
     // For "running" — a previous create already fired; the caller should poll.
@@ -200,7 +231,13 @@ async fn fire_export(
         return Ok(());
     }
 
-    exporter.submit(config, store, query, qid, key).await?;
+    if let Err(e) = exporter.submit(config, store, query, qid, key).await {
+        // Keep the failure on the row: the next create reclaims the job with a new attempt.
+        db.fail_view_job(view_id, qid, &format!("{e:#}"))
+            .await
+            .with_context(|| format!("failed to record export submit failure: {e:#}"))?;
+        return Err(e);
+    }
 
     tracing::info!(%view_id, %qid, "export query fired (fire-and-forget)");
     Ok(())
@@ -249,6 +286,19 @@ pub(crate) async fn poll_view_status(
             status: "completed".into(),
             s3_key: row.s3_key,
             error: None,
+            read_rows: row.read_rows,
+            written_rows: row.written_rows,
+            total_rows: row.total_rows,
+        }));
+    }
+
+    // ── failed: keep the row and its error until the next create reclaims it ──
+    if row.status == "failed" {
+        return Ok(Some(ViewPollResult {
+            view_id,
+            status: "failed".into(),
+            s3_key: None,
+            error: row.error,
             read_rows: row.read_rows,
             written_rows: row.written_rows,
             total_rows: row.total_rows,
@@ -335,29 +385,11 @@ pub(crate) async fn poll_view_status(
             let msg =
                 "export query finished but parquet file not found in object store".to_string();
             tracing::warn!(%view_id, %key, "{}", msg);
-            delete_job(db, view_id).await;
-            Ok(Some(ViewPollResult {
-                view_id,
-                status: "failed".into(),
-                s3_key: None,
-                error: Some(msg),
-                read_rows: None,
-                written_rows: None,
-                total_rows: None,
-            }))
+            fail_job(db, view_id, qid, msg).await
         }
         Some(ExportOutcome::Failed(exception)) => {
             tracing::warn!(%view_id, %exception, "export query failed in ClickHouse");
-            delete_job(db, view_id).await;
-            Ok(Some(ViewPollResult {
-                view_id,
-                status: "failed".into(),
-                s3_key: None,
-                error: Some(exception),
-                read_rows: None,
-                written_rows: None,
-                total_rows: None,
-            }))
+            fail_job(db, view_id, qid, exception).await
         }
         None => {
             // No log entry — query may not have started, or was lost.
@@ -389,6 +421,28 @@ pub(crate) async fn poll_view_status(
             }))
         }
     }
+}
+
+/// Record the failure of attempt `qid` and answer the poll with it. The row
+/// stays, so later polls see `failed` and the next create starts a new attempt.
+async fn fail_job(
+    db: &Db,
+    view_id: Uuid,
+    qid: &str,
+    error: String,
+) -> Result<Option<ViewPollResult>> {
+    db.fail_view_job(view_id, qid, &error)
+        .await
+        .context("failed to record export failure")?;
+    Ok(Some(ViewPollResult {
+        view_id,
+        status: "failed".into(),
+        s3_key: None,
+        error: Some(error),
+        read_rows: None,
+        written_rows: None,
+        total_rows: None,
+    }))
 }
 
 async fn delete_job(db: &Db, view_id: Uuid) {
@@ -451,4 +505,57 @@ pub async fn expire_completed_views(
         tracing::info!(expired, "expired traffic view exports");
     }
     Ok(expired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_ids_embed_the_view_id_and_never_repeat() {
+        let view_id = compute_view_id("org", &[]);
+        let (a, b) = (new_attempt_id(view_id), new_attempt_id(view_id));
+        let prefix = format!("proxyx-export-{view_id}-");
+        assert!(a.starts_with(&prefix) && b.starts_with(&prefix));
+        assert_ne!(a, b);
+        assert!(Uuid::parse_str(&a[prefix.len()..]).is_ok());
+    }
+
+    #[test]
+    fn export_key_keeps_ordinary_org_ids_and_escapes_unsafe_characters() {
+        let view = uuid::uuid!("00000000-0000-5000-8000-000000000001");
+        assert_eq!(
+            s3_key("acme-1.example_org:x@y é", view),
+            format!("traffic-views/acme-1.example_org:x@y é/{view}.parquet")
+        );
+        assert_eq!(
+            s3_key("e2ectl' *?#\"org", view),
+            format!("traffic-views/e2ectl' %2A%3F#\"org/{view}.parquet")
+        );
+        assert_eq!(
+            s3_key("a{1,2}%2A", view),
+            format!("traffic-views/a%7B1,2%7D%252A/{view}.parquet")
+        );
+        assert_eq!(
+            s3_key("x/.././/y/", view),
+            format!("traffic-views/x%2F..%2F.%2F%2Fy%2F/{view}.parquet")
+        );
+        assert_eq!(
+            s3_key("..", view),
+            format!("traffic-views/%2E%2E/{view}.parquet")
+        );
+        for org in ["*", "%2A", "a*", "a%2A", "{", "?", "..", ".", "a//b", "/a/"] {
+            let key = s3_key(org, view);
+            let prefix = key.strip_prefix("traffic-views/").unwrap();
+            assert!(
+                !prefix.contains(['*', '?', '{', '}']) && prefix.matches('/').count() == 1,
+                "{org:?} -> {key}"
+            );
+        }
+        assert_ne!(s3_key("*", view), s3_key("%2A", view));
+        assert_eq!(
+            s3_key("a\tb\nc\u{7f}", view),
+            format!("traffic-views/a%09b%0Ac%7F/{view}.parquet")
+        );
+    }
 }

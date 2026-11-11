@@ -59,11 +59,46 @@ pub(super) fn chunk_scan_traffic_source_ids(
 /// Capture store over a ClickHouse HTTP client.
 pub struct ClickHouseStore {
     client: clickhouse::Client,
+    /// Whether the server defines the `cluster` macro. Resolved once, on the
+    /// first export poll, so a stock single node needs no cluster setup.
+    has_cluster_macro: tokio::sync::OnceCell<bool>,
 }
 
 impl ClickHouseStore {
     pub fn new(client: clickhouse::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            has_cluster_macro: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// FROM-clause source for a `system.*` table that export polling reads.
+    /// A clustered deployment scans every replica; a server without the
+    /// `cluster` macro (stock single node) reads its own table.
+    async fn export_system_table(&self, table: &str) -> Result<String> {
+        use anyhow::Context as _;
+
+        let clustered = *self
+            .has_cluster_macro
+            .get_or_try_init(|| async {
+                let count: u64 = self
+                    .client
+                    .query("SELECT count() FROM system.macros WHERE macro = 'cluster'")
+                    .fetch_one()
+                    .await
+                    .context("failed to query system.macros")?;
+                Ok::<bool, anyhow::Error>(count > 0)
+            })
+            .await?;
+        Ok(system_table_source(clustered, table))
+    }
+}
+
+fn system_table_source(clustered: bool, table: &str) -> String {
+    if clustered {
+        format!("clusterAllReplicas('{{cluster}}', system.{table})")
+    } else {
+        format!("system.{table}")
     }
 }
 
@@ -483,9 +518,10 @@ impl ViewExporter for ClickHouseStore {
         Ok(())
     }
 
-    /// Check `system.processes` on every replica for a running query with the
-    /// given query_id. The export runs on whichever replica the submit request
-    /// reached, and a later poll may land on another one behind the Service.
+    /// Check `system.processes` for a running query with the given query_id:
+    /// on every replica when the server defines the `cluster` macro, since the
+    /// export runs on whichever replica the submit request reached and a later
+    /// poll may land on another one behind the Service.
     async fn progress(&self, qid: &str) -> Result<Option<ExportProgress>> {
         use anyhow::Context as _;
 
@@ -496,12 +532,13 @@ impl ViewExporter for ClickHouseStore {
             total_rows_approx: u64,
         }
 
+        let processes = self.export_system_table("processes").await?;
         let result: Option<Row> = self
             .client
-            .query(
+            .query(&format!(
                 "SELECT read_rows, written_rows, total_rows_approx \
-                 FROM clusterAllReplicas('{cluster}', system.processes) WHERE query_id = ?",
-            )
+                 FROM {processes} WHERE query_id = ?"
+            ))
             .bind(qid)
             .fetch_optional::<Row>()
             .await
@@ -514,8 +551,9 @@ impl ViewExporter for ClickHouseStore {
         }))
     }
 
-    /// Check `system.query_log` on every replica for a completed or failed query.
-    /// Only the replica that ran the export logs it.
+    /// Check `system.query_log` for a completed or failed query: on every
+    /// replica when the server defines the `cluster` macro. Only the replica
+    /// that ran the export logs it.
     async fn outcome(&self, qid: &str) -> Result<Option<ExportOutcome>> {
         use anyhow::Context as _;
 
@@ -526,17 +564,18 @@ impl ViewExporter for ClickHouseStore {
             exception: String,
         }
 
+        let query_log = self.export_system_table("query_log").await?;
         let result: Option<Row> = self
             .client
-            .query(
+            .query(&format!(
                 // `type` is Enum8; the client rejects decoding it into a String.
                 "SELECT toString(type) AS type, exception \
-                 FROM clusterAllReplicas('{cluster}', system.query_log) \
+                 FROM {query_log} \
                  WHERE query_id = ? \
                    AND type IN ('QueryFinish', 'ExceptionWhileProcessing') \
                  ORDER BY event_time DESC \
-                 LIMIT 1",
-            )
+                 LIMIT 1"
+            ))
             .bind(qid)
             .fetch_optional::<Row>()
             .await
@@ -555,6 +594,15 @@ impl ViewExporter for ClickHouseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_system_table_scans_all_replicas_only_when_clustered() {
+        assert_eq!(
+            system_table_source(true, "processes"),
+            "clusterAllReplicas('{cluster}', system.processes)"
+        );
+        assert_eq!(system_table_source(false, "query_log"), "system.query_log");
+    }
 
     #[test]
     fn scan_traffic_source_ids_are_deduplicated_and_bounded() {

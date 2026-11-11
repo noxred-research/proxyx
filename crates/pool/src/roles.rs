@@ -1,9 +1,11 @@
 //! The two serving roles. Each one starts the ops server first (so
 //! `/healthz` answers while a dependency is still down), connects to
-//! Postgres and Redis, loads the snapshot, builds its context, and runs its
-//! tasks until the `CancellationToken` fires. The ops server outlives the
-//! rest: on the stop request `/readyz` turns 503 and the drain stays
-//! scrapable, and the server stops once every other task has ended.
+//! Postgres and Redis, loads the snapshot, builds its context, binds the
+//! listeners it serves, and runs its tasks until the `CancellationToken`
+//! fires. `/readyz` stays 503 `starting` until the listeners are bound, so
+//! ready never precedes the sockets. The ops server outlives the rest: on the
+//! stop request `/readyz` turns 503 and the drain stays scrapable, and the
+//! server stops once every other task has ended.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +16,7 @@ use common::metrics::Metrics;
 use provider::MobileBoxClient;
 use store::loaded::Loaded;
 use store::{Db, Hot};
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +41,23 @@ struct Started {
     loaded: watch::Receiver<Arc<Loaded>>,
 }
 
+impl Started {
+    /// What `/readyz` checks. Publish it on the sender [`start`] returned only
+    /// once everything the role must own to serve is up.
+    fn ops_deps(&self) -> api::OpsDeps {
+        api::OpsDeps {
+            db: self.db.clone(),
+            hot: self.hot.clone(),
+            loaded: self.loaded.clone(),
+        }
+    }
+}
+
+/// The channel that makes the ops server report ready: `/readyz` answers 503
+/// `starting` until a role sends `Some` on it, which it does once the
+/// listeners it must own are bound.
+type OpsReady = watch::Sender<Option<api::OpsDeps>>;
+
 /// Start the ops server, connect, and load the first snapshot. `sync_git`
 /// is the gateway's duty: it copies changed git data into Postgres. `None`
 /// when `cancel` fired before startup finished.
@@ -46,7 +66,7 @@ async fn start(
     service: &str,
     sync_git: bool,
     cancel: &CancellationToken,
-) -> anyhow::Result<Option<(Tasks, Started)>> {
+) -> anyhow::Result<Option<(Tasks, Started, OpsReady)>> {
     let metrics = Arc::new(Metrics::new(service));
     let mut tasks = Tasks::new(cancel, settings.drain_timeout + STOP_MARGIN);
     let (deps_tx, deps_rx) = watch::channel(None);
@@ -78,33 +98,29 @@ async fn start(
             return if stopping { Ok(None) } else { Err(err) };
         }
     };
-    deps_tx.send_replace(Some(api::OpsDeps {
-        db: started.db.clone(),
-        hot: started.hot.clone(),
-        loaded: started.loaded.clone(),
-    }));
-    Ok(Some((tasks, started)))
+    Ok(Some((tasks, started, deps_tx)))
 }
 
-/// Serve tunnels and the control API.
+/// Serve tunnels and the control API. `/readyz` turns 200 only once the
+/// CONNECT, SOCKS5, probe and API listeners are bound by this process: a bind
+/// failure (an address in use) ends the role with an error naming the
+/// listener, and the ops server never reports ready.
 pub async fn gateway(
     settings: Settings,
     service: &str,
     exit_ip: ExitIpConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let Some((
-        mut tasks,
-        Started {
-            metrics,
-            db,
-            hot,
-            loaded,
-        },
-    )) = start(&settings, service, true, &cancel).await?
-    else {
+    let Some((mut tasks, started, deps)) = start(&settings, service, true, &cancel).await? else {
         return Ok(());
     };
+    let ops_deps = started.ops_deps();
+    let Started {
+        metrics,
+        db,
+        hot,
+        loaded,
+    } = started;
     let tunnels = gateway::Tunnels::default();
     let built = (|| {
         let api_state = api::ApiState::new(
@@ -123,13 +139,18 @@ pub async fn gateway(
         Ok(built) => built,
         Err(err) => return Err(tasks.fail(err).await),
     };
+    let bound = match bind_listeners(&settings).await {
+        Ok(bound) => bound,
+        Err(err) => return Err(tasks.fail(err).await),
+    };
+    deps.send_replace(Some(ops_deps));
     tasks.spawn(
         "api",
-        api::serve(settings.api_listen, api_state, cancel.clone()),
+        api::serve_listener(bound.api, api_state, cancel.clone()),
     );
     tasks.spawn(
         "gateway",
-        gateway::run(
+        gateway::run_on(
             gateway::GatewayCtx {
                 settings,
                 db,
@@ -141,31 +162,49 @@ pub async fn gateway(
                 metrics,
                 tunnels,
             },
+            bound.tunnels,
             cancel,
         ),
     );
     tasks.finish().await
 }
 
-/// Keep the pools, the static inventory and the quality checks healthy.
+/// The listeners of the gateway role, owned before it reports ready.
+struct GatewayListeners {
+    api: TcpListener,
+    tunnels: gateway::Bound,
+}
+
+/// Bind the control API and the tunnel listeners. The error names the
+/// listener and its address.
+async fn bind_listeners(settings: &Settings) -> anyhow::Result<GatewayListeners> {
+    let api = TcpListener::bind(settings.api_listen)
+        .await
+        .with_context(|| format!("failed to bind the control API to {}", settings.api_listen))?;
+    tracing::info!(addr = %settings.api_listen, "control API listening");
+    let tunnels = gateway::Bound::bind(settings).await?;
+    Ok(GatewayListeners { api, tunnels })
+}
+
+/// Keep the pools, the static inventory and the quality checks healthy. The
+/// warmer binds no listener besides the ops server: it is ready once its
+/// context is built.
 pub async fn warmer(
     settings: Settings,
     service: &str,
     exit_ip: ExitIpConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let Some((
-        mut tasks,
-        Started {
-            metrics,
-            db,
-            hot,
-            loaded,
-        },
-    )) = start(&settings, service, false, &cancel).await?
-    else {
+    let Some((mut tasks, started, deps)) = start(&settings, service, false, &cancel).await? else {
         return Ok(());
     };
+    let ops_deps = started.ops_deps();
+    let Started {
+        metrics,
+        db,
+        hot,
+        loaded,
+    } = started;
 
     let built = (|| {
         let (reputation, probe) = quality(&settings, &metrics)?;
@@ -185,6 +224,7 @@ pub async fn warmer(
         Ok(ctx) => ctx,
         Err(err) => return Err(tasks.fail(err).await),
     };
+    deps.send_replace(Some(ops_deps));
     tasks.spawn("warmer", warmer::run(ctx, cancel));
     tasks.finish().await
 }

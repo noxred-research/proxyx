@@ -13,7 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -465,10 +465,9 @@ impl std::fmt::Debug for AccessLog {
     }
 }
 
-/// Writer thread body: format and write each record, flushing whenever the channel runs dry
-/// so a tailing reader sees lines promptly; exit after draining once every sender is gone.
+/// Writer thread body: flush every record so sink failures count against that record,
+/// and exit after draining once every sender is gone.
 fn run_writer(rx: &Receiver<Msg>, mut sink: Sink, format: Format, dropped: &AtomicU64) {
-    let mut dirty = false;
     let mut failing = false;
     let mut note = |result: io::Result<()>, lost: u64| match result {
         Ok(()) => failing = false,
@@ -480,35 +479,25 @@ fn run_writer(rx: &Receiver<Msg>, mut sink: Sink, format: Format, dropped: &Atom
             }
         }
     };
-    loop {
-        let msg = match rx.try_recv() {
-            Ok(msg) => msg,
-            Err(TryRecvError::Empty) => {
-                if dirty {
-                    note(sink.writer.flush(), 0);
-                }
-                match rx.recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                }
-            }
-            Err(TryRecvError::Disconnected) => break,
-        };
+    while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Record(record) => {
                 let mut line = format_line(format, &record);
                 line.push('\n');
-                note(sink.writer.write_all(line.as_bytes()), 1);
-                dirty = true;
+                // Surface buffered sink failures while this record can still be counted.
+                note(
+                    sink.writer
+                        .write_all(line.as_bytes())
+                        .and_then(|()| sink.writer.flush()),
+                    1,
+                );
             }
             Msg::Reopen(ack) => {
                 let result = sink.reopen();
-                dirty = false;
                 let _ = ack.send(result);
             }
         }
     }
-    note(sink.writer.flush(), 0);
 }
 
 #[cfg(test)]
@@ -1101,9 +1090,11 @@ mod tests {
         let log = AccessLog::start(Box::new(Broken), None, Format::Squid, 16).expect("start");
         log.log(big.clone());
         log.log(big);
+        // Small records fail on BufWriter flush, not write_all.
+        log.log(http_record());
         let dropped = Arc::clone(&log.dropped);
         drop(log);
-        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
     }
 
     #[test]

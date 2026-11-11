@@ -14,10 +14,10 @@
               "bool": {
                 "filter": [
                   {
-                    "wildcard": {
+                    "regexp": {
                       "host": {
                         "case_insensitive": true,
-                        "value": "*stripe*"
+                        "value": ".*[Ssſ]tripe.*"
                       }
                     }
                   },

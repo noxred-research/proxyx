@@ -469,6 +469,13 @@ pub enum ProxyErrorCause {
     UpstreamError,
     /// The target did not answer in time.
     UpstreamTimeout,
+    /// The target's circuit breaker is open: the proxy made no dial and answered at once.
+    /// `Retry-After` says when the next probe is due.
+    UpstreamUnavailable,
+    /// The proxy's own TLS handshake with the target failed or its certificate did not verify.
+    UpstreamTls,
+    /// The proxy is at its connection limit and refused the connection.
+    ConnectionLimit,
 }
 
 impl ProxyErrorCause {
@@ -481,6 +488,9 @@ impl ProxyErrorCause {
             Self::UpstreamDns => "upstream_dns",
             Self::UpstreamError => "upstream_error",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::UpstreamUnavailable => "upstream_unavailable",
+            Self::UpstreamTls => "upstream_tls",
+            Self::ConnectionLimit => "connection_limit",
         }
     }
 
@@ -493,6 +503,9 @@ impl ProxyErrorCause {
             Self::UpstreamDns,
             Self::UpstreamError,
             Self::UpstreamTimeout,
+            Self::UpstreamUnavailable,
+            Self::UpstreamTls,
+            Self::ConnectionLimit,
         ]
         .into_iter()
         .find(|cause| cause.code() == code.trim())
@@ -507,7 +520,8 @@ impl ProxyErrorCause {
     }
 
     /// True when the same request can succeed later: a store outage, a refused or failed
-    /// upstream, or a timeout. An unknown session and a name that does not resolve are not.
+    /// upstream, a timeout, an open circuit breaker or a full proxy. An unknown session, a name
+    /// that does not resolve and an upstream certificate that does not verify are not.
     pub const fn is_retryable(self) -> bool {
         matches!(
             self,
@@ -515,6 +529,8 @@ impl ProxyErrorCause {
                 | Self::UpstreamRefused
                 | Self::UpstreamError
                 | Self::UpstreamTimeout
+                | Self::UpstreamUnavailable
+                | Self::ConnectionLimit
         )
     }
 }
@@ -1145,6 +1161,9 @@ mod tests {
             "upstream_dns",
             "upstream_error",
             "upstream_timeout",
+            "upstream_unavailable",
+            "upstream_tls",
+            "connection_limit",
         ] {
             assert_eq!(
                 ProxyErrorCause::from_code(code).map(ProxyErrorCause::code),
@@ -1161,6 +1180,9 @@ mod tests {
         assert_eq!(cause, ProxyErrorCause::UpstreamTimeout);
         assert!(cause.is_retryable());
         assert!(!ProxyErrorCause::SessionNotFound.is_retryable());
+        assert!(ProxyErrorCause::UpstreamUnavailable.is_retryable());
+        assert!(ProxyErrorCause::ConnectionLimit.is_retryable());
+        assert!(!ProxyErrorCause::UpstreamTls.is_retryable());
     }
 
     #[test]

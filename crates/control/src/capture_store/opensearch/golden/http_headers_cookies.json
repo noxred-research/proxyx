@@ -23,10 +23,10 @@
               }
             },
             {
-              "wildcard": {
+              "regexp": {
                 "mime_type": {
                   "case_insensitive": true,
-                  "value": "*json*"
+                  "value": ".*j[Ssſ]on.*"
                 }
               }
             },

@@ -497,7 +497,46 @@ async fn the_total_timeout_also_bounds_a_plain_http_request() {
         "{:?}",
         start.elapsed()
     );
-    assert!(!String::from_utf8_lossy(&out).contains("200 OK"));
+    let wire = String::from_utf8_lossy(&out);
+    assert!(
+        wire.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"),
+        "{wire}"
+    );
+    assert!(wire.contains("X-ProxyX-Error: timeout\r\n"), "{wire}");
+}
+
+#[tokio::test]
+async fn a_total_timeout_never_appends_an_error_to_a_started_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("origin.test:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(upstream.read(&mut request).await.unwrap() > 0);
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+    let edge = Edge::start(&format!("{OPEN}\n[timeouts]\ntotal = \"200ms\"\n")).await;
+    let mut client = TcpStream::connect(edge.addr("main")).await.unwrap();
+    client
+        .write_all(
+            format!("GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut wire = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut wire))
+        .await
+        .unwrap()
+        .unwrap();
+    let wire = String::from_utf8_lossy(&wire);
+    assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+    assert!(wire.ends_with("partial"), "{wire}");
+    assert!(!wire.contains("504"), "{wire}");
 }
 
 #[tokio::test]

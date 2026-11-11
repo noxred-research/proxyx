@@ -3,7 +3,7 @@
 //! request/response byte buffers avoid per-call allocation. Uses std blocking
 //! I/O; Rust ignores SIGPIPE by default so a broken pipe surfaces as an error.
 
-use crate::resilience::{retryable_disconnect, set_keepalive, Health};
+use crate::resilience::{set_keepalive, Health};
 use limiter_proto::{
     decode_consume_results, decode_create_results, decode_drain_results, decode_snapshot_results,
     encode_consume_reqs, encode_create_reqs, encode_drain_reqs, encode_snapshot_reqs, parse_frame,
@@ -13,21 +13,18 @@ use limiter_proto::{
 use limiter_proto::{decode_ping_results, encode_ping_reqs, PingResult, OP_PING};
 use socket2::SockRef;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Instant;
 
 pub struct Connection {
     stream: TcpStream,
-    peer_addr: SocketAddr,
     req: Vec<u8>,
     resp: Vec<u8>,
     /// Set for connections the pooled client opens: every exchange reports its
     /// outcome to the circuit breaker.
     health: Option<Arc<Health>>,
     pub(crate) last_used: Instant,
-    pub(crate) reused: bool,
-    response_started: bool,
 }
 
 fn invalid(msg: &'static str) -> io::Error {
@@ -93,16 +90,12 @@ impl Connection {
     }
 
     fn new(stream: TcpStream, health: Option<Arc<Health>>) -> io::Result<Self> {
-        let peer_addr = stream.peer_addr()?;
         Ok(Connection {
             stream,
-            peer_addr,
             req: Vec::with_capacity(4096),
             resp: Vec::with_capacity(4096),
             health,
             last_used: Instant::now(),
-            reused: false,
-            response_started: false,
         })
     }
 
@@ -114,21 +107,10 @@ impl Connection {
         result
     }
 
-    /// Read one frame, tracking the first response byte before any later error.
+    /// Read one response frame.
     fn read_frame_bytes(&mut self) -> io::Result<()> {
         self.resp.resize(4, 0);
-        loop {
-            match self.stream.read(&mut self.resp[..4]) {
-                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => {
-                    self.response_started = true;
-                    self.stream.read_exact(&mut self.resp[n..4])?;
-                    break;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        self.stream.read_exact(&mut self.resp[..4])?;
         let frame_len =
             u32::from_be_bytes([self.resp[0], self.resp[1], self.resp[2], self.resp[3]]) as usize;
         if !(5..=MAX_FRAME_BYTES).contains(&frame_len) {
@@ -141,30 +123,14 @@ impl Connection {
 
     /// Pipeline reads never reconnect or replay pending requests.
     fn read_frame(&mut self) -> io::Result<Frame<'_>> {
-        self.response_started = false;
         self.read_frame_bytes()?;
         parse_frame(&self.resp)?.ok_or_else(|| invalid("incomplete response frame"))
     }
 
-    fn exchange_once(&mut self) -> io::Result<()> {
-        self.stream.write_all(&self.req)?;
-        self.read_frame_bytes()
-    }
-
-    /// Only the first exchange after a pool checkout can recover an idle close.
+    /// Never replay an exchange: a lost response may follow an applied mutation.
     fn exchange(&mut self) -> io::Result<Frame<'_>> {
-        let reused = std::mem::take(&mut self.reused);
-        self.response_started = false;
-        if let Err(error) = self.exchange_once() {
-            if !reused || self.response_started || !retryable_disconnect(&error) {
-                return Err(error);
-            }
-            let Some(health) = &self.health else {
-                return Err(error);
-            };
-            self.stream = Self::connect_stream(self.peer_addr, health)?;
-            self.exchange_once()?;
-        }
+        self.stream.write_all(&self.req)?;
+        self.read_frame_bytes()?;
         parse_frame(&self.resp)?.ok_or_else(|| invalid("incomplete response frame"))
     }
 
@@ -216,7 +182,6 @@ impl Connection {
     /// Write one CONSUME frame without reading the response. Pair with
     /// `recv_consume` to let the caller control the in-flight (pipeline) window.
     pub fn send_consume(&mut self, reqs: &[ConsumeReq]) -> io::Result<()> {
-        self.reused = false;
         self.req.clear();
         encode_consume_reqs(&mut self.req, reqs);
         self.stream.write_all(&self.req)
@@ -292,7 +257,7 @@ mod tests {
             ..ResilienceConfig::default()
         }));
         let conn = Connection::connect_with(&addr.to_string(), health).unwrap();
-        assert_eq!(conn.peer_addr, addr);
+        assert_eq!(conn.stream.peer_addr().unwrap(), addr);
         let sock = SockRef::from(&conn.stream);
         assert!(sock.keepalive().unwrap());
         assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(30));
@@ -330,54 +295,72 @@ mod tests {
         assert!(!SockRef::from(&conn.stream).keepalive().unwrap());
     }
 
-    fn assert_ping_failure(
-        response: &'static [u8],
-        reused: bool,
-        attempts: usize,
-        expected: io::ErrorKind,
-    ) {
+    fn assert_ping_failure(response: &'static [u8], warmup: bool, expected: io::ErrorKind) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server_listener = listener.try_clone().unwrap();
         server_listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            for _ in 0..attempts {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                let (mut stream, _) = loop {
-                    match server_listener.accept() {
-                        Ok(accepted) => break accepted,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "missing expected connection");
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("accept failed: {error}"),
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match server_listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "missing expected connection");
+                        std::thread::sleep(Duration::from_millis(1));
                     }
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
-                let mut hello = [0; 5];
-                stream.read_exact(&mut hello).unwrap();
-                stream.write_all(&[VERSION]).unwrap();
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut hello = [0; 5];
+            stream.read_exact(&mut hello).unwrap();
+            stream.write_all(&[VERSION]).unwrap();
+            for index in 0..=usize::from(warmup) {
                 let mut header = [0; 4];
                 stream.read_exact(&mut header).unwrap();
                 let mut request = vec![0; u32::from_be_bytes(header) as usize];
                 stream.read_exact(&mut request).unwrap();
-                stream.write_all(response).unwrap();
+                if warmup && index == 0 {
+                    let mut bytes = header.to_vec();
+                    bytes.extend_from_slice(&request);
+                    let frame = limiter_proto::parse_frame(&bytes).unwrap().unwrap();
+                    let token =
+                        limiter_proto::decode_ping_reqs(frame.payload, frame.count).unwrap()[0];
+                    let mut reply = Vec::new();
+                    limiter_proto::write_frame_header(&mut reply, OP_PING, 1, 16);
+                    limiter_proto::push_ping_result(
+                        &mut reply,
+                        &PingResult {
+                            token,
+                            uptime_ns: 1,
+                        },
+                    );
+                    stream.write_all(&reply).unwrap();
+                } else {
+                    stream.write_all(response).unwrap();
+                }
             }
         });
-        let health = Arc::new(Health::new(ResilienceConfig {
-            connect_timeout: Duration::from_millis(500),
-            io_timeout: Duration::from_millis(500),
-            ..ResilienceConfig::default()
-        }));
-        let mut conn = Connection::connect_with(&addr.to_string(), Arc::clone(&health)).unwrap();
-        conn.reused = reused;
-        let error = conn.ping(7).unwrap_err();
+        let client = crate::Client::connect_with(
+            addr.to_string(),
+            crate::ClientConfig::default(),
+            ResilienceConfig {
+                connect_timeout: Duration::from_millis(500),
+                io_timeout: Duration::from_millis(500),
+                ..ResilienceConfig::default()
+            },
+        );
+        if warmup {
+            client.ping().unwrap();
+        }
+        let error = client.ping().unwrap_err();
         server.join().unwrap();
         assert_eq!(error.kind(), expected);
-        assert_eq!(health.stats().transport_errors, 1);
+        assert_eq!(client.stats().transport_errors, 1);
         listener.set_nonblocking(true).unwrap();
         assert!(matches!(
             listener.accept(),
@@ -387,31 +370,26 @@ mod tests {
 
     #[test]
     fn fresh_socket_disconnect_is_not_replayed() {
-        assert_ping_failure(&[], false, 1, io::ErrorKind::UnexpectedEof);
+        assert_ping_failure(&[], false, io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
-    fn reused_socket_disconnect_is_replayed_only_once() {
-        assert_ping_failure(&[], true, 2, io::ErrorKind::UnexpectedEof);
+    fn reused_socket_disconnect_is_not_replayed() {
+        assert_ping_failure(&[], true, io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
     fn partial_response_header_is_not_replayed() {
-        assert_ping_failure(&[0], true, 1, io::ErrorKind::UnexpectedEof);
+        assert_ping_failure(&[0], true, io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
     fn partial_response_payload_is_not_replayed() {
-        assert_ping_failure(
-            &[0, 0, 0, 5, OP_PING],
-            true,
-            1,
-            io::ErrorKind::UnexpectedEof,
-        );
+        assert_ping_failure(&[0, 0, 0, 5, OP_PING], true, io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
     fn invalid_response_frame_is_not_replayed() {
-        assert_ping_failure(&[0, 0, 0, 0], true, 1, io::ErrorKind::InvalidData);
+        assert_ping_failure(&[0, 0, 0, 0], true, io::ErrorKind::InvalidData);
     }
 }

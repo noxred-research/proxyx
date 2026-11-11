@@ -61,6 +61,9 @@ enum Command {
     /// Assess a running deployment from its datastores and ops endpoints.
     Assess(proxyx_ops::AssessArgs),
     /// Rate-limit service (in-memory token buckets over a binary TCP protocol).
+    #[command(
+        after_help = "Environment: PROXYX_LIMITER_MAX_BUCKETS (1048576), SHARDS (256), REAPER_MS (1000), MAX_CONNECTIONS (4096), IDLE_TIMEOUT_MS (60000), TCP_KEEPALIVE_SECS (60; 0 disables), METRICS_ADDR (off). All names use the PROXYX_LIMITER_ prefix."
+    )]
     Limiter {
         /// Listen address.
         #[arg(default_value = proxyx_limiter_server::DEFAULT_LISTEN)]
@@ -92,7 +95,7 @@ struct EdgeArgs {
 
 #[derive(Subcommand)]
 enum Migrate {
-    /// Pool gateway Postgres schema.
+    /// Pool relational database schema (PostgreSQL, MariaDB or SQLite).
     Pool {
         #[command(flatten)]
         config: PoolConfig,
@@ -100,8 +103,7 @@ enum Migrate {
         #[arg(long)]
         check: bool,
     },
-    /// Control plane Postgres and ClickHouse schema (and the Kafka topic when
-    /// the broker is Kafka-compatible).
+    /// Control plane relational database, capture store and broker schemas.
     Control {
         /// Configuration file; overrides the environment (`PROXYX_CONTROL_*`).
         #[arg(short, long)]

@@ -785,14 +785,20 @@ async fn get_capture(
     Ok(Json(capture))
 }
 
+fn validate_ws_query(query: &WsTrafficQuery) -> Result<(), AppError> {
+    crate::query::ws::validate_regex_patterns(query)
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    crate::query::ws::cursor_boundary(query).map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(())
+}
+
 async fn search_ws_traffic(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<ServicePrincipal>,
     Json(query): Json<RpcWsTrafficQuery>,
 ) -> Result<Json<crate::models::WsSearchResponse>, AppError> {
     let query = query.into_scoped(&principal)?;
-    crate::query::ws::validate_regex_patterns(&query)
-        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    validate_ws_query(&query)?;
     state.capture_store.check_ws_query(&query)?;
     let results = state.capture_store.search_ws(&query).await?;
     Ok(Json(results))
@@ -804,8 +810,7 @@ async fn count_ws_traffic(
     Json(query): Json<RpcWsTrafficQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let query = query.into_scoped(&principal)?;
-    crate::query::ws::validate_regex_patterns(&query)
-        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    validate_ws_query(&query)?;
     state.capture_store.check_ws_query(&query)?;
     let count = state.capture_store.count_ws(&query).await?;
     Ok(Json(serde_json::json!({ "count": count })))
@@ -865,6 +870,7 @@ async fn get_conversation_ws(
         order: q.order.unwrap_or_default(),
         payload_max_fetch_size: q.payload_max_fetch_size,
     };
+    validate_ws_query(&query)?;
     let results = state.capture_store.search_ws(&query).await?;
     Ok(Json(results))
 }
@@ -1113,4 +1119,62 @@ async fn get_view(
         written_rows: result.written_rows,
         total_rows: result.total_rows,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_query_rejects_invalid_cursor_encoding() {
+        for cursor in ["%", "invalid"] {
+            let query = serde_json::from_value::<WsTrafficQuery>(serde_json::json!({
+                "branches": [{}],
+                "cursor": cursor,
+            }))
+            .unwrap();
+            let err = validate_ws_query(&query).unwrap_err();
+            assert_eq!(err.message, "invalid cursor encoding");
+            assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn ws_query_rejects_invalid_cursor_length() {
+        for cursor in ["", "AA"] {
+            let query = serde_json::from_value::<WsTrafficQuery>(serde_json::json!({
+                "branches": [{}],
+                "cursor": cursor,
+            }))
+            .unwrap();
+            let err = validate_ws_query(&query).unwrap_err();
+            assert_eq!(err.message, "invalid cursor length");
+            assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn ws_query_accepts_valid_or_absent_cursor() {
+        let cursor =
+            crate::query::cursor::encode_cursor(time::OffsetDateTime::UNIX_EPOCH, 42, Uuid::nil());
+        for cursor in [None, Some(cursor)] {
+            let query = serde_json::from_value::<WsTrafficQuery>(serde_json::json!({
+                "branches": [{}],
+                "cursor": cursor,
+            }))
+            .unwrap();
+            assert!(validate_ws_query(&query).is_ok());
+        }
+    }
+
+    #[test]
+    fn ws_query_rejects_invalid_regex_without_cursor() {
+        let query = serde_json::from_value::<WsTrafficQuery>(serde_json::json!({
+            "branches": [{"host": {"op": "regex_match", "value": "["}}],
+        }))
+        .unwrap();
+        let err = validate_ws_query(&query).unwrap_err();
+        assert!(err.message.contains("regex compilation failed"));
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
 }

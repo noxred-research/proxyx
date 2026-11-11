@@ -104,6 +104,10 @@ def milestone_ms(entry: Mapping[str, object], key: str) -> float | None:
 def result_from_load(target: str, run: int, load: PageLoad) -> RunResult:
     """Classify a loaded document: blocked, an HTTP error, or ok."""
 
+    # Plain HTTP proxy authentication can load a 407 document instead of
+    # raising Chromium's proxy-auth navigation error. Neither measures a route.
+    if load.status == 407:
+        raise ProxyCredentialsRejected("proxy refused probe token: HTTP 407")
     reason = detect_block(load.status, load.final_url, load.headers, load.body)
     if reason is not None:
         outcome, error = Outcome.BLOCKED, None

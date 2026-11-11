@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use common::Secret;
 use common::config::humantime_secs;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::auth::Actor;
 use crate::error::{
     ApiBytes, ApiError, ApiJson, ApiPath as Path, ApiQuery as Query, ensure_object,
+    json_content_type,
 };
 use crate::state::ApiState;
 use crate::wire::{MAX_NAME_LEN, block_json, ensure_text, parse_org, parse_scope, random_token};
@@ -39,12 +40,19 @@ pub(crate) async fn create_key(
     State(state): State<Arc<ApiState>>,
     Path(org): Path<String>,
     Actor(actor): Actor,
+    headers: HeaderMap,
     ApiBytes(body): ApiBytes,
 ) -> Result<impl IntoResponse, ApiError> {
     let org = parse_org(&org)?;
     let body: KeyBody = if body.is_empty() {
         KeyBody::default()
     } else {
+        if !json_content_type(&headers) {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected request with `Content-Type: application/json`",
+            ));
+        }
         ensure_object(&body)?;
         serde_json::from_slice(&body)
             .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?

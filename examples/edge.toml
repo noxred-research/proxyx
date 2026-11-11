@@ -84,7 +84,8 @@ strategy = "round_robin"         # first, fifo, random, least_connections, stick
 [[pool]]
 name = "v6"
 # A whole routed IPv6 block: every connection draws a fresh address from it.
-# Needs `ip route add local 2001:db8:1234::/64 dev lo` on the host.
+# Needs `ip -6 route add local 2001:db8:1234::/64 dev lo` and
+# `sysctl -w net.ipv6.ip_nonlocal_bind=1` in the proxy's network namespace.
 prefixes = ["2001:db8:1234::/64"]
 strategy = "sticky"              # the same session id keeps the same address
 

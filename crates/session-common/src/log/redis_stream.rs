@@ -66,6 +66,12 @@ impl CaptureLogProducer for RedisStreamProducer {
     async fn flush_and_close(&self, _timeout: Duration) {
         // XADD is synchronous on the Redis side; nothing to flush.
     }
+
+    async fn probe(&self) -> Result<()> {
+        let mut conn = self.conn.clone();
+        redis::cmd("PING").query_async::<String>(&mut conn).await?;
+        Ok(())
+    }
 }
 
 /// `XREADGROUP`/`XAUTOCLAIM`/`XACK` consumer for one Redis Stream.

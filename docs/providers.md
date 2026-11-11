@@ -666,11 +666,15 @@ Rules:
 
 - Two services must return the same IPv4 address, and that address must have strictly more votes than any
   other. The quorum is taken over the services that answered; each failure counts in
-  `check_failures_total{service}`.
+  `check_failures_total{check}`.
 - The country of the exit is the strict majority among the winner's voters that report one, and must equal the
   wanted region's country. The city is advice only and is not checked.
 - A static IP must equal its inventory entry (not for a SIM box, whose exit changes, nor for a customer
   upstream, whose entry is an address and not its exit).
+- A private, loopback or otherwise unroutable exit is refused only for a `public_only` adapter (the `customer`
+  adapters, validated through `upstream/validate` as `private_exit`). An adapter without `public_only` fronts
+  upstreams you operate (a VPN egress, a lab) and may exit from a private address: the unit is admitted and its
+  `X-ProxyX-Exit-IP` is that address.
 - Each service call has a 5 s limit.
 - A [`local`](#local-units) unit has no proxy: the services are asked straight from the unit's bound source
   address, so the exit they see is that machine's own address. Only IPv4 answers vote, so give a `local` unit an
@@ -758,6 +762,9 @@ subdomains), on ports 80 and 443 or a page's own explicit port. Any other host i
 probe token that leaks from a browser process is not an open proxy; a page whose load needs a new host fails
 until it is listed in `extra_hosts`. The prober fetches the per-region list from
 [`GET /v1/probe/targets`](gateway.md#get-v1probetargets).
+HTTP pages use the probe listener's authenticated, single-exchange
+[HTTP forwarding](gateway.md#plain-http-probe-pages); HTTPS pages use CONNECT. Neither mode forwards
+the probe credential to the page's origin.
 
 The **light probe** makes 3 GETs per target through the upstream, reads the status, the time to first byte and
 the first 16 KiB, follows up to 3 redirects and uses a 10 s limit per request. A final status that is neither

@@ -22,7 +22,7 @@ From lowest to highest priority:
 
 A few rules apply to all components:
 
-- A `--config` file that does not exist is an error. A wrong mount path never silently starts the process on defaults.
+- An explicit `--config` path must name an existing regular file. A missing file or directory is rejected rather than silently starting on defaults or environment values. Default discovery locations may remain absent.
 - Durations of the pool gateway are plain seconds or `30s`, `5m`, `2h`. Durations of the session proxy and control plane are integer seconds or milliseconds as the key name says (`_secs`, `_ms`).
 - Secrets are never part of a pool configuration file. Provider logins, the admin token and scorer keys are files in `secrets_dir`; see [Pool gateway](#pool-gateway-and-warmer).
 - The pool gateway refuses a configuration **file** that contains an unknown key (a typo such as `max_connection`) and refuses values that would fail later (a zero timeout, a pending limit above `max_connections`). Unknown `PROXYX_POOL_*` environment variables are ignored, because orchestrators inject variables with that prefix.
@@ -65,7 +65,7 @@ Clients choose per lease with the username options `ttl` (session lifetime, boun
 | `redis_url` | `PROXYX_POOL_REDIS_URL` | `redis://localhost:6379` | Redis or Valkey for hot state (leases, ready sets, counters, cooldowns, breakers). Loss of this state is accepted and rebuilt from the database. Keep it separate from the session proxy's Redis, or use another database number (`redis://host:6379/1`). |
 | `connect_listen` | `PROXYX_POOL_CONNECT_LISTEN` | `0.0.0.0:8080` | HTTP CONNECT listener. |
 | `socks_listen` | `PROXYX_POOL_SOCKS_LISTEN` | `0.0.0.0:1080` | SOCKS5 listener. |
-| `probe_listen` | `PROXYX_POOL_PROBE_LISTEN` | `0.0.0.0:8082` | CONNECT listener for the prober's browsers. It accepts only signed probe tokens. |
+| `probe_listen` | `PROXYX_POOL_PROBE_LISTEN` | `0.0.0.0:8082` | Prober listener: HTTP CONNECT for HTTPS pages and authenticated single-exchange forwarding for plain HTTP pages. It accepts only signed probe tokens and the configured probe-target allowlist. |
 | `api_listen` | `PROXYX_POOL_API_LISTEN` | `0.0.0.0:8081` | Control API (`/v1/...`). |
 | `ops_listen` | `PROXYX_POOL_OPS_LISTEN` | `0.0.0.0:8888` | `/healthz`, `/readyz`, `/metrics`. |
 | `data_dir` | `PROXYX_POOL_DATA_DIR` | `/etc/proxyx/data` | Directory with `adapters/*.toml`, `policies/*.toml`, `inventory/*.toml` and `probe-targets.toml`. |
@@ -79,6 +79,12 @@ Clients choose per lease with the username options `ttl` (session lifetime, boun
 | `max_pending_connections` | `PROXYX_POOL_MAX_PENDING_CONNECTIONS` | `max_connections / 2` (at least 1) | Most connections that have not authenticated yet, across all listeners. Between 1 and `max_connections`. |
 | `max_pending_per_ip` | `PROXYX_POOL_MAX_PENDING_PER_IP` | a quarter of the pending limit, at least 16, at most the pending limit | Most unauthenticated connections of one source (an IPv4 address or an IPv6 /64). Raise it for clients behind one NAT or a load balancer without PROXY protocol. |
 | `tunnel_idle_timeout` | `PROXYX_POOL_TUNNEL_IDLE_TIMEOUT` | `10m` | A tunnel with no byte in either direction for this long is closed. Must be above zero. |
+| `tcp_keepalive` | `PROXYX_POOL_TCP_KEEPALIVE` | `true` | Enable TCP keepalive on accepted and upstream sockets. |
+| `tcp_keepalive_time` | `PROXYX_POOL_TCP_KEEPALIVE_TIME` | `60s` | Idle time before keepalive probes; positive when enabled. |
+| `tcp_keepalive_interval` | `PROXYX_POOL_TCP_KEEPALIVE_INTERVAL` | `15s` | Keepalive probe interval; positive when enabled. |
+| `tcp_keepalive_retries` | `PROXYX_POOL_TCP_KEEPALIVE_RETRIES` | `4` | Unanswered probes before disconnect; positive when enabled. |
+| `handshake_timeout` | `PROXYX_POOL_HANDSHAKE_TIMEOUT` | `10s` | Deadline to complete the client HTTP head or SOCKS negotiation; positive. |
+| `first_byte_timeout` | `PROXYX_POOL_FIRST_BYTE_TIMEOUT` | `3s` | New client silence limit; positive and no greater than `handshake_timeout`. |
 | `exit_ip_services` | `PROXYX_POOL_EXIT_IP_SERVICES` | unset (public services) | Comma list of `kind=url` that replaces the public exit-IP check services, for an isolated environment. It needs at least one of `cloudflare`, `ipinfo`, `ifconfig_co`, because only those report the exit country. |
 | `ipqs_base_url` | `PROXYX_POOL_IPQS_BASE_URL` | `https://ipqualityscore.com` | Origin of the IPQS reputation API. |
 | `abuseipdb_base_url` | `PROXYX_POOL_ABUSEIPDB_BASE_URL` | `https://api.abuseipdb.com` | Origin of the AbuseIPDB reputation API. |
@@ -92,6 +98,8 @@ Clients choose per lease with the username options `ttl` (session lifetime, boun
 | `sentry.traces_sample_rate` | `PROXYX_POOL_SENTRY__TRACES_SAMPLE_RATE` | `0.0` | Share of transactions sent, 0.0 to 1.0. Traces go to OpenTelemetry. |
 
 The base URLs must be `http://` or `https://` origins. Only a benchmark or an isolated environment with a stand-in service changes them.
+
+The gateway publishes readiness only after its first configuration snapshot and successful binding of CONNECT, SOCKS5, probe and control API listeners. A bind failure stops startup without reporting ready.
 
 ### Secret files
 
@@ -156,7 +164,7 @@ Per-org request rate limits. See [session-proxy.md](session-proxy.md#rate-limiti
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `stream_name` | `PROXYX_INTERCEPT_REQUEST_LOG__STREAM_NAME` | `proxyx:request_log` | Redis stream that receives captures. Must equal the control plane's `request_log_stream`. |
-| `channel_capacity` | `PROXYX_INTERCEPT_REQUEST_LOG__CHANNEL_CAPACITY` | `256` | Size of the in-process queue, and the largest batch handed to the producer. A full queue blocks the tunnel (backpressure). |
+| `channel_capacity` | `PROXYX_INTERCEPT_REQUEST_LOG__CHANNEL_CAPACITY` | `256` | Positive size of the in-process queue, and the largest batch handed to the producer. A full queue blocks the tunnel (backpressure); `0` is rejected at startup. |
 | `max_stream_len` | `PROXYX_INTERCEPT_REQUEST_LOG__MAX_STREAM_LEN` | `1000000` | Approximate `MAXLEN ~` of the Redis stream. `0` disables trimming. |
 
 ### `[tuning]`
@@ -166,7 +174,7 @@ Per-org request rate limits. See [session-proxy.md](session-proxy.md#rate-limiti
 | `max_body_capture` | `PROXYX_INTERCEPT_TUNING__MAX_BODY_CAPTURE` | `524288` | Largest request or response body (and WebSocket payload) kept in a capture, in bytes. Larger bodies are truncated and flagged. |
 | `max_ws_compressed_message_bytes` | `PROXYX_INTERCEPT_TUNING__MAX_WS_COMPRESSED_MESSAGE_BYTES` | `16777216` | Largest compressed (`permessage-deflate`) WebSocket message buffered for capture. A larger one closes the WebSocket with status `1009` before it is buffered.|
 | `max_header_capture` | `PROXYX_INTERCEPT_TUNING__MAX_HEADER_CAPTURE` | `512` | Largest header value kept, in bytes. |
-| `exchange_channel_capacity` | `PROXYX_INTERCEPT_TUNING__EXCHANGE_CHANNEL_CAPACITY` | `8` | Per-tunnel queue between the interception path and the capture publisher. |
+| `exchange_channel_capacity` | `PROXYX_INTERCEPT_TUNING__EXCHANGE_CHANNEL_CAPACITY` | `8` | Positive per-tunnel queue size between the interception path and capture publisher; `0` is rejected at startup. |
 | `max_connections` | `PROXYX_INTERCEPT_TUNING__MAX_CONNECTIONS` | `10000` | Most concurrent connections across all listeners. |
 | `shutdown_drain_timeout_secs` | `PROXYX_INTERCEPT_TUNING__SHUTDOWN_DRAIN_TIMEOUT_SECS` | `300` | How long a stopping proxy waits for tunnels before forcing exit. The capture buffer is then flushed for up to 30 s more, so the termination grace period has to cover both. |
 
@@ -282,8 +290,8 @@ Required when `broker_kind = "rabbitmq"`; shared with the control plane. See [ca
 | `auth_mode` | `PROXYX_CONTROL_AUTH_MODE` | `keys` | `keys`: `Authorization: Bearer pxk_...` checked against the `api_keys` table. `trusted_headers`: `x-proxyx-*` principal headers set by an authenticating gateway in front of the API. See [control-api.md](control-api.md#authentication). |
 | `http.request_timeout_secs` | `PROXYX_CONTROL_HTTP__REQUEST_TIMEOUT_SECS` | `60` | Deadline of one API request; past it the API answers `504`. `0` disables. |
 | `http.max_in_flight` | `PROXYX_CONTROL_HTTP__MAX_IN_FLIGHT` | `1024` | Requests served at once; more get `503` with `Retry-After: 1`. `0` disables. |
-| `http.per_key_rps` | `PROXYX_CONTROL_HTTP__PER_KEY_RPS` | `100` | Sustained requests per second per credential (or client address); over it `429` with `Retry-After`. `0` disables. |
-| `http.per_key_burst` | `PROXYX_CONTROL_HTTP__PER_KEY_BURST` | `200` | Burst of `per_key_rps`. |
+| `http.per_key_rps` | `PROXYX_CONTROL_HTTP__PER_KEY_RPS` | `100` | Sustained requests per second for each independent source-IP and normalized-credential bucket; either bucket can refuse with `429` and `Retry-After`. The source-IP bucket runs before authentication. `0` disables both. |
+| `http.per_key_burst` | `PROXYX_CONTROL_HTTP__PER_KEY_BURST` | `200` | Burst capacity for each source-IP and normalized-credential bucket. |
 | `internal_allowed_cidrs` | `PROXYX_CONTROL_INTERNAL_ALLOWED_CIDRS` | empty | Comma-separated CIDR allowlist for `/rpc/*` in `trusted_headers` mode, matched against the `X-Forwarded-For` client. Enforced outside `env = "dev"`. |
 | `database_url` | `PROXYX_CONTROL_DATABASE_URL` | empty | Database URL (orgs, session lifecycle, export jobs, API keys). Required. The scheme selects the backend as for the pool: `postgres://`, `mariadb://` or `mysql://`, `sqlite://PATH?mode=rwc`. The pool and the control plane may use different backends but need separate databases or files. See [databases.md](databases.md). |
 | `api_addr` | `PROXYX_CONTROL_API_ADDR` | `0.0.0.0:9000` | API listener. |
@@ -346,6 +354,7 @@ Exports exist only with the ClickHouse capture store; with `opensearch` they ans
 | `traffic_views_bucket` | `PROXYX_CONTROL_TRAFFIC_VIEWS_BUCKET` | empty | S3 bucket, or blob container for `azure`. |
 | `traffic_views_azure_account` | `PROXYX_CONTROL_TRAFFIC_VIEWS_AZURE_ACCOUNT` | empty | Storage account name. Required for `azure`. |
 | `traffic_views_s3_region` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_REGION` | `us-east-1` | AWS region of the bucket. |
+| `traffic_views_s3_endpoint` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_ENDPOINT` | unset | Optional HTTP(S) S3-compatible endpoint, with path-style bucket URLs for both ClickHouse exports and SDK HEAD/DELETE; reachable from the API and ClickHouse. Rejects userinfo, query strings and fragments. |
 | `traffic_views_ttl_secs` | `PROXYX_CONTROL_TRAFFIC_VIEWS_TTL_SECS` | `86400` | How long a completed export is kept, counted from completion. The reaper then deletes the object and the job row. |
 | `cloudfront_domain` | `PROXYX_CONTROL_CLOUDFRONT_DOMAIN` | empty | CloudFront distribution domain for signed download URLs. Required for signed URLs. |
 | `cloudfront_key_pair_id` | `PROXYX_CONTROL_CLOUDFRONT_KEY_PAIR_ID` | empty | CloudFront key pair id. |
@@ -389,7 +398,7 @@ The session proxy talks to the limiter through a pooled client (`backend = "limi
 |---|---|---|
 | Connect and handshake timeout | 1 s | A connect that does not finish counts as a transport failure. |
 | Exchange timeout | 1 s | One request/response on an open connection. On timeout the connection is dropped. |
-| Pooled maximum idle (`ResilienceConfig::max_idle`) | 30 s | Connections idle this long are dropped at checkout, before the server's default 60 s timeout. A reused socket that fails with EOF, reset or broken pipe before any response byte is retried once on a fresh connection; successful recovery does not count as a transport failure. Fresh connections, partial responses and timeouts are never retried. |
+| Pooled maximum idle (`ResilienceConfig::max_idle`) | 30 s | Connections idle this long are dropped at checkout, before the server's default 60 s timeout. Mutating requests are never replayed after a transport failure: the server may have applied the operation even when no response byte arrived. A failed connection is discarded; the next operation reconnects and the configured fail policy governs the failed operation. |
 | TCP keepalive | 30 s idle, 3 probes | Detects a peer that vanished without a FIN. |
 | Circuit breaker | opens after 5 consecutive transport failures, stays open 2 s, then lets one probe through | While open, no connection is attempted: `consume` returns at once the answer of the fail policy (`failopen_policy`: `grant_tokens` allows, `deny` rejects with the same `429`), and `create` fails. A `FULL` or `STALE` reply counts as a success, because the service answered. |
 
@@ -420,7 +429,7 @@ The fail policy still decides what a degraded `consume` means; the breaker only 
 | `idle` | `10m` | A tunnel with no byte in either direction this long is closed (also a UDP association). |
 | `keepalive` | `60s` | A client connection waiting for its next HTTP request. |
 | `response_header` | `60s` | Waiting for the target's response head after the request was sent. |
-| `total` | `0` | Longest one request, tunnel or UDP association may last; `0` is no limit. Every other timeout must be above zero. |
+| `total` | `0` | Longest one request, tunnel or UDP association may last; `0` is no limit. Every other setting in `[timeouts]` must be above zero. A plain HTTP request gets `504` if its final response has not started; otherwise the proxy closes the partial response without appending another response. |
 
 ### `[tcp.client]` and `[tcp.upstream]`
 
@@ -534,6 +543,8 @@ Circuit breakers, one per parent and one per explicitly listed egress address; s
 | `max_fails`, `fail_timeout` | inherit `[breaker.egress]` | Override the existing consecutive-failure threshold and breaker open interval for this pool. |
 | `latency_tolerance` | `50ms` | Retain the current address while its measured latency is within this of the fastest. |
 | `race_width` | `2` | Maximum concurrently dialed source-address candidates; must be positive. Prefix races have one candidate; prefix latency selection is rejected. |
+
+For generated, unassigned IPv6 source addresses on Linux, install a local route with `ip -6 route add local <prefix> dev lo` and enable `net.ipv6.ip_nonlocal_bind=1` in the proxy's network namespace. Persist both settings. The sysctl affects every application in that namespace. Prefix health checks sample bindability; they do not inspect the routing table or prove return-path reachability when nonlocal binding is enabled.
 
 ### `[[user]]`
 
@@ -687,10 +698,12 @@ Readiness checks behind `GET /health/ready`; see [session-proxy.md](session-prox
 
 | Key | Default | Meaning |
 |---|---|---|
-| `check_interval_ms` | `2000` | Period of the Redis ping and of the capture pipeline sample. |
+| `check_interval_ms` | `2000` | Period of the Redis ping and capture pipeline sample; while publishing is unhealthy, also schedules a backend recovery probe. |
 | `redis_timeout_ms` | `1000` | Time one Redis `PING` may take. |
 | `redis_failure_threshold` | `3` | Consecutive failed pings that make the `redis` check fail. |
 | `capture_stall_fraction` | `0.9` | The capture queue counts as full at this share of `request_log.channel_capacity`. In (0, 1]. |
 | `capture_stall_window_ms` | `30000` | How long the queue has to stay full before `capture_pipeline` fails. |
 | `capture_publish_stale_ms` | `60000` | Captures are queued or in flight but nothing was published for this long: `capture_pipeline` fails. |
 | `drain_notice_ms` | `0` | Pause between going not-ready and closing the listeners on shutdown. |
+
+A capture that exhausts its five publish attempts also fails `capture_pipeline`, even when fast failures keep the queue below its stall threshold. A clean published batch or successful backend probe clears that failure without restarting the process. Kafka publishes may remain in flight during the backend's internal retries, so its stale and queue-full windows still govern when readiness fails.

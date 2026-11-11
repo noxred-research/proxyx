@@ -231,12 +231,20 @@ browser_sample = 0.0
         format!("http://{}{path}", self.settings.api_listen)
     }
 
-    /// Wait until the ops server of the gateway reports ready.
+    /// Wait until the gateway's ops server reports ready and its API is listening.
     async fn wait_ready(&self, http: &reqwest::Client) -> TestResult {
         let url = format!("http://{}/readyz", self.settings.ops_listen);
         eventually(Duration::from_secs(60), || async {
             let res = http.get(&url).send().await.ok()?;
-            res.status().is_success().then_some(())
+            if !res.status().is_success() {
+                return None;
+            }
+            drop(
+                tokio::net::TcpStream::connect(self.settings.api_listen)
+                    .await
+                    .ok()?,
+            );
+            Some(())
         })
         .await
         .ok_or("the gateway never became ready")?;

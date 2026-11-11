@@ -9,14 +9,12 @@ mod evaluate;
 mod facts;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand};
 use common::config::Settings;
 use common::metrics::Metrics;
-use tokio_util::sync::CancellationToken;
 
 pub use collect::{collect, probe_gateway};
 pub use evaluate::{
@@ -95,30 +93,17 @@ pub fn ops_url(listen: std::net::SocketAddr) -> String {
 }
 
 /// Connect and load the pool as the roles do (no git sync), read it, and judge it.
+///
+/// The load runs once, with no reload loop behind it, and the Postgres pool is
+/// closed before the gateway is asked: nothing of this call keeps a session
+/// (or anything it could lock) on the database after it returns.
 pub async fn assess_pool(settings: &Settings, args: &PoolAssessArgs) -> anyhow::Result<Assessment> {
     let db = store::Db::connect(settings.database_url.expose())
         .await
         .context("cannot connect to Postgres")?;
-    let hot = store::Hot::connect(settings.redis_url.expose())
-        .await
-        .context("cannot connect to Redis")?;
-    let cancel = CancellationToken::new();
-    let metrics = Arc::new(Metrics::new("proxyx-assess"));
-    let loaded =
-        store::loaded::sync_and_watch(db.clone(), settings, metrics, cancel.clone(), false)
-            .await
-            .context("cannot load the pool configuration (policies, adapters, inventory)")?;
-    let loaded = loaded.borrow().clone();
-    cancel.cancel();
-    let mut facts = collect(
-        &db,
-        &hot,
-        &loaded,
-        time::OffsetDateTime::now_utc(),
-        args.window,
-    )
-    .await
-    .context("cannot read the pool state")?;
+    let facts = read_pool(&db, settings, args).await;
+    db.close().await;
+    let mut facts = facts?;
     if !args.no_gateway {
         let url = args
             .ops_url
@@ -127,6 +112,29 @@ pub async fn assess_pool(settings: &Settings, args: &PoolAssessArgs) -> anyhow::
         facts.gateway = Some(probe_gateway(&url, args.timeout, settings.reload_every).await);
     }
     Ok(evaluate(&facts, &Thresholds::default()))
+}
+
+async fn read_pool(
+    db: &store::Db,
+    settings: &Settings,
+    args: &PoolAssessArgs,
+) -> anyhow::Result<PoolFacts> {
+    let hot = store::Hot::connect(settings.redis_url.expose())
+        .await
+        .context("cannot connect to Redis")?;
+    let metrics = Metrics::new("proxyx-assess");
+    let loaded = store::loaded::load(db, settings, &metrics, false)
+        .await
+        .context("cannot load the pool configuration (policies, adapters, inventory)")?;
+    collect(
+        db,
+        &hot,
+        &loaded,
+        time::OffsetDateTime::now_utc(),
+        args.window,
+    )
+    .await
+    .context("cannot read the pool state")
 }
 
 /// `proxyx assess`: print the assessment and return its exit code: 0 all OK,

@@ -284,15 +284,14 @@ impl RabbitMqConfig {
                     .with_context(|| format!("reading rabbitmq.tls.client_cert {cert}"))?;
                 let key_pem = std::fs::read(key)
                     .with_context(|| format!("reading rabbitmq.tls.client_key {key}"))?;
-                let der = {
+                // The identity wants the PEM bytes (the TLS backend parses
+                // them itself); parse once here so a bad key names its file.
+                {
                     use rustls::pki_types::pem::PemObject as _;
                     rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
-                        .context("parsing rabbitmq.tls.client_key")?
-                };
-                Some(OwnedIdentity::PKCS8 {
-                    pem,
-                    key: der.secret_der().to_vec(),
-                })
+                        .context("parsing rabbitmq.tls.client_key")?;
+                }
+                Some(OwnedIdentity::PKCS8 { pem, key: key_pem })
             }
             (None, None) => None,
             _ => bail!("rabbitmq.tls.client_cert and client_key must be set together"),
@@ -799,6 +798,52 @@ impl CaptureLogProducer for RabbitMqProducer {
     fn healthy(&self) -> bool {
         self.state.is_up()
     }
+
+    /// Reconnect if needed, then passively declare every partition queue:
+    /// a round trip that fails while the broker is down, frozen or missing a
+    /// queue (which would make every publish come back unroutable).
+    async fn probe(&self) -> Result<()> {
+        self.channel().await?;
+        let guard = self.session.lock().await;
+        let Some(session) = guard.as_ref() else {
+            bail!("RabbitMQ connection was lost");
+        };
+        let timeout = Duration::from_secs(self.config.confirm_timeout_secs);
+        let checked = tokio::time::timeout(timeout, async {
+            for partition in 0..self.config.partitions {
+                let queue = self.config.queue_name(partition);
+                // A passive declare of a missing queue closes its channel,
+                // so each gets its own.
+                let channel = session.connection.create_channel().await?;
+                channel
+                    .queue_declare(
+                        queue.clone().into(),
+                        QueueDeclareOptions {
+                            passive: true,
+                            durable: true,
+                            ..QueueDeclareOptions::default()
+                        },
+                        FieldTable::default(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("queue {queue} is missing (run `proxyx migrate control`)")
+                    })?;
+                let _ = channel.close(200, "probe".into()).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        match checked {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                drop(guard);
+                self.drop_session().await;
+                Err(anyhow!("RabbitMQ did not answer within {timeout:?}"))
+            }
+        }
+    }
 }
 
 struct ConsumerSession {
@@ -1038,6 +1083,46 @@ mod tests {
         assert_eq!(c.queue_name(11), "cap.p11");
         assert_eq!(c.dead_queue_name(), "cap.dead");
         assert_eq!(RabbitMqConfig::routing_key(7), "p07");
+    }
+
+    /// lapin's rustls backend parses the identity key itself and wants the
+    /// PEM text; handing it DER failed every mutual-TLS connection.
+    #[test]
+    fn a_client_key_reaches_the_tls_backend_as_pem() {
+        use rustls::pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject,
+        };
+
+        let rcgen::CertifiedKey {
+            cert: certificate,
+            key_pair,
+        } = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("proxyx-rabbit-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key) = (dir.join("client.pem"), dir.join("client.key"));
+        std::fs::write(&cert, certificate.pem()).unwrap();
+        std::fs::write(&key, key_pair.serialize_pem()).unwrap();
+        let mut c = RabbitMqConfig::new("amqps://localhost/%2f");
+        c.tls = Some(TlsConfig {
+            ca_cert: None,
+            client_cert: Some(cert.to_string_lossy().into_owned()),
+            client_key: Some(key.to_string_lossy().into_owned()),
+        });
+        let Some(OwnedIdentity::PKCS8 { pem, key }) = c.tls_config().unwrap().identity else {
+            panic!("a client identity was configured");
+        };
+        let certificate = CertificateDer::from_pem_slice(&pem).unwrap();
+        let private_key = PrivatePkcs8KeyDer::from_pem_slice(&key).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_client_auth_cert(vec![certificate], PrivateKeyDer::Pkcs8(private_key))
+        .unwrap();
+        assert!(client.client_auth_cert_resolver.has_certs());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -389,6 +389,9 @@ pub struct LlmConfig {
     pub model: String,
     #[serde(default)]
     pub api_key_file: Option<PathBuf>,
+    /// PEM file of extra root certificates to trust, for an endpoint behind a private CA.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
     #[serde(default = "default_llm_timeout")]
     pub timeout_secs: u64,
     /// Most characters of captured content sent to the model.

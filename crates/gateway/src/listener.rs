@@ -132,6 +132,27 @@ async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> bool {
     }
 }
 
+/// Always finish relay accounting. Once the relay closes its channel, drain
+/// any response bytes already buffered by the bridge instead of cancelling it.
+async fn complete_http_exchange(
+    relaying: impl Future<Output = ()>,
+    exchange: impl Future<Output = std::io::Result<()>>,
+    drain_timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::pin!(relaying, exchange);
+    tokio::select! {
+        () = &mut relaying => {
+            timeout(drain_timeout, &mut exchange).await.map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP probe response drain timed out")
+            })?
+        }
+        result = &mut exchange => {
+            relaying.await;
+            result
+        }
+    }
+}
+
 /// True when the client sent a first byte (or closed) in time; the byte stays
 /// in the socket for the reader. A silent client ends here, counted as a
 /// request that timed out.
@@ -158,7 +179,7 @@ async fn serve_connect(
     }
     let head = match timeout(
         gw.settings.handshake_timeout,
-        wire::read_connect(&mut client),
+        wire::read_connect(&mut client, listener == Listener::Probe),
     )
     .await
     {
@@ -203,6 +224,28 @@ async fn serve_connect(
             return;
         }
     };
+    if let Some(http) = head.http {
+        // Only sanitized headers enter the relay. The bridge forwards exactly
+        // one framed body, not buffered pipeline bytes or later credentials.
+        let (channel, relay_client) = tokio::io::duplex(8 * 1024);
+        let exit_ip = opened.tunnel.lease.grant.ip;
+        let copying = relay(&gw, opened.tunnel, relay_client, opened.stream, http.head);
+        let exchange = wire::http_exchange(
+            client,
+            channel,
+            head.leftover,
+            http.body,
+            http.head_only,
+            &opened.session,
+            exit_ip,
+        );
+        if let Err(error) =
+            complete_http_exchange(copying, exchange, gw.settings.tunnel_idle_timeout).await
+        {
+            tracing::debug!(%error, "HTTP probe exchange ended");
+        }
+        return;
+    }
     let reply = wire::established(&opened.session, opened.tunnel.lease.grant.ip);
     if !write_reply(&mut client, &reply).await {
         opened.tunnel.finish(&gw).await;
@@ -322,6 +365,58 @@ async fn serve_socks(gw: Arc<Gateway>, mut client: TcpStream, pending: Pending) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_completed_relay_does_not_cancel_a_buffered_http_response() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let payload = vec![b'p'; 32 * 1024];
+        let exchange = async {
+            writer.write_all(&payload).await?;
+            writer.shutdown().await
+        };
+        let receive = async {
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).await.expect("response");
+            received
+        };
+        let (result, received) = tokio::join!(
+            complete_http_exchange(std::future::ready(()), exchange, Duration::from_secs(1)),
+            receive,
+        );
+        result.expect("drain response after relay completion");
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_relay_bounds_a_stalled_http_response_drain() {
+        let error = complete_http_exchange(
+            std::future::ready(()),
+            std::future::pending(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("stalled bridge must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn an_http_bridge_error_still_finishes_relay_accounting() {
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let relaying = async {
+            tokio::task::yield_now().await;
+            finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        };
+        let result = complete_http_exchange(
+            relaying,
+            std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::InvalidData))),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(finished.load(std::sync::atomic::Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn an_accepted_client_socket_has_nodelay_and_keepalive_on() {

@@ -129,7 +129,7 @@ fn ping_round_trips_over_sync_and_async_clients() {
 }
 
 #[test]
-fn sync_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
+fn sync_consume_degrades_after_idle_disconnect_and_recovers_on_next_operation() {
     let server = spawn(
         "127.0.0.1:0",
         Some("127.0.0.1:0"),
@@ -146,15 +146,23 @@ fn sync_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
 
     let outcome = bucket.consume(1);
     assert!(outcome.allowed);
+    assert!(outcome.degraded);
+    assert_eq!(outcome.remaining, 0);
+    assert_eq!(client.stats().transport_errors, 1);
+    assert_eq!(client.stats().circuit_opens, 0);
+    assert_eq!(client.circuit_state(), CircuitState::Closed);
+
+    let outcome = bucket.consume(1);
+    assert!(outcome.allowed);
     assert!(!outcome.degraded);
     assert_eq!(outcome.remaining, 1);
-    assert_eq!(client.stats().transport_errors, 0);
+    assert_eq!(client.stats().transport_errors, 1);
     assert_eq!(client.stats().circuit_opens, 0);
     assert_eq!(client.circuit_state(), CircuitState::Closed);
 }
 
 #[test]
-fn async_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
+fn async_consume_degrades_after_idle_disconnect_and_recovers_on_next_operation() {
     let server = spawn(
         "127.0.0.1:0",
         Some("127.0.0.1:0"),
@@ -178,9 +186,19 @@ fn async_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
             .await
             .unwrap();
         assert!(outcome.allowed);
+        assert!(outcome.degraded);
+        assert_eq!(outcome.remaining, 0);
+        assert_eq!(client.stats().transport_errors, 1);
+        assert_eq!(client.stats().circuit_opens, 0);
+        assert_eq!(client.circuit_state(), CircuitState::Closed);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), bucket.consume(1))
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
         assert!(!outcome.degraded);
         assert_eq!(outcome.remaining, 1);
-        assert_eq!(client.stats().transport_errors, 0);
+        assert_eq!(client.stats().transport_errors, 1);
         assert_eq!(client.stats().circuit_opens, 0);
         assert_eq!(client.circuit_state(), CircuitState::Closed);
     });
@@ -641,9 +659,9 @@ fn async_checkout_drops_expired_connections_before_the_server_idle_timeout() {
 }
 
 #[test]
-fn sync_replay_is_limited_to_one_reused_connection_without_response_bytes() {
+fn sync_ambiguous_disconnect_is_not_replayed() {
     for (on_consume, max_idle, expected_connections, expected_consumes) in [
-        (OnConsume::Hangup, Duration::from_secs(30), 2, 2),
+        (OnConsume::Hangup, Duration::from_secs(30), 1, 1),
         (OnConsume::PartialResponse, Duration::from_secs(30), 1, 1),
         (OnConsume::Hangup, Duration::ZERO, 2, 1),
     ] {
@@ -685,14 +703,14 @@ fn sync_replay_is_limited_to_one_reused_connection_without_response_bytes() {
 }
 
 #[test]
-fn async_replay_is_limited_to_one_reused_connection_without_response_bytes() {
+fn async_ambiguous_disconnect_is_not_replayed() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async {
         for (on_consume, max_idle, expected_connections, expected_consumes) in [
-            (OnConsume::Hangup, Duration::from_secs(30), 2, 2),
+            (OnConsume::Hangup, Duration::from_secs(30), 1, 1),
             (OnConsume::PartialResponse, Duration::from_secs(30), 1, 1),
             (OnConsume::Hangup, Duration::ZERO, 2, 1),
         ] {

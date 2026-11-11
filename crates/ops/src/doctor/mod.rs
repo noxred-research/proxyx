@@ -155,6 +155,21 @@ fn any_file(paths: &[&str]) -> bool {
     paths.iter().any(|p| std::path::Path::new(p).is_file())
 }
 
+fn limiter_configured(addr: Option<&str>, present: impl Fn(&str) -> bool) -> bool {
+    addr.is_some()
+        || [
+            "PROXYX_LIMITER_MAX_BUCKETS",
+            "PROXYX_LIMITER_SHARDS",
+            "PROXYX_LIMITER_REAPER_MS",
+            "PROXYX_LIMITER_MAX_CONNECTIONS",
+            "PROXYX_LIMITER_IDLE_TIMEOUT_MS",
+            "PROXYX_LIMITER_TCP_KEEPALIVE_SECS",
+            "PROXYX_LIMITER_METRICS_ADDR",
+        ]
+        .into_iter()
+        .any(present)
+}
+
 /// The roles `--role all` finds configuration for.
 fn detect(configs: &Configs, ctx: &Ctx) -> Vec<Plan> {
     let mut plans = Vec::new();
@@ -170,11 +185,7 @@ fn detect(configs: &Configs, ctx: &Ctx) -> Vec<Plan> {
     {
         plans.push(Plan::Control(control::Kind::Both, "control"));
     }
-    if ctx.limiter_addr.is_some()
-        || ["MAX_BUCKETS", "SHARDS", "REAPER_MS"]
-            .iter()
-            .any(|k| present(&format!("PROXYX_LIMITER_{k}")))
-    {
+    if limiter_configured(ctx.limiter_addr.as_deref(), present) {
         plans.push(Plan::Limiter);
     }
     if configs.edge.is_some() || any_file(&["/etc/proxyx/edge.toml"]) {
@@ -297,5 +308,22 @@ mod tests {
         assert_eq!(parse_timeout("2"), Ok(Duration::from_secs(2)));
         assert!(parse_timeout("0").is_err());
         assert!(parse_timeout("fast").is_err());
+    }
+
+    #[test]
+    fn every_limiter_variable_selects_the_role_without_a_listen_address() {
+        for var in [
+            "PROXYX_LIMITER_MAX_BUCKETS",
+            "PROXYX_LIMITER_SHARDS",
+            "PROXYX_LIMITER_REAPER_MS",
+            "PROXYX_LIMITER_MAX_CONNECTIONS",
+            "PROXYX_LIMITER_IDLE_TIMEOUT_MS",
+            "PROXYX_LIMITER_TCP_KEEPALIVE_SECS",
+            "PROXYX_LIMITER_METRICS_ADDR",
+        ] {
+            assert!(limiter_configured(None, |name| name == var), "{var}");
+        }
+        assert!(!limiter_configured(None, |_| false));
+        assert!(limiter_configured(Some("127.0.0.1:39091"), |_| false));
     }
 }

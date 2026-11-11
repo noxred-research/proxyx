@@ -112,6 +112,9 @@ pub async fn create_session(redis_url: &str, prefix: &str, id: Uuid, captured: b
         "captured_hosts": if captured { vec![ORIGIN_HOST] } else { Vec::new() },
         "excluded_hosts": [],
         "upstream_overrides": {},
+        // The local stub origin uses a fresh private CA. This opt-out applies
+        // only to this benchmark session, including attach mode.
+        "insecure_upstream_tls": captured,
         "inject_headers": [],
         "serialize": false,
         "expires_at_ms": now_ms + (SESSION_TTL_SECS as i64) * 1000,

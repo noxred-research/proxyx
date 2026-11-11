@@ -17,6 +17,16 @@ mirrored. Licence: AGPL-3.0-only.
 proxyx-client = { path = "crates/client" }
 ```
 
+Run the complete create → fetch → release → wait → search flow against a running control API and session proxy:
+
+```sh
+PROXYX_API=http://127.0.0.1:9000 PROXYX_SERVICE_KEY="$KEY" PROXYX_ORG=acme \
+  cargo run -p proxyx-client --example capture_session -- https://example.com/
+```
+
+The ingester and capture store must also run so the example can wait for processing and read captures back.
+Set `PROXYX_HOSTS` to comma-separated capture patterns (default `*`). The example releases its session even if fetching fails.
+
 ## Capture sessions
 
 Authenticate with a **service key** (`pxk_...`, sent as `Authorization: Bearer`). The key is bound to one org.
@@ -232,10 +242,12 @@ event twice.
 
 ## Session proxy errors
 
-When the session proxy cannot set up a tunnel it answers with `X-ProxyX-Error: <cause>`.
+When the session proxy cannot set up or carry a tunnel it answers with `X-ProxyX-Error: <cause>`.
 `sessions::ProxyErrorCause::from_headers` reads it: `session_not_found`, `session_backend_unavailable`,
-`upstream_refused`, `upstream_dns`, `upstream_error`, `upstream_timeout`. A SOCKS5 failure arrives in-band as an HTTP
-response with this header after a successful SOCKS5 reply.
+`upstream_refused`, `upstream_dns`, `upstream_error`, `upstream_timeout`, `upstream_unavailable` (the target's circuit
+breaker is open; honour `Retry-After`), `upstream_tls` (the proxy's own handshake with the target failed or its
+certificate did not verify) and `connection_limit`. `is_retryable()` is true for the transient ones. A SOCKS5 failure
+arrives in-band as an HTTP response with this header after a successful SOCKS5 reply.
 
 ## Providers
 

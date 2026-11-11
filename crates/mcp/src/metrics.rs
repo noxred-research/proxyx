@@ -367,6 +367,12 @@ pub const CATALOG: &[Family] = &[
         "Requests admitted without a rate-limit verdict because the backend failed and the policy fails open.",
     ),
     fam(
+        "proxyx_intercept_scheduler_lag_seconds",
+        Histogram,
+        &[],
+        "Runtime probe tick delay; exported only when session-proxy profiling is enabled.",
+    ),
+    fam(
         "proxyx_limiter_buckets",
         Gauge,
         &[],

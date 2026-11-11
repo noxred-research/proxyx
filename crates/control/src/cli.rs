@@ -14,6 +14,8 @@ use anyhow::{Context as _, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use tokio_util::sync::CancellationToken;
 
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Arguments of `proxyx control`.
 #[derive(Args)]
 pub struct ControlArgs {
@@ -255,7 +257,7 @@ async fn run_api(config: ControlConfig) -> Result<()> {
     let reaper_view_store = view_store.clone();
     let reaper_db = db.clone();
     let view_ttl = std::time::Duration::from_secs(config.traffic_views_ttl_secs);
-    tokio::spawn(async move {
+    let mut reaper_handle = tokio::spawn(async move {
         const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
         let mut interval = tokio::time::interval(REAP_INTERVAL);
@@ -307,17 +309,13 @@ async fn run_api(config: ControlConfig) -> Result<()> {
     });
     let api_cancel = shutdown.clone();
     let api_addr = config.api_addr;
-    tokio::spawn(async move {
-        if let Err(e) = server::serve(api_addr, api_state, api_cancel).await {
-            tracing::error!(error = %e, "API server failed");
-        }
-    });
-
-    wait_for_shutdown().await?;
-    tracing::info!("shutdown signal received");
-    shutdown.cancel();
+    let api_handle =
+        tokio::spawn(async move { server::serve(api_addr, api_state, api_cancel).await });
+    let result = supervise_server(api_handle, shutdown, "API server", wait_for_shutdown()).await;
+    let reaper_result = drain_task(&mut reaper_handle, "session reaper", DRAIN_TIMEOUT).await;
+    result?;
+    reaper_result?;
     tracing::info!("api stopped");
-
     Ok(())
 }
 
@@ -334,10 +332,6 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
     // sink only checks that its index templates exist.
 
     let shutdown = CancellationToken::new();
-
-    let sink = capture_store::build_sink(&config).await?;
-    let pipeline = pipeline::RequestPipeline::new(sink, 256);
-    let pipeline_sender = pipeline.sender();
 
     let log_consumer: Box<dyn common::log::CaptureLogConsumer> = match config.broker_kind {
         BrokerKind::RedisStream => {
@@ -382,6 +376,10 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
         }
     };
     let log_consumer = common::log::instrument_consumer(config.broker_kind.as_str(), log_consumer);
+    // Finish fallible setup before starting the pipeline's background drain.
+    let sink = capture_store::build_sink(&config).await?;
+    let pipeline = pipeline::RequestPipeline::new(sink, 256);
+    let pipeline_sender = pipeline.sender();
     let broker_connection = log_consumer.connection();
     let log_consumer = consumer::RequestLogConsumer::new(
         log_consumer,
@@ -391,32 +389,20 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
     let consumer_shutdown = shutdown.clone();
     let ingest_healthy = Arc::new(AtomicBool::new(true));
     let ingest_healthy_flag = Arc::clone(&ingest_healthy);
-    let consumer_handle = tokio::spawn(async move {
+    let mut consumer_handle = tokio::spawn(async move {
         log_consumer.run(consumer_shutdown).await;
-    });
-    // Monitor consumer task: when it exits for any reason, mark unhealthy.
-    tokio::spawn(async move {
-        let _ = consumer_handle.await;
-        ingest_healthy_flag.store(false, Ordering::Relaxed);
-        tracing::warn!("consumer task exited, marking ingester unhealthy");
     });
 
     let health_shutdown = shutdown.clone();
     let health_addr = config.ingester_health_addr;
     let health_sink = pipeline.sink();
-    tokio::spawn(async move {
-        if let Err(e) = serve_health(
-            health_addr,
-            health_shutdown,
-            ingest_healthy,
-            health_sink,
-            broker_connection,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "ingester health server failed");
-        }
-    });
+    let health_handle = tokio::spawn(serve_health(
+        health_addr,
+        health_shutdown,
+        ingest_healthy,
+        health_sink,
+        broker_connection,
+    ));
 
     tracing::info!(
         stream = %config.request_log_stream,
@@ -425,14 +411,30 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
         "ingester started"
     );
 
-    wait_for_shutdown().await?;
-    tracing::info!("shutdown signal received, draining ingester...");
-    shutdown.cancel();
-
-    let drain_timeout = std::time::Duration::from_secs(30);
-    pipeline.flush_and_close(drain_timeout).await;
+    let mut consumer_finished = false;
+    let stop = async {
+        tokio::select! {
+            result = wait_for_shutdown() => result,
+            result = &mut consumer_handle => {
+                consumer_finished = true;
+                ingest_healthy_flag.store(false, Ordering::Relaxed);
+                result.context("ingester consumer task failed")?;
+                anyhow::bail!("ingester consumer exited unexpectedly");
+            }
+        }
+    };
+    let result = supervise_server(health_handle, shutdown, "ingester health server", stop).await;
+    tracing::info!("draining ingester...");
+    let consumer_result = if consumer_finished {
+        Ok(())
+    } else {
+        drain_task(&mut consumer_handle, "ingester consumer", DRAIN_TIMEOUT).await
+    };
+    // Always close the pipeline, including health bind, signal and task errors.
+    pipeline.flush_and_close(DRAIN_TIMEOUT).await;
+    result?;
+    consumer_result?;
     tracing::info!("ingester stopped");
-
     Ok(())
 }
 
@@ -466,15 +468,24 @@ async fn run_keys(config: ControlConfig, action: KeysAction) -> Result<()> {
 pub async fn migrate(config: Option<&str>, target: MigrateTarget, check: bool) -> Result<()> {
     let config = ControlConfig::load(config)?;
     let _guard = runtime::init_process(&config, "migrate");
+    migrate_stores(&config, target, check).await
+}
 
-    let db = crate::db::Db::connect(&config.database_url, 2).await?;
+async fn migrate_stores(config: &ControlConfig, target: MigrateTarget, check: bool) -> Result<()> {
     let store_schema = match target {
         MigrateTarget::All => Some(config.capture_store.backend),
         MigrateTarget::Clickhouse => Some(CaptureBackend::ClickHouse),
         MigrateTarget::Opensearch => Some(CaptureBackend::OpenSearch),
         MigrateTarget::Database | MigrateTarget::Broker => None,
     };
-    let database = matches!(target, MigrateTarget::All | MigrateTarget::Database);
+    if matches!(target, MigrateTarget::All | MigrateTarget::Database) {
+        let db = crate::db::Db::connect(&config.database_url, 2).await?;
+        if check {
+            migrations::verify_database(&db).await?;
+        } else {
+            migrations::run_database(&db).await?;
+        }
+    }
     let broker = matches!(target, MigrateTarget::All | MigrateTarget::Broker);
     common::log::warn_deprecated_broker_names();
     if broker {
@@ -482,38 +493,32 @@ pub async fn migrate(config: Option<&str>, target: MigrateTarget, check: bool) -
     }
 
     if check {
-        if database {
-            migrations::verify_database(&db).await?;
-        }
         match store_schema {
             Some(CaptureBackend::ClickHouse) => {
                 let ch = runtime::clickhouse_client(config.clickhouse_config()?);
                 migrations::verify_clickhouse(&ch).await?;
             }
             Some(CaptureBackend::OpenSearch) => {
-                capture_store::migrate_opensearch(&config, true).await?;
+                capture_store::migrate_opensearch(config, true).await?;
             }
             None => {}
         }
         if broker {
-            broker_admin::verify_broker(&config).await?;
+            broker_admin::verify_broker(config).await?;
         }
     } else {
-        if database {
-            migrations::run_database(&db).await?;
-        }
         match store_schema {
             Some(CaptureBackend::ClickHouse) => {
                 let ch = runtime::clickhouse_client(config.clickhouse_config()?);
                 migrations::run_clickhouse(&ch).await?;
             }
             Some(CaptureBackend::OpenSearch) => {
-                capture_store::migrate_opensearch(&config, false).await?;
+                capture_store::migrate_opensearch(config, false).await?;
             }
             None => {}
         }
         if broker {
-            broker_admin::ensure_broker(&config).await?;
+            broker_admin::ensure_broker(config).await?;
         }
     }
 
@@ -583,10 +588,48 @@ fn ingester_health(
     }
 }
 
-async fn wait_for_shutdown() -> Result<(), std::io::Error> {
+async fn drain_task<T>(
+    task: &mut tokio::task::JoinHandle<T>,
+    name: &str,
+    timeout: std::time::Duration,
+) -> Result<T> {
+    match tokio::time::timeout(timeout, &mut *task).await {
+        Ok(result) => result.with_context(|| format!("{name} task failed")),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("{name} did not drain within {timeout:?}");
+        }
+    }
+}
+
+async fn supervise_server(
+    mut task: tokio::task::JoinHandle<Result<()>>,
+    shutdown: CancellationToken,
+    name: &str,
+    signal: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    let signal_result = tokio::select! {
+        result = &mut task => {
+            shutdown.cancel();
+            result.with_context(|| format!("{name} task failed"))?
+                .with_context(|| format!("{name} failed"))?;
+            anyhow::bail!("{name} exited unexpectedly");
+        }
+        result = signal => result,
+    };
+    shutdown.cancel();
+    let drain_result = drain_task(&mut task, name, DRAIN_TIMEOUT)
+        .await
+        .and_then(|result| result.with_context(|| format!("{name} failed during shutdown")));
+    signal_result?;
+    drain_result
+}
+
+async fn wait_for_shutdown() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
+        result = tokio::signal::ctrl_c() => result?,
         _ = sigterm.recv() => {},
     }
     Ok(())
@@ -596,6 +639,233 @@ async fn wait_for_shutdown() -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use figment::{Figment, providers::Format as _, providers::Toml};
+
+    fn empty_config() -> ControlConfig {
+        Figment::new()
+            .merge(Toml::string(""))
+            .extract()
+            .expect("default control config")
+    }
+
+    #[tokio::test]
+    async fn standalone_redis_broker_migration_needs_no_database_or_store() {
+        let mut config = empty_config();
+        assert!(config.database_url.is_empty());
+        config.redis_url = "not a Redis URL".to_owned();
+        for check in [false, true] {
+            migrate_stores(&config, MigrateTarget::Broker, check)
+                .await
+                .expect("Redis broker migration needs no connections");
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_store_migrations_require_only_the_selected_store_config() {
+        let mut config = empty_config();
+        // An unconfigured broker must not gate either standalone store.
+        config.broker_kind = BrokerKind::Kafka;
+        for check in [false, true] {
+            for (target, section) in [
+                (MigrateTarget::Clickhouse, "[clickhouse]"),
+                (MigrateTarget::Opensearch, "[capture_store.opensearch]"),
+            ] {
+                let error = migrate_stores(&config, target, check)
+                    .await
+                    .expect_err("selected store config is required");
+                assert!(error.to_string().contains(section), "{error:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn database_targets_still_require_a_database() {
+        let config = empty_config();
+        for check in [false, true] {
+            for target in [MigrateTarget::All, MigrateTarget::Database] {
+                assert!(migrate_stores(&config, target, check).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_bind_failure_stops_supervision_without_a_signal() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve loopback port");
+        let addr = occupied.local_addr().expect("reserved address");
+        let task = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, axum::Router::new()).await?;
+            Ok(())
+        });
+        let shutdown = CancellationToken::new();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            supervise_server(task, shutdown.clone(), "API server", std::future::pending()),
+        )
+        .await
+        .expect("bind failure must not wait for a signal")
+        .expect_err("occupied bind must fail");
+        assert!(error.to_string().contains("API server failed"), "{error:#}");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("bind error retains its source")
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn unexpected_successful_server_exit_is_an_error() {
+        let shutdown = CancellationToken::new();
+        let error = supervise_server(
+            tokio::spawn(async { Ok(()) }),
+            shutdown.clone(),
+            "API server",
+            std::future::pending(),
+        )
+        .await
+        .expect_err("server must not stop before shutdown");
+        assert!(error.to_string().contains("exited unexpectedly"));
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_active_http_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("server address");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
+        let release = CancellationToken::new();
+        let handler_release = release.clone();
+        let app = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let started = Arc::clone(&handler_started);
+                let release = handler_release.clone();
+                async move {
+                    started.notify_one();
+                    release.cancelled().await;
+                    "drained"
+                }
+            }),
+        );
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let observed_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await?;
+            Ok(())
+        });
+        let signal = CancellationToken::new();
+        let stop = signal.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise_server(task, shutdown, "API server", async move {
+                stop.cancelled().await;
+                Ok(())
+            })
+            .await
+        });
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{addr}/slow"))
+                .await?
+                .text()
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("request enters handler");
+        signal.cancel();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observed_shutdown.cancelled(),
+        )
+        .await
+        .expect("supervisor requests graceful shutdown");
+        assert!(!supervisor.is_finished());
+        release.cancel();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .expect("request drains")
+            .expect("request task joins")
+            .expect("request succeeds");
+        assert_eq!(body, "drained");
+        tokio::time::timeout(std::time::Duration::from_secs(2), supervisor)
+            .await
+            .expect("server drains")
+            .expect("supervisor task joins")
+            .expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn signal_failure_still_cancels_and_joins_server() {
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let drained = Arc::new(AtomicBool::new(false));
+        let server_drained = Arc::clone(&drained);
+        let task = tokio::spawn(async move {
+            server_shutdown.cancelled().await;
+            server_drained.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        let error = supervise_server(task, shutdown, "API server", async {
+            anyhow::bail!("signal registration failed");
+        })
+        .await
+        .expect_err("signal failure must propagate");
+        assert!(error.to_string().contains("signal registration failed"));
+        assert!(drained.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn server_panic_stops_supervision() {
+        async fn panic_server() -> Result<()> {
+            panic!("test server panic");
+        }
+        let shutdown = CancellationToken::new();
+        let error = supervise_server(
+            tokio::spawn(panic_server()),
+            shutdown.clone(),
+            "API server",
+            std::future::pending(),
+        )
+        .await
+        .expect_err("panic must stop supervision");
+        assert!(error.to_string().contains("API server task failed"));
+        assert!(shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_aborts_and_joins_the_task() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&dropped));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            let _flag = flag;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.expect("task starts before timeout");
+        let error = drain_task(&mut task, "test server", std::time::Duration::ZERO)
+            .await
+            .expect_err("unresponsive task times out");
+        assert!(error.to_string().contains("did not drain"));
+        assert!(dropped.load(Ordering::Relaxed), "task must not detach");
+        assert!(task.is_finished());
+    }
 
     #[test]
     fn ingester_health_reflects_consumer_and_store_breaker() {

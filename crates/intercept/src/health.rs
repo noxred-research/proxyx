@@ -8,8 +8,10 @@
 //!   succeeds; `redis_failure_threshold` failures in a row fail the check and
 //!   the first success clears it;
 //! - `capture_pipeline`: the capture queue has not been full for longer than
-//!   `capture_stall_window_ms`, and the writer made progress within
-//!   `capture_publish_stale_ms` while work was pending;
+//!   `capture_stall_window_ms`, the writer made progress within
+//!   `capture_publish_stale_ms` while work was pending, and the writer is not
+//!   dropping captures (it dropped one after its attempts and no batch has
+//!   published cleanly since; a probe the broker answers clears this too);
 //! - `listeners`: every accept loop is bound and still running;
 //! - not draining: the shutdown signal has not arrived.
 
@@ -263,7 +265,7 @@ pub fn spawn_monitor(
                 }
             }
 
-            let verdict = watch.check(
+            let mut verdict = watch.check(
                 Instant::now(),
                 writer.queued(),
                 writer.capacity(),
@@ -271,6 +273,19 @@ pub fn spawn_monitor(
                 writer.since_progress(),
                 &cfg,
             );
+            // Fast failures (a refused connection, a nack) never stall the
+            // writer: it drops the capture after its attempts and moves on.
+            // Those show only here.
+            let probe_timeout = Duration::from_millis(cfg.check_interval_ms);
+            if let Some(failure) = writer.publish_failure(probe_timeout).await {
+                verdict = Err(format!(
+                    "captures are being dropped, publishing has failed for {}s: {}",
+                    failure.since.as_secs(),
+                    failure.error
+                ));
+            }
+            // Settles a gauge that a racing sender left stale.
+            common::metrics::PROXY_CAPTURE_BUFFER_DEPTH.set(writer.queued() as i64);
             if let Err(reason) = &verdict {
                 tracing::warn!(%reason, "capture pipeline readiness check failing");
             }

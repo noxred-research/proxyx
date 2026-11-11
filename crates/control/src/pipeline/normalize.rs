@@ -133,15 +133,21 @@ fn decode_headers_and_body(
     let encoding = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase());
+        .map(|(_, value)| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty() && value != "identity");
 
     let (decoded, did_decode) = if truncated {
-        // A truncated body that was compressed cannot be decoded — the
-        // compressed stream is incomplete — and storing the raw compressed
-        // bytes is just unreadable garbage. Drop it; the size columns retain
-        // the byte-count truth. A truncated *plaintext* body keeps its
-        // partial bytes (still useful for search).
-        if encoding.is_some() {
+        // A truncated body in a supported compressed encoding cannot be
+        // decoded — the compressed stream is incomplete — and storing the
+        // raw compressed bytes is just unreadable garbage. Drop it; the size
+        // columns retain the byte-count truth. A truncated body in any other
+        // encoding (identity, unknown, chained) is never decoded on the
+        // complete path either, so its captured prefix is kept like a
+        // plaintext one.
+        if matches!(
+            encoding.as_deref(),
+            Some("gzip" | "x-gzip" | "deflate" | "br")
+        ) {
             (Vec::new(), false)
         } else {
             (body.to_vec(), false)
@@ -198,8 +204,12 @@ fn decompress_gzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 fn decompress_deflate(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let decoder = flate2::read::DeflateDecoder::new(data);
-    read_capped(decoder)
+    match read_capped(flate2::read::ZlibDecoder::new(data)) {
+        Err(error) if error.kind() != std::io::ErrorKind::FileTooLarge => {
+            read_capped(flate2::read::DeflateDecoder::new(data))
+        }
+        result => result,
+    }
 }
 
 fn decompress_brotli(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -220,11 +230,191 @@ fn read_capped<R: Read>(reader: R) -> std::io::Result<Vec<u8>> {
             "decompression rejected: body exceeds cap",
         );
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::FileTooLarge,
             "decompressed body exceeds size cap",
         ));
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn deflate_decodes_zlib_and_raw_request_and_response_bodies() {
+        let plaintext = b"searchable\0 deflate body";
+        for zlib_wrapped in [true, false] {
+            let compressed = if zlib_wrapped {
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(plaintext).unwrap();
+                encoder.finish().unwrap()
+            } else {
+                let mut encoder =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(plaintext).unwrap();
+                encoder.finish().unwrap()
+            };
+            assert_eq!(decompress_deflate(&compressed).unwrap(), plaintext);
+            let headers = vec![
+                wire::Header {
+                    name: "Content-Encoding".into(),
+                    value: " DeFlAtE ".into(),
+                },
+                wire::Header {
+                    name: "CONTENT-LENGTH".into(),
+                    value: compressed.len().to_string(),
+                },
+                wire::Header {
+                    name: "x-keep".into(),
+                    value: "keep".into(),
+                },
+            ];
+            let captured = wire::CapturedRequest {
+                request_headers: headers.clone(),
+                response_headers: headers,
+                request_body: compressed.clone().into(),
+                response_body: compressed.into(),
+                ..Default::default()
+            };
+            let normalized =
+                NormalizedCapturedRequest::from_captured(&captured, 0, None, None, None, None);
+            assert_eq!(normalized.request_body, "searchable deflate body");
+            assert_eq!(normalized.response_body, "searchable deflate body");
+            assert_eq!(
+                normalized.request_headers,
+                vec![("x-keep".into(), "keep".into())]
+            );
+            assert_eq!(normalized.response_headers, normalized.request_headers);
+        }
+    }
+
+    #[test]
+    fn truncated_plaintext_keeps_request_and_response_prefixes() {
+        for encoding in [
+            None,
+            Some(""),
+            Some(" \t "),
+            Some("identity"),
+            Some(" IdEnTiTy "),
+        ] {
+            let mut headers = vec![wire::Header {
+                name: "Content-Length".into(),
+                value: "1000".into(),
+            }];
+            if let Some(encoding) = encoding {
+                headers.push(wire::Header {
+                    name: "Content-Encoding".into(),
+                    value: encoding.into(),
+                });
+            }
+            let expected_headers: Vec<_> = headers
+                .iter()
+                .map(|header| (header.name.clone(), header.value.clone()))
+                .collect();
+            let captured = wire::CapturedRequest {
+                request_headers: headers.clone(),
+                response_headers: headers,
+                request_body: b"captured\0 request prefix".to_vec().into(),
+                response_body: b"captured\0 response prefix".to_vec().into(),
+                request_body_truncated: true,
+                response_body_truncated: true,
+                ..Default::default()
+            };
+            let normalized =
+                NormalizedCapturedRequest::from_captured(&captured, 0, None, None, None, None);
+            assert_eq!(normalized.request_body, "captured request prefix");
+            assert_eq!(normalized.response_body, "captured response prefix");
+            assert_eq!(normalized.request_headers, expected_headers);
+            assert_eq!(normalized.response_headers, expected_headers);
+        }
+    }
+
+    #[test]
+    fn truncated_gzip_drops_body_and_keeps_headers() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"captured gzip body").unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.truncate(compressed.len() / 2);
+        for encoding in ["gzip", "x-gzip"] {
+            let headers = vec![
+                ("content-encoding".into(), encoding.into()),
+                ("content-length".into(), "1000".into()),
+            ];
+            let (actual_headers, body) =
+                decode_headers_and_body(headers.clone(), &compressed, true);
+            assert!(body.is_empty());
+            assert_eq!(actual_headers, headers);
+        }
+    }
+
+    #[test]
+    fn truncated_unsupported_encoding_keeps_prefix_and_headers() {
+        for encoding in ["zstd", "compress", "gzip, br", "x-custom"] {
+            let headers = vec![
+                ("content-encoding".into(), encoding.into()),
+                ("content-length".into(), "1000".into()),
+            ];
+            let (actual_headers, body) =
+                decode_headers_and_body(headers.clone(), b"opaque\0 prefix", true);
+            assert_eq!(body, "opaque prefix", "{encoding}");
+            assert_eq!(actual_headers, headers);
+        }
+    }
+
+    #[test]
+    fn invalid_deflate_keeps_original_body_and_headers() {
+        let original = b"not deflate";
+        assert!(decompress_deflate(original).is_err());
+        let headers = vec![
+            ("content-encoding".into(), "deflate".into()),
+            ("content-length".into(), original.len().to_string()),
+        ];
+        let (actual_headers, body) = decode_headers_and_body(headers.clone(), original, false);
+        assert_eq!(body.as_bytes(), original);
+        assert_eq!(actual_headers, headers);
+    }
+
+    #[test]
+    fn deflate_enforces_decoded_cap_without_retrying_oversized_zlib_as_raw() {
+        for zlib_wrapped in [true, false] {
+            for size in [MAX_DECODED_BYTES, MAX_DECODED_BYTES + 1] {
+                let mut plaintext = std::io::repeat(b'x').take(size);
+                let compressed = if zlib_wrapped {
+                    let mut encoder =
+                        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+                    std::io::copy(&mut plaintext, &mut encoder).unwrap();
+                    encoder.finish().unwrap()
+                } else {
+                    let mut encoder =
+                        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+                    std::io::copy(&mut plaintext, &mut encoder).unwrap();
+                    encoder.finish().unwrap()
+                };
+                if size == MAX_DECODED_BYTES {
+                    let decoded = decompress_deflate(&compressed).unwrap();
+                    assert_eq!(decoded.len() as u64, size);
+                    assert!(decoded.iter().all(|&byte| byte == b'x'));
+                } else {
+                    let error = decompress_deflate(&compressed).unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+                    let expected_body = String::from_utf8(compressed.clone())
+                        .map(|body| body.replace('\0', ""))
+                        .unwrap_or_default();
+                    let headers = vec![
+                        ("content-encoding".into(), "deflate".into()),
+                        ("content-length".into(), compressed.len().to_string()),
+                    ];
+                    let (actual_headers, body) =
+                        decode_headers_and_body(headers.clone(), &compressed, false);
+                    assert_eq!(body, expected_body);
+                    assert_eq!(actual_headers, headers);
+                }
+            }
+        }
+    }
 }
 
 /// Normalized WebSocket message ready for ClickHouse insert. The proxy

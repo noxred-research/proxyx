@@ -369,3 +369,210 @@ async fn a_reset_before_the_head_is_not_a_bad_request_but_garbage_is() -> TestRe
     );
     Ok(())
 }
+
+async fn raw_http(proxy: SocketAddr, request: &[u8]) -> Result<Vec<u8>, BoxErr> {
+    let mut client = TcpStream::connect(proxy).await?;
+    client.write_all(request).await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(12), client.read_to_end(&mut response)).await??;
+    Ok(response)
+}
+
+#[tokio::test]
+async fn probe_http_pages_use_leased_tunnels_and_never_forward_a_second_request() -> TestResult {
+    let Some(env) = env() else { return Ok(()) };
+    let mut setup = Setup::new();
+    setup.probe_targets = vec!["http://page.stub/"];
+    let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let captured = Arc::clone(&seen);
+    let target = serve(move |mut socket| {
+        let captured = Arc::clone(&captured);
+        async move {
+            let Some(head) = read_head(&mut socket).await else {
+                return;
+            };
+            let mut request = head.as_bytes().to_vec();
+            let n = if head.contains("Transfer-Encoding: chunked\r\n") {
+                b"4\r\nbody\r\n0\r\n\r\n".len()
+            } else if head.contains("Content-Length: 4\r\n") {
+                4
+            } else {
+                0
+            };
+            let mut body = vec![0; n];
+            if socket.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            request.extend_from_slice(&body);
+            // A raw relay would deliver the next authority and its credentials
+            // here. The HTTP bridge must not forward even one extra byte.
+            let mut extra = [0; 1024];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(100), socket.read(&mut extra)).await {
+                request.extend_from_slice(&extra[..n]);
+            }
+            captured.lock().push(request);
+            respond(
+                &mut socket,
+                "200 OK",
+                "<!doctype html><title>probe page</title>",
+            )
+            .await;
+        }
+    })
+    .await;
+    let (h, provider, ip) = unit_for(&env, &setup, target).await?;
+    let token = probe_token(&setup);
+    let auth = STANDARD.encode(format!("px:{token}"));
+    let later_auth = STANDARD.encode("px:later-secret");
+    let later = format!(
+        "GET http://other.stub/private HTTP/1.1\r\nHost: other.stub\r\n\
+         Proxy-Authorization: Basic {later_auth}\r\n\r\n",
+    );
+    for (method, framing, body, pipelined) in [
+        ("GET", "", "", false),
+        ("GET", "", "", true),
+        ("POST", "Content-Length: 4\r\n", "body", true),
+        (
+            "POST",
+            "Transfer-Encoding: chunked\r\nTrailer: Proxy-Authorization\r\n",
+            "4;extension=discard\r\nbody\r\n0\r\nProxy-Authorization: trailer-secret\r\n\r\n",
+            true,
+        ),
+    ] {
+        let request = format!(
+            "{method} http://page.stub/ HTTP/1.1\r\nHost: page.stub\r\n\
+             Proxy-Authorization: Basic {auth}\r\n\
+             Connection: keep-alive, X-Remove\r\nX-Remove: hop-secret\r\n\
+             Proxy-Connection: keep-alive\r\n{framing}\r\n{body}{}",
+            if pipelined { later.as_str() } else { "" },
+        );
+        let response = String::from_utf8(raw_http(h.probe, request.as_bytes()).await?)?;
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("<!doctype html><title>probe page</title>"));
+        assert!(response.contains(&format!("X-ProxyX-Exit-IP: {ip}\r\n")));
+        assert!(response.contains("Connection: close\r\n"));
+        let session = response
+            .lines()
+            .find_map(|line| line.strip_prefix("X-ProxyX-Pool-Session: "))
+            .ok_or("missing session correlation")?;
+        assert_eq!(
+            h.hot
+                .session_get(session)
+                .await?
+                .ok_or("missing session record")?
+                .org,
+            setup.probe_org
+        );
+
+        let request = seen.lock().last().expect("origin received request").clone();
+        let request = String::from_utf8(request)?;
+        assert!(request.starts_with(&format!("{method} / HTTP/1.1\r\n")));
+        assert!(request.contains("Host: page.stub\r\n"));
+        assert!(request.contains("Connection: close\r\n"));
+        for forbidden in [
+            "Proxy-Authorization",
+            "Proxy-Connection",
+            "X-Remove",
+            "hop-secret",
+            "other.stub",
+            "trailer-secret",
+            auth.as_str(),
+            later_auth.as_str(),
+        ] {
+            assert!(!request.contains(forbidden), "origin received {forbidden}");
+        }
+        let expected_body = if framing.starts_with("Transfer-Encoding") {
+            "4\r\nbody\r\n0\r\n\r\n"
+        } else {
+            body
+        };
+        assert_eq!(
+            request.split_once("\r\n\r\n").expect("head").1,
+            expected_body
+        );
+    }
+    assert_eq!(provider.connects().len(), 4);
+    assert!(provider.connects().iter().all(|(target, login)| {
+        target == "page.stub:80" && login == &format!("{PROVIDER_USER}:{PROVIDER_PASS}")
+    }));
+    eventually("HTTP probe tunnels close", || {
+        tunnels_closed(&h, &setup.probe_org)
+    })
+    .await;
+    assert!(metered_bytes(&h, &setup.provider).await? > 0);
+    assert_eq!(h.connections("probe", "ok"), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn absolute_http_keeps_probe_auth_destination_rules_and_public_405() -> TestResult {
+    let Some(env) = env() else { return Ok(()) };
+    let mut setup = Setup::new();
+    setup.probe_targets = vec!["http://page.stub/", "http://127.0.0.1/"];
+    let (h, provider, _) = static_fixture(&env, &setup).await?;
+    let token = probe_token(&setup);
+    for (url, host) in [
+        ("http://other.stub/", "other.stub"),
+        ("http://page.stub:22/", "page.stub:22"),
+        ("http://127.0.0.1/", "127.0.0.1"),
+        ("http://169.254.169.254/", "169.254.169.254"),
+    ] {
+        let auth = STANDARD.encode(format!("px:{token}"));
+        let request = format!(
+            "GET {url} HTTP/1.1\r\nHost: {host}\r\nProxy-Authorization: Basic {auth}\r\n\r\n",
+        );
+        let response = raw_http(h.probe, request.as_bytes()).await?;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403 destination_denied\r\n"),
+            "{url}"
+        );
+    }
+    for key in [
+        setup.key.as_str(),
+        setup.probe_key.as_str(),
+        setup.probe_secret.as_str(),
+        "invalid-token",
+    ] {
+        let auth = STANDARD.encode(format!("px:{key}"));
+        let request = format!(
+            "GET http://page.stub/ HTTP/1.1\r\nHost: page.stub\r\nProxy-Authorization: Basic {auth}\r\n\r\n",
+        );
+        let response = raw_http(h.probe, request.as_bytes()).await?;
+        assert!(response.starts_with(b"HTTP/1.1 407 auth_required\r\n"));
+    }
+    let response = raw_http(
+        h.probe,
+        b"GET http://page.stub/ HTTP/1.1\r\nHost: page.stub\r\n\r\n",
+    )
+    .await?;
+    assert!(response.starts_with(b"HTTP/1.1 407 auth_required\r\n"));
+    for listener in [h.connect, h.probe] {
+        let auth = STANDARD.encode(format!("px:{token}"));
+        let request = format!(
+            "GET http://page.stub/ HTTP/1.1\r\nHost: other.stub\r\nProxy-Authorization: Basic {auth}\r\n\r\n",
+        );
+        let response = raw_http(listener, request.as_bytes()).await?;
+        let expected = if listener == h.connect {
+            &b"HTTP/1.1 405 Method Not Allowed\r\n"[..]
+        } else {
+            &b"HTTP/1.1 400 Bad Request\r\n"[..]
+        };
+        assert!(response.starts_with(expected));
+    }
+    for framing in [
+        "Content-Length: 0\r\nContent-Length: 1\r\n",
+        "Content-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+        "Content-Length: +1\r\n",
+    ] {
+        let auth = STANDARD.encode(format!("px:{token}"));
+        let request = format!(
+            "POST http://page.stub/ HTTP/1.1\r\nHost: page.stub\r\n\
+             Proxy-Authorization: Basic {auth}\r\n{framing}\r\n",
+        );
+        let response = raw_http(h.probe, request.as_bytes()).await?;
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+    }
+    assert!(provider.connects().is_empty());
+    Ok(())
+}

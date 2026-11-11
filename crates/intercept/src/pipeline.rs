@@ -166,7 +166,8 @@ pub struct WsPipelineEvent {
 /// preserved end-to-end.
 pub struct RequestLogWriter {
     sender: parking_lot::Mutex<Option<mpsc::Sender<DrainItem>>>,
-    drain: parking_lot::Mutex<Option<tokio::task::JoinHandle<Box<dyn CaptureLogProducer>>>>,
+    drain: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    producer: Arc<dyn CaptureLogProducer>,
     capacity: usize,
     progress: Arc<Progress>,
 }
@@ -180,6 +181,26 @@ struct Progress {
     last_ms: AtomicU64,
     /// A batch is being published right now.
     publishing: AtomicBool,
+    failure: parking_lot::Mutex<FailureState>,
+}
+
+#[derive(Default)]
+struct FailureState {
+    /// Since when captures are dropped, and the latest error.
+    active: Option<(tokio::time::Instant, String)>,
+    /// Counts failures, so a probe can tell whether one arrived while it ran.
+    generation: u64,
+}
+
+/// The writer is dropping captures: a capture failed all its attempts and
+/// no batch has published cleanly since, and the broker does not answer a
+/// probe either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishFailure {
+    /// Error of the latest dropped capture, or of the probe.
+    pub error: String,
+    /// How long publishing has been failing.
+    pub since: Duration,
 }
 
 impl Progress {
@@ -188,6 +209,7 @@ impl Progress {
             origin: tokio::time::Instant::now(),
             last_ms: AtomicU64::new(0),
             publishing: AtomicBool::new(false),
+            failure: parking_lot::Mutex::new(FailureState::default()),
         }
     }
 
@@ -199,6 +221,44 @@ impl Progress {
     fn since_last(&self) -> Duration {
         let last = Duration::from_millis(self.last_ms.load(Ordering::Acquire));
         self.origin.elapsed().saturating_sub(last)
+    }
+
+    /// A capture failed its last attempt.
+    fn fail(&self, error: String) {
+        let mut state = self.failure.lock();
+        state.generation += 1;
+        let since = state
+            .active
+            .take()
+            .map_or_else(tokio::time::Instant::now, |(since, _)| since);
+        state.active = Some((since, error));
+    }
+
+    /// A batch published cleanly.
+    fn recover(&self) {
+        self.failure.lock().active = None;
+    }
+
+    /// The broker answered a probe started when the generation was
+    /// `generation`; a failure that came in since keeps the state.
+    fn recover_if(&self, generation: u64) {
+        let mut state = self.failure.lock();
+        if state.generation == generation {
+            state.active = None;
+        }
+    }
+
+    fn failure(&self) -> Option<(PublishFailure, u64)> {
+        let state = self.failure.lock();
+        state.active.as_ref().map(|(since, error)| {
+            (
+                PublishFailure {
+                    error: error.clone(),
+                    since: since.elapsed(),
+                },
+                state.generation,
+            )
+        })
     }
 }
 
@@ -216,9 +276,10 @@ impl RequestLogWriter {
     pub fn new(config: RequestLogConfig, producer: Box<dyn CaptureLogProducer>) -> Self {
         let (sender, receiver) = mpsc::channel(config.channel_capacity);
         let progress = Arc::new(Progress::new());
+        let producer: Arc<dyn CaptureLogProducer> = Arc::from(producer);
         let drain = tokio::spawn(drain_task(
             receiver,
-            producer,
+            producer.clone(),
             config.stream_name,
             config.channel_capacity,
             progress.clone(),
@@ -226,6 +287,7 @@ impl RequestLogWriter {
         Self {
             sender: parking_lot::Mutex::new(Some(sender)),
             drain: parking_lot::Mutex::new(Some(drain)),
+            producer,
             capacity: config.channel_capacity,
             progress,
         }
@@ -257,15 +319,38 @@ impl RequestLogWriter {
         self.progress.since_last()
     }
 
+    /// Whether captures are being dropped because the broker does not take
+    /// them. While they are, the producer is probed (at most for `timeout`):
+    /// a broker that answers clears the failure at once, so readiness
+    /// recovers although no capture arrives to prove it. A clean batch
+    /// clears it too. `None` when publishing works.
+    pub async fn publish_failure(&self, timeout: Duration) -> Option<PublishFailure> {
+        let (failure, generation) = self.progress.failure()?;
+        let probed = match tokio::time::timeout(timeout, self.producer.probe()).await {
+            Ok(Ok(())) => {
+                self.progress.recover_if(generation);
+                return self.progress.failure().map(|(failure, _)| failure);
+            }
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(_) => format!("no answer within {timeout:?}"),
+        };
+        Some(PublishFailure {
+            error: format!("{} (broker probe: {probed})", failure.error),
+            since: failure.since,
+        })
+    }
+
     /// Send an HTTP exchange. Blocks if channel is full (backpressure).
     pub async fn send(&self, event: PipelineEvent) {
         let sender = self.sender.lock().clone();
         let Some(sender) = sender else {
-            tracing::debug!("request log writer closed, http event dropped");
+            tracing::warn!("request log writer closed, http event dropped");
+            common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc();
             return;
         };
         if sender.send(DrainItem::Http(Box::new(event))).await.is_err() {
             tracing::warn!("request log channel closed, http event dropped");
+            common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc();
             return;
         }
         record_buffer_depth(&sender);
@@ -275,11 +360,13 @@ impl RequestLogWriter {
     pub async fn send_ws(&self, event: WsPipelineEvent) {
         let sender = self.sender.lock().clone();
         let Some(sender) = sender else {
-            tracing::debug!("request log writer closed, ws event dropped");
+            tracing::warn!("request log writer closed, ws event dropped");
+            common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc();
             return;
         };
         if sender.send(DrainItem::Ws(Box::new(event))).await.is_err() {
             tracing::warn!("request log channel closed, ws event dropped");
+            common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc();
             return;
         }
         record_buffer_depth(&sender);
@@ -289,28 +376,31 @@ impl RequestLogWriter {
     /// the producer. The total wall-clock budget is bounded by `timeout`.
     /// Idempotent.
     pub async fn flush_and_close(&self, timeout: std::time::Duration) {
+        let queued = self.queued();
         let _ = self.sender.lock().take();
         let task = self.drain.lock().take();
         let Some(task) = task else { return };
         let started = std::time::Instant::now();
         let half = timeout / 2;
-        let producer = match tokio::time::timeout(half, task).await {
-            Ok(Ok(producer)) => Some(producer),
+        let drained = match tokio::time::timeout(half, task).await {
+            Ok(Ok(())) => true,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "request log writer drain task panicked");
-                None
+                false
             }
             Err(_) => {
-                tracing::warn!(
+                tracing::error!(
                     timeout_secs = timeout.as_secs(),
-                    "request log writer drain timed out before producer flush",
+                    queued_at_shutdown = queued,
+                    "request log writer drain timed out before producer flush; captures \
+                     still queued or in flight are lost",
                 );
-                None
+                false
             }
         };
-        if let Some(producer) = producer {
+        if drained {
             let remaining = timeout.saturating_sub(started.elapsed());
-            producer.flush_and_close(remaining).await;
+            self.producer.flush_and_close(remaining).await;
             tracing::info!("request log writer drained");
         }
     }
@@ -327,15 +417,13 @@ fn record_buffer_depth(sender: &mpsc::Sender<DrainItem>) {
 /// `batch_capacity`) and publishes it as one batch, so the producer can send
 /// one request per partition instead of one per capture. The next round
 /// starts only after this batch is published, which keeps per-key order.
-/// The producer is returned to `flush_and_close` so it can run a final
-/// broker-side flush.
 async fn drain_task(
     mut receiver: mpsc::Receiver<DrainItem>,
-    producer: Box<dyn CaptureLogProducer>,
+    producer: Arc<dyn CaptureLogProducer>,
     stream_name: String,
     batch_capacity: usize,
     progress: Arc<Progress>,
-) -> Box<dyn CaptureLogProducer> {
+) {
     tracing::info!(%stream_name, "request log writer started");
 
     let mut items = Vec::with_capacity(batch_capacity);
@@ -349,15 +437,26 @@ async fn drain_task(
             progress.touch();
         }
         common::metrics::PROXY_CAPTURE_BUFFER_DEPTH.set(receiver.len() as i64);
-        let records = items.drain(..).filter_map(encode_item).collect();
-        progress.publishing.store(true, Ordering::Release);
-        publish_with_retry(producer.as_ref(), records).await;
-        progress.publishing.store(false, Ordering::Release);
+        let mut records = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            match encode_item(item) {
+                Some(record) => records.push(record),
+                // `encode_item` logged why; the capture is lost all the same.
+                None => common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc(),
+            }
+        }
+        if !records.is_empty() {
+            progress.publishing.store(true, Ordering::Release);
+            publish_with_retry(producer.as_ref(), records, &progress).await;
+            progress.publishing.store(false, Ordering::Release);
+        }
         progress.touch();
+        // Senders race with the gauge writes above; this one follows the
+        // slowest step, so an idle writer settles at its real depth.
+        common::metrics::PROXY_CAPTURE_BUFFER_DEPTH.set(receiver.len() as i64);
     }
 
     tracing::info!("request log writer stopped");
-    producer
 }
 
 /// Encodes a queued item as a `(key, payload)` record keyed by `source_id`.
@@ -404,7 +503,11 @@ fn encode_item(item: DrainItem) -> Option<(Bytes, Bytes)> {
 /// Only captures that fail every attempt are counted as dropped and surfaced
 /// at `error!`. `Bytes::clone` is a cheap refcount bump, so retrying does not
 /// re-copy payloads.
-async fn publish_with_retry(producer: &dyn CaptureLogProducer, mut records: Vec<(Bytes, Bytes)>) {
+async fn publish_with_retry(
+    producer: &dyn CaptureLogProducer,
+    mut records: Vec<(Bytes, Bytes)>,
+    progress: &Progress,
+) {
     let mut attempts = vec![0; records.len()];
     let mut backoff = Duration::from_millis(50);
     while !records.is_empty() {
@@ -432,6 +535,8 @@ async fn publish_with_retry(producer: &dyn CaptureLogProducer, mut records: Vec<
         let mut outcomes = outcomes.into_iter();
         let mut record_attempts = attempts.iter_mut();
         let mut last_error = None;
+        let mut dropped_error = None;
+        let mut clean = true;
         records.retain(|_| {
             let attempt = record_attempts
                 .next()
@@ -443,8 +548,12 @@ async fn publish_with_retry(producer: &dyn CaptureLogProducer, mut records: Vec<
                     *attempt = MAX_PUBLISH_ATTEMPTS;
                     false
                 }
-                common::log::PublishOutcome::NotSent => true,
+                common::log::PublishOutcome::NotSent => {
+                    clean = false;
+                    true
+                }
                 common::log::PublishOutcome::Failed(error) => {
+                    clean = false;
                     *attempt += 1;
                     if *attempt == MAX_PUBLISH_ATTEMPTS {
                         common::metrics::PROXY_CAPTURES_DROPPED_TOTAL.inc();
@@ -453,6 +562,7 @@ async fn publish_with_retry(producer: &dyn CaptureLogProducer, mut records: Vec<
                             attempts = *attempt,
                             "capture-log publish failed permanently, capture dropped"
                         );
+                        dropped_error = Some(format!("{error:#}"));
                         false
                     } else {
                         last_error = Some((error, *attempt));
@@ -463,6 +573,13 @@ async fn publish_with_retry(producer: &dyn CaptureLogProducer, mut records: Vec<
         });
         // Retain the matching counters without copying or reallocating records.
         attempts.retain(|attempt| *attempt < MAX_PUBLISH_ATTEMPTS);
+        // Readiness follows what the broker does with captures: dropping one
+        // means it refused it five times; a batch it took whole means it works.
+        if let Some(error) = dropped_error {
+            progress.fail(error);
+        } else if clean {
+            progress.recover();
+        }
         if let Some((error, attempt)) = last_error {
             tracing::warn!(
                 error = %error,
@@ -843,6 +960,7 @@ mod tests {
                     (Bytes::from_static(b"crawl-1"), Bytes::from_static(b"b")),
                     (Bytes::from_static(b"scan-2"), Bytes::from_static(b"c")),
                 ],
+                &Progress::new(),
             )
             .await;
         });
@@ -871,7 +989,7 @@ mod tests {
 
         output.lock().clear();
         let quick = FlakyProducer::new(&[], 0);
-        publish_with_retry(&quick, records(&["fast"])).await;
+        publish_with_retry(&quick, records(&["fast"]), &Progress::new()).await;
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(output.lock().is_empty(), "no warning after a fast publish");
     }
@@ -881,7 +999,7 @@ mod tests {
         let _guard = RETRY_TEST_LOCK.lock().await;
         let producer = FlakyProducer::new(&["b", "d"], 1);
 
-        publish_with_retry(&producer, records(&["a", "b", "c", "d"])).await;
+        publish_with_retry(&producer, records(&["a", "b", "c", "d"]), &Progress::new()).await;
 
         let calls = producer.calls.lock();
         assert_eq!(calls.len(), 2);
@@ -895,7 +1013,7 @@ mod tests {
         let producer = FlakyProducer::new(&["b", "c"], usize::MAX);
         let dropped_before = dropped_captures_count();
 
-        publish_with_retry(&producer, records(&["a", "b", "c"])).await;
+        publish_with_retry(&producer, records(&["a", "b", "c"]), &Progress::new()).await;
 
         assert_eq!(producer.calls.lock().len(), MAX_PUBLISH_ATTEMPTS as usize);
         assert_eq!(dropped_captures_count() - dropped_before, 2);
@@ -907,7 +1025,7 @@ mod tests {
         let producer = SequentialProducer::new(&[("a", 5)]);
         let dropped_before = dropped_captures_count();
 
-        publish_with_retry(&producer, records(&["a", "b", "c"])).await;
+        publish_with_retry(&producer, records(&["a", "b", "c"]), &Progress::new()).await;
 
         assert_eq!(
             *producer.attempts.lock(),
@@ -923,7 +1041,7 @@ mod tests {
         let producer = SequentialProducer::new(&[("a", 5), ("b", 4)]);
         let dropped_before = dropped_captures_count();
 
-        publish_with_retry(&producer, records(&["a", "b", "c"])).await;
+        publish_with_retry(&producer, records(&["a", "b", "c"]), &Progress::new()).await;
 
         assert_eq!(
             *producer.attempts.lock(),
@@ -939,7 +1057,7 @@ mod tests {
         let producer = SequentialProducer::new(&[("a", 2), ("b", 1)]);
         let dropped_before = dropped_captures_count();
 
-        publish_with_retry(&producer, records(&["a", "b", "c"])).await;
+        publish_with_retry(&producer, records(&["a", "b", "c"]), &Progress::new()).await;
 
         assert_eq!(
             *producer.attempts.lock(),
@@ -947,5 +1065,331 @@ mod tests {
         );
         assert_eq!(*producer.delivered.lock(), ["a", "b", "c"].map(Bytes::from));
         assert_eq!(dropped_captures_count(), dropped_before);
+    }
+
+    /// A broker whose publishes and probes are switched from the test.
+    struct ToggleState {
+        publish_works: std::sync::atomic::AtomicBool,
+        probe_works: std::sync::atomic::AtomicBool,
+        probes: std::sync::atomic::AtomicU64,
+        delivered: parking_lot::Mutex<Vec<Bytes>>,
+    }
+
+    impl ToggleState {
+        fn new(publish_works: bool, probe_works: bool) -> Arc<Self> {
+            Arc::new(Self {
+                publish_works: publish_works.into(),
+                probe_works: probe_works.into(),
+                probes: 0.into(),
+                delivered: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn set_publish(&self, works: bool) {
+            self.publish_works.store(works, Ordering::SeqCst);
+        }
+
+        fn delivered(&self) -> usize {
+            self.delivered.lock().len()
+        }
+    }
+
+    struct ToggleProducer(Arc<ToggleState>);
+
+    impl CaptureLogProducer for ToggleProducer {
+        fn publish<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _key: &'life1 [u8],
+            _payload: Bytes,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { unreachable!("the drain publishes in batches") })
+        }
+
+        fn publish_batch<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            records: &'life1 [(Bytes, Bytes)],
+        ) -> Pin<Box<dyn Future<Output = Vec<PublishOutcome>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            let results = if self.0.publish_works.load(Ordering::SeqCst) {
+                self.0
+                    .delivered
+                    .lock()
+                    .extend(records.iter().map(|(key, _)| key.clone()));
+                records.iter().map(|_| PublishOutcome::Published).collect()
+            } else {
+                records
+                    .iter()
+                    .map(|_| PublishOutcome::Failed(anyhow::anyhow!("connection refused")))
+                    .collect()
+            };
+            Box::pin(async move { results })
+        }
+
+        fn flush_and_close<'life0, 'async_trait>(
+            &'life0 self,
+            _timeout: Duration,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {})
+        }
+
+        fn probe<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.0.probes.fetch_add(1, Ordering::SeqCst);
+            let works = self.0.probe_works.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if works {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("broker unreachable"))
+                }
+            })
+        }
+    }
+
+    fn fast_health() -> crate::config::HealthConfig {
+        crate::config::HealthConfig {
+            check_interval_ms: 50,
+            redis_timeout_ms: 300,
+            redis_failure_threshold: 2,
+            capture_stall_fraction: 0.9,
+            capture_stall_window_ms: 30_000,
+            capture_publish_stale_ms: 60_000,
+            drain_notice_ms: 0,
+        }
+    }
+
+    struct Rig {
+        writer: Arc<RequestLogWriter>,
+        state: Arc<ToggleState>,
+        readiness: Arc<crate::health::Readiness>,
+        cancel: tokio_util::sync::CancellationToken,
+        monitor: tokio::task::JoinHandle<()>,
+    }
+
+    impl Rig {
+        async fn start(publish_works: bool, probe_works: bool) -> Self {
+            let state = ToggleState::new(publish_works, probe_works);
+            let writer = Arc::new(RequestLogWriter::new(
+                RequestLogConfig {
+                    channel_capacity: 16,
+                    ..RequestLogConfig::default()
+                },
+                Box::new(ToggleProducer(state.clone())),
+            ));
+            let redis = redis::aio::ConnectionManager::new(
+                redis::Client::open(crate::health::testkit::fake_redis().await).unwrap(),
+            )
+            .await
+            .unwrap();
+            let readiness = Arc::new(crate::health::Readiness::new());
+            readiness
+                .register_listener("test")
+                .store(true, Ordering::Release);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let monitor = crate::health::spawn_monitor(
+                readiness.clone(),
+                redis,
+                writer.clone(),
+                fast_health(),
+                cancel.clone(),
+            );
+            let rig = Self {
+                writer,
+                state,
+                readiness,
+                cancel,
+                monitor,
+            };
+            rig.wait_ready(true).await;
+            rig
+        }
+
+        /// Wait for readiness to become `want`; returns the pipeline detail.
+        async fn wait_ready(&self, want: bool) -> Option<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let report = self.readiness.report();
+                if report.ready == want {
+                    return report.checks[crate::health::CHECK_CAPTURE_PIPELINE]
+                        .detail
+                        .clone();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "readiness stayed {}, wanted {want}: {report:?}",
+                    report.ready
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn send(&self, id: &str) {
+            self.writer.send(test_event(id)).await;
+        }
+
+        /// Wait until nothing is queued or in flight.
+        async fn settle(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while self.writer.has_work() {
+                assert!(std::time::Instant::now() < deadline, "writer never settled");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            self.monitor.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_publish_failures_fail_readiness_and_the_probe_recovers_it_without_traffic() {
+        let _guard = RETRY_TEST_LOCK.lock().await;
+        let rig = Rig::start(false, false).await;
+        let dropped_before = dropped_captures_count();
+
+        for i in 0..3 {
+            rig.send(&format!("down-{i}")).await;
+        }
+        // Every attempt fails at once: the writer never stalls, yet readiness
+        // must report the dropped captures.
+        let detail = rig
+            .wait_ready(false)
+            .await
+            .expect("a failing check has a detail");
+        assert!(detail.contains("captures are being dropped"), "{detail}");
+        assert!(detail.contains("connection refused"), "{detail}");
+        assert!(
+            detail.contains("broker probe: broker unreachable"),
+            "{detail}"
+        );
+        rig.settle().await;
+        assert_eq!(rig.state.delivered(), 0);
+        assert_eq!(dropped_captures_count() - dropped_before, 3);
+        assert_eq!(rig.writer.queued(), 0);
+        // Still failing while the broker is down and nothing arrives.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!rig.readiness.report().ready, "no stale recovery");
+
+        // The broker is back; no capture arrives, the probe alone recovers.
+        rig.state.probe_works.store(true, Ordering::SeqCst);
+        rig.state.set_publish(true);
+        rig.wait_ready(true).await;
+
+        // And the next capture goes through.
+        rig.send("up-0").await;
+        rig.settle().await;
+        assert_eq!(rig.state.delivered(), 1);
+        assert_eq!(dropped_captures_count() - dropped_before, 3);
+        assert!(rig.readiness.report().ready);
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_clean_batch_recovers_readiness_when_the_probe_cannot() {
+        let _guard = RETRY_TEST_LOCK.lock().await;
+        let rig = Rig::start(false, false).await;
+        rig.send("down-0").await;
+        rig.wait_ready(false).await;
+
+        // Publishing works again but the probe still fails (a broker that
+        // accepts captures yet refuses metadata): the next batch decides.
+        rig.state.set_publish(true);
+        rig.send("up-0").await;
+        rig.settle().await;
+        rig.wait_ready(true).await;
+        assert_eq!(rig.state.delivered(), 1);
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_healthy_writer_is_never_probed() {
+        let _guard = RETRY_TEST_LOCK.lock().await;
+        let rig = Rig::start(true, false).await;
+        for i in 0..5 {
+            rig.send(&format!("ok-{i}")).await;
+        }
+        rig.settle().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rig.readiness.report().ready);
+        assert_eq!(rig.state.probes.load(Ordering::SeqCst), 0);
+        rig.stop().await;
+    }
+
+    #[tokio::test]
+    async fn every_accepted_capture_is_published_or_counted_dropped_across_flaps_and_shutdown() {
+        let _guard = RETRY_TEST_LOCK.lock().await;
+        let rig = Rig::start(true, true).await;
+        let dropped_before = dropped_captures_count();
+        let senders = 4;
+        let per_sender = 40;
+
+        // The broker flaps while four tunnels send, so retries, drops and
+        // concurrent senders interleave.
+        let flapper = {
+            let state = rig.state.clone();
+            tokio::spawn(async move {
+                let mut works = false;
+                loop {
+                    works = !works;
+                    state.set_publish(works);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+            })
+        };
+        let mut tasks = Vec::new();
+        for s in 0..senders {
+            let writer = rig.writer.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..per_sender {
+                    writer.send(test_event(&format!("flap-{s}-{i}"))).await;
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        flapper.abort();
+        // The broker is back for the final drain at shutdown.
+        rig.state.set_publish(true);
+        rig.writer.flush_and_close(Duration::from_secs(10)).await;
+
+        // A capture accepted after shutdown is counted, not lost silently.
+        rig.writer.send(test_event("late")).await;
+
+        let accepted = (senders * per_sender) as usize;
+        let delivered = rig.state.delivered();
+        let dropped = (dropped_captures_count() - dropped_before) as usize;
+        assert_eq!(
+            delivered + dropped,
+            accepted + 1,
+            "published {delivered} + dropped {dropped}"
+        );
+        let delivered_keys = rig.state.delivered.lock().clone();
+        let unique: std::collections::BTreeSet<_> = delivered_keys.iter().collect();
+        assert_eq!(unique.len(), delivered, "no capture published twice");
+        assert!(!unique.contains(&Bytes::from("late")));
+        assert_eq!(rig.writer.queued(), 0);
+        assert!(!rig.writer.has_work());
+        rig.stop().await;
     }
 }

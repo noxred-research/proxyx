@@ -304,7 +304,7 @@ impl MitmHandler {
                         .trim_end_matches('.')
                         .eq_ignore_ascii_case(host.trim_end_matches('.'))
                 });
-        let config = tls::configure_upstream(connector, insecure)?;
+        let config = tls::configure_upstream(connector, tls_profile, insecure)?;
         let handshake_start = std::time::Instant::now();
         let handshake = tokio::time::timeout(
             self.limits.tls_handshake,
@@ -375,7 +375,7 @@ impl MitmHandler {
                         .with_context(|| {
                             format!("h1 fallback connect to {dial_host}:{dial_port}")
                         })?;
-                    let mut config = tls::configure_upstream(&connector, insecure)
+                    let mut config = tls::configure_upstream(&connector, tls_profile, insecure)
                         .context("h1 fallback connector configure failed")?;
                     // Force ALPN to http/1.1 only (length-prefixed wire format).
                     config
@@ -646,10 +646,16 @@ pub struct CapturedExchange {
     pub request_headers: Vec<(String, String)>,
     pub request_body: Bytes,
     pub request_body_truncated: bool,
+    /// Full request body size on the wire (decoded transfer framing), not
+    /// the length of the captured prefix.
+    pub request_body_size: u64,
     pub status: u16,
     pub response_headers: Vec<(String, String)>,
     pub response_body: Bytes,
     pub response_body_truncated: bool,
+    /// Full response body size on the wire (decoded transfer framing), not
+    /// the length of the captured prefix.
+    pub response_body_size: u64,
     /// Wall-clock time at which the exchange began (request line read).
     /// Captured at the proxy so the ClickHouse `timestamp` reflects request
     /// order, not when the publisher happened to dequeue it under backpressure.
@@ -904,6 +910,7 @@ where
 
         let request_body = sb.captured;
         let request_body_truncated = sb.truncated;
+        let request_body_size = sb.size;
         // Leftover from request body = start of next pipelined request
         client_carryover = sb.leftover;
 
@@ -945,7 +952,12 @@ where
         // Parse response
         let parsed_resp = parse_response(&resp_header_buf[..resp_header_len])?;
         let answered = upstream_req.response(parsed_resp.status);
-        let resp_wants_close = wants_close(&parsed_resp.headers);
+        let resp_framing =
+            response_body_framing(&parsed_req.method, parsed_resp.status, &parsed_resp.headers);
+        // EOF frames this body. Keeping the client leg alive would leave it
+        // waiting for the delimiter until the next-request idle timeout.
+        let resp_wants_close =
+            wants_close(&parsed_resp.headers) || resp_framing == BodyFraming::CloseDelimited;
 
         // WS upgrade detection happens BEFORE reading the response body. A 101
         // has no HTTP body; the bytes past \r\n\r\n are the start of the WS
@@ -988,17 +1000,15 @@ where
             .write_all(&client_response_head(
                 &resp_header_buf[..resp_header_len],
                 &parsed_resp.headers,
-                close_after_exchange || quota_reached,
+                close_after_exchange || quota_reached || resp_wants_close,
             ))
             .await?;
         observe_overhead(protocol, "response", answered.elapsed());
 
         // Stream response body (skipped for WS upgrades)
-        let (response_body, response_body_truncated) = if ws_upgraded {
-            (Bytes::new(), false)
+        let (response_body, response_body_truncated, response_body_size) = if ws_upgraded {
+            (Bytes::new(), false, 0)
         } else {
-            let resp_framing =
-                response_body_framing(&parsed_req.method, parsed_resp.status, &parsed_resp.headers);
             let sb = stream_body(
                 &mut upstream,
                 client.get_mut(),
@@ -1009,7 +1019,7 @@ where
             )
             .await?;
             upstream_carryover = sb.leftover;
-            (sb.captured, sb.truncated)
+            (sb.captured, sb.truncated, sb.size)
         };
         client.get_mut().flush().await?;
 
@@ -1029,6 +1039,7 @@ where
             request_headers: captured_request_headers(&parsed_req.headers, max_header_capture),
             request_body,
             request_body_truncated,
+            request_body_size,
             status: parsed_resp.status,
             response_headers: truncate_header_values(
                 parsed_resp.headers.clone(),
@@ -1036,6 +1047,7 @@ where
             ),
             response_body,
             response_body_truncated,
+            response_body_size,
             timestamp: exchange_ts,
             duration_ms: exchange_start.elapsed().as_millis() as u64,
         };
@@ -1454,6 +1466,8 @@ struct BodyCapture {
     buf: Vec<u8>,
     truncated: bool,
     cap: usize,
+    /// Every byte offered, captured or not.
+    total: u64,
 }
 
 impl BodyCapture {
@@ -1462,10 +1476,12 @@ impl BodyCapture {
             buf: Vec::new(),
             truncated: false,
             cap,
+            total: 0,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
+        self.total += data.len() as u64;
         if self.buf.len() < self.cap {
             let take = (self.cap - self.buf.len()).min(data.len());
             self.buf.extend_from_slice(&data[..take]);
@@ -1485,6 +1501,8 @@ impl BodyCapture {
 struct StreamedBody {
     captured: Bytes,
     truncated: bool,
+    /// Full body size, including the bytes past the capture cap.
+    size: u64,
     leftover: Vec<u8>,
 }
 
@@ -1559,6 +1577,7 @@ where
             Ok(StreamedBody {
                 captured: Bytes::new(),
                 truncated: false,
+                size: 0,
                 leftover: extra.to_vec(),
             })
         }
@@ -1586,6 +1605,7 @@ where
 
             Ok(StreamedBody {
                 captured: Bytes::from(capture.buf),
+                size: capture.total,
                 truncated: capture.truncated,
                 leftover,
             })
@@ -1607,6 +1627,7 @@ where
             }
             Ok(StreamedBody {
                 captured: Bytes::from(capture.buf),
+                size: capture.total,
                 truncated: capture.truncated,
                 leftover: Vec::new(),
             })
@@ -1708,6 +1729,7 @@ where
 
     Ok(StreamedBody {
         captured: Bytes::from(std::mem::take(&mut capture.buf)),
+        size: capture.total,
         truncated: capture.truncated,
         leftover: buf,
     })
@@ -2347,10 +2369,12 @@ where
                 request_headers: captured_request_headers(&parsed_req.headers, max_header_capture),
                 request_body: Bytes::new(),
                 request_body_truncated: false,
+                request_body_size: 0,
                 status: 101,
                 response_headers: truncate_header_values(captured_resp_headers, max_header_capture),
                 response_body: Bytes::new(),
                 response_body_truncated: false,
+                response_body_size: 0,
                 timestamp: exchange_ts,
                 duration_ms: exchange_start.elapsed().as_millis() as u64,
             };
@@ -2427,6 +2451,7 @@ where
             }
             Err(err) => return Err(err),
         };
+        let request_body_size = req_body_raw.len() as u64;
         let body_read = body_start.elapsed();
 
         // Rate limit: acquire a token per exchange before forwarding.
@@ -2455,7 +2480,7 @@ where
         // --- H1 → H2 request translation ---
 
         // Build an absolute URI so h2 can populate :scheme, :authority, :path.
-        let uri = build_h2_uri(target_host, &parsed_req.path);
+        let uri = build_h2_uri(target_host, &parsed_req);
         let mut req_builder = http::Request::builder()
             .method(parsed_req.method.as_str())
             .uri(uri.as_str());
@@ -2615,6 +2640,7 @@ where
         // captured copy is.
         let mut captured: Vec<u8> = Vec::new();
         let mut response_body_truncated = false;
+        let mut response_body_size = 0u64;
 
         while let Some(chunk) = tokio::time::timeout(limits.body_idle, recv_body.data())
             .await
@@ -2634,6 +2660,7 @@ where
                 // chunks so we never emit a chunked terminator mid-stream.
                 continue;
             }
+            response_body_size += chunk.len() as u64;
 
             if use_chunked {
                 let len_line = format!("{:x}\r\n", chunk.len());
@@ -2686,10 +2713,12 @@ where
             request_headers: truncate_header_values(parsed_req.headers, max_header_capture),
             request_body,
             request_body_truncated,
+            request_body_size,
             status,
             response_headers,
             response_body,
             response_body_truncated,
+            response_body_size,
             timestamp: exchange_ts,
             duration_ms: exchange_start.elapsed().as_millis() as u64,
         };
@@ -2721,12 +2750,11 @@ where
     Ok(())
 }
 
-/// Build an absolute URI for H2 requests from a target host and H1 request path.
-///
-/// H2 requires absolute URIs so the `http` crate can populate the :scheme,
-/// :authority, and :path pseudo-headers correctly. This function produces
-/// `https://<host><path>` for relative paths (the normal MITM CONNECT case).
-fn build_h2_uri(host: &str, path: &str) -> String {
+/// Build an absolute URI for H2 requests, preserving the H1 Host authority
+/// (including a non-default port or bracketed IPv6 literal).
+fn build_h2_uri(target_host: &str, request: &ParsedRequest) -> String {
+    let host = request.host.as_deref().unwrap_or(target_host);
+    let path = &request.path;
     if path.starts_with('/') {
         format!("https://{}{}", host, path)
     } else {
@@ -2759,7 +2787,7 @@ fn build_h2_extended_connect(
     target_host: &str,
     inject_headers: &[(String, String)],
 ) -> Result<http::Request<()>> {
-    let uri = build_h2_uri(target_host, &parsed_req.path);
+    let uri = build_h2_uri(target_host, parsed_req);
     let mut req_builder = http::Request::builder()
         .method(http::Method::CONNECT)
         .uri(uri.as_str());
@@ -3022,10 +3050,12 @@ where
         request_headers: captured_request_headers(&parsed_req.headers, max_header_capture),
         request_body: Bytes::new(),
         request_body_truncated: false,
+        request_body_size: 0,
         status: parsed_resp.status,
         response_headers: truncate_header_values(parsed_resp.headers.clone(), max_header_capture),
         response_body: Bytes::new(),
         response_body_truncated: false,
+        response_body_size: 0,
         timestamp: exchange_ts,
         duration_ms: exchange_start.elapsed().as_millis() as u64,
     };
@@ -3073,6 +3103,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h2_requests_preserve_host_authority() {
+        for authority in ["app.example:8443", "[::1]:8443", "other.example"] {
+            let request = parse_request(
+                format!("GET /path?q=1 HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                build_h2_uri("fallback.example", &request),
+                format!("https://{authority}/path?q=1")
+            );
+            let extended = build_h2_extended_connect(&request, "fallback.example", &[]).unwrap();
+            assert_eq!(extended.uri().authority().unwrap().as_str(), authority);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_delimited_response_closes_client_without_idle_wait() {
+        for version in ["1.0", "1.1"] {
+            let (mut client, proxy_client) = tokio::io::duplex(4096);
+            let (proxy_upstream, mut upstream) = tokio::io::duplex(4096);
+            let (tx, mut captures) = mpsc::channel(1);
+            let proxy = tokio::spawn(async move {
+                let exit = proxy_http_keepalive(
+                    proxy_client,
+                    proxy_upstream,
+                    "example.test",
+                    &[],
+                    tx,
+                    None,
+                    1024,
+                    512,
+                    None,
+                    None,
+                    false,
+                    "http",
+                    HttpLimits::default(),
+                )
+                .await?;
+                handoff_or_close(exit, None).await
+            });
+            let origin = tokio::spawn(async move {
+                let mut request = [0; 4096];
+                assert!(upstream.read(&mut request).await.unwrap() > 0);
+                upstream
+                    .write_all(format!("HTTP/{version} 200 OK\r\n\r\nclose framed").as_bytes())
+                    .await
+                    .unwrap();
+                upstream.shutdown().await.unwrap();
+            });
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+                .await
+                .expect("EOF must delimit the response, not the 30 second idle timeout")
+                .unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.to_ascii_lowercase().contains("connection: close"));
+            assert!(response.ends_with("close framed"));
+            assert_eq!(captures.recv().await.unwrap().response_body, "close framed");
+            proxy.await.unwrap().unwrap();
+            origin.await.unwrap();
+        }
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt, split};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -3418,6 +3516,10 @@ Connection: keep-alive\r\n\r\n";
             CAP,
             "captured response body must be bounded by max_body_capture"
         );
+        assert_eq!(
+            exchange.response_body_size, BODY_LEN as u64,
+            "response_body_size must be the full wire size, not the captured prefix"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3689,6 +3791,7 @@ Connection: keep-alive\r\n\r\n";
                 ],
                 request_body: Bytes::from(vec![0x41u8; BODY_SIZE]),
                 request_body_truncated: false,
+                request_body_size: BODY_SIZE as u64,
                 status: 200,
                 response_headers: vec![
                     (
@@ -3699,6 +3802,7 @@ Connection: keep-alive\r\n\r\n";
                 ],
                 response_body: Bytes::from(vec![0x42u8; BODY_SIZE]),
                 response_body_truncated: false,
+                response_body_size: BODY_SIZE as u64,
                 timestamp: time::OffsetDateTime::now_utc(),
                 duration_ms: 50,
             };
@@ -3787,10 +3891,12 @@ Connection: keep-alive\r\n\r\n";
             request_headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             request_body: Bytes::from(vec![0x41u8; BODY_SIZE]),
             request_body_truncated: false,
+            request_body_size: BODY_SIZE as u64,
             status: 200,
             response_headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             response_body: Bytes::from(vec![0x42u8; BODY_SIZE]),
             response_body_truncated: false,
+            response_body_size: BODY_SIZE as u64,
             timestamp: time::OffsetDateTime::now_utc(),
             duration_ms: 100,
         };
@@ -3811,13 +3917,13 @@ Connection: keep-alive\r\n\r\n";
             path: exchange.path.clone(),
             request_headers: exchange.request_headers.clone(),
             request_body: exchange.request_body.clone(),
-            request_body_size: exchange.request_body.len() as u64,
+            request_body_size: exchange.request_body_size,
             request_body_truncated: exchange.request_body_truncated,
             response_status: exchange.status as u32,
             response_status_text: String::new(),
             response_headers: exchange.response_headers.clone(),
             response_body: exchange.response_body.clone(),
-            response_body_size: exchange.response_body.len() as u64,
+            response_body_size: exchange.response_body_size,
             response_body_truncated: exchange.response_body_truncated,
             timing: TimingInfo {
                 total_ms: exchange.duration_ms,
@@ -4662,6 +4768,7 @@ Connection: keep-alive\r\n\r\n";
                 request_headers: vec![("Host".to_string(), "target.com".to_string())],
                 request_body: Bytes::from(vec![0x41u8; size / 10]), // req body ~10% of resp
                 request_body_truncated: false,
+                request_body_size: (size / 10) as u64,
                 status: 200,
                 response_headers: vec![
                     ("Content-Type".to_string(), "text/html".to_string()),
@@ -4669,6 +4776,7 @@ Connection: keep-alive\r\n\r\n";
                 ],
                 response_body: Bytes::from(vec![0x42u8; size]),
                 response_body_truncated: false,
+                response_body_size: size as u64,
                 timestamp: time::OffsetDateTime::now_utc(),
                 duration_ms: 100,
             });
@@ -4694,13 +4802,13 @@ Connection: keep-alive\r\n\r\n";
                 path: ex.path.clone(),
                 request_headers: ex.request_headers.clone(),
                 request_body: ex.request_body.clone(), // CLONE
-                request_body_size: ex.request_body.len() as u64,
+                request_body_size: ex.request_body_size,
                 request_body_truncated: ex.request_body_truncated,
                 response_status: ex.status as u32,
                 response_status_text: String::new(),
                 response_headers: ex.response_headers.clone(),
                 response_body: ex.response_body.clone(), // CLONE
-                response_body_size: ex.response_body.len() as u64,
+                response_body_size: ex.response_body_size,
                 response_body_truncated: ex.response_body_truncated,
                 timing: TimingInfo {
                     total_ms: ex.duration_ms,
@@ -5441,6 +5549,72 @@ Connection: keep-alive\r\n\r\n";
         );
     }
 
+    /// `*_body_size` is the full body size even when capture stops at the cap:
+    /// a Content-Length request and a chunked response, both over the cap.
+    #[tokio::test]
+    async fn test_h1_body_sizes_are_full_size_beyond_capture_cap() {
+        const CAP: usize = 4096;
+        const REQ_LEN: usize = 10_000;
+        const CHUNKS: [usize; 3] = [7_000, 9_000, 4_000];
+        let resp_len: usize = CHUNKS.iter().sum();
+
+        let mut resp_raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for size in CHUNKS {
+            resp_raw.extend_from_slice(format!("{size:x}\r\n").as_bytes());
+            resp_raw.extend(std::iter::repeat_n(b'r', size));
+            resp_raw.extend_from_slice(b"\r\n");
+        }
+        resp_raw.extend_from_slice(b"0\r\n\r\n");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_fake_http_server(listener, resp_raw));
+        let upstream = TcpStream::connect(server_addr).await.unwrap();
+        let (client_stream, test_end) = tokio::io::duplex(256 * 1024);
+        let (mut test_reader, mut test_writer) = split(test_end);
+        let (exchange_tx, mut exchange_rx) = tokio::sync::mpsc::channel(8);
+
+        let proxy = tokio::spawn(async move {
+            proxy_http_keepalive(
+                client_stream,
+                upstream,
+                "test.local",
+                &[],
+                exchange_tx,
+                None,
+                CAP,
+                CAP,
+                None,
+                None,
+                false,
+                "http",
+                HttpLimits::default(),
+            )
+            .await
+            .map(|_| ())
+        });
+
+        let req_data = make_h1_request("test.local", "/sizes", &vec![b'q'; REQ_LEN]);
+        test_writer.write_all(&req_data).await.unwrap();
+        test_writer.shutdown().await.unwrap();
+        let mut response_data = Vec::new();
+        test_reader.read_to_end(&mut response_data).await.unwrap();
+        proxy.await.unwrap().unwrap();
+        server.await.unwrap();
+
+        let exchange = exchange_rx.try_recv().expect("exchange must be captured");
+        assert_eq!(exchange.request_body.len(), CAP);
+        assert!(exchange.request_body_truncated);
+        assert_eq!(exchange.request_body_size, REQ_LEN as u64);
+        assert_eq!(exchange.response_body.len(), CAP);
+        assert!(exchange.response_body_truncated);
+        assert_eq!(
+            exchange.response_body_size, resp_len as u64,
+            "decoded chunk data, not chunk framing"
+        );
+    }
+
     // =========================================================================
     // RFC 8441 Extended CONNECT (WS over H2) tests
     // =========================================================================
@@ -6022,6 +6196,10 @@ Sec-WebSocket-Version: 13\r\n\r\n",
         assert!(
             exchange.response_body_truncated,
             "exchange must be flagged as truncated"
+        );
+        assert_eq!(
+            exchange.response_body_size, BODY_SIZE as u64,
+            "response_body_size must be the full wire size, not the captured prefix"
         );
     }
 

@@ -217,6 +217,20 @@ impl Reassembler {
         fin: bool,
         rsv1: bool,
     ) -> Result<Option<Reassembled>> {
+        self.feed_frame(payload, payload.len() as u64, opcode, fin, rsv1)
+    }
+
+    /// Like [`Reassembler::feed`], for a frame whose payload was only
+    /// partly retained: `payload` holds the captured prefix and `wire_len`
+    /// the frame's full payload length, which is what `payload_size` sums.
+    pub fn feed_frame(
+        &mut self,
+        payload: &[u8],
+        wire_len: u64,
+        opcode: u8,
+        fin: bool,
+        rsv1: bool,
+    ) -> Result<Option<Reassembled>> {
         // Control frames are always FIN=1 (parser enforces) and don't
         // participate in reassembly state. Emit them directly.
         if is_control(opcode) {
@@ -260,19 +274,24 @@ impl Reassembler {
         // (context-takeover). The compressed wire-byte limit is enforced
         // before appending; the capture cap applies to inflated output.
         // For UNCOMPRESSED messages we cap here — no shared window state.
-        self.captured_size = self.captured_size.saturating_add(payload.len() as u64);
+        self.captured_size = self.captured_size.saturating_add(wire_len);
         if self.rsv1 {
             // Compressed: keep the bounded payload for the inflater.
             self.capture_buf.extend_from_slice(payload);
-        } else if self.capture_buf.len() < self.max_capture {
-            let room = self.max_capture - self.capture_buf.len();
-            let take = room.min(payload.len());
-            self.capture_buf.extend_from_slice(&payload[..take]);
-            if take < payload.len() {
+        } else {
+            if self.capture_buf.len() < self.max_capture {
+                let room = self.max_capture - self.capture_buf.len();
+                let take = room.min(payload.len());
+                self.capture_buf.extend_from_slice(&payload[..take]);
+                if take < payload.len() {
+                    self.truncated = true;
+                }
+            } else if !payload.is_empty() {
                 self.truncated = true;
             }
-        } else if !payload.is_empty() {
-            self.truncated = true;
+            if wire_len > payload.len() as u64 {
+                self.truncated = true;
+            }
         }
 
         if !fin {
@@ -441,11 +460,10 @@ impl Inflater {
         let mut scratch = vec![0u8; 16 * 1024];
 
         loop {
-            if input_pos >= input.len() {
-                break;
-            }
-
             let in_slice = &input[input_pos..];
+            // The decompressor holds output it could not fit in `scratch`;
+            // an exhausted input still has to be drained until a call leaves
+            // the scratch buffer unfilled.
             let in_before = self.decompress.total_in();
             let out_before = self.decompress.total_out();
             let status = self
@@ -478,6 +496,9 @@ impl Inflater {
             }
 
             if matches!(status, flate2::Status::StreamEnd) {
+                break;
+            }
+            if input_pos >= input.len() && produced < scratch.len() {
                 break;
             }
             if consumed == 0 && produced == 0 {
@@ -965,22 +986,27 @@ where
                 unmask(&mut capture_buf, key);
             }
 
-            let reassembled =
-                match reassembler.feed(&capture_buf, header.opcode, header.fin, header.rsv1) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => continue, // mid-fragmentation
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            host = %ctx.host,
-                            session_id = %ctx.session_id,
-                            direction = direction.as_str(),
-                            "ws reassembly error, tearing down direction"
-                        );
-                        let _ = writer.shutdown().await;
-                        return Err(e);
-                    }
-                };
+            let reassembled = match reassembler.feed_frame(
+                &capture_buf,
+                payload_len as u64,
+                header.opcode,
+                header.fin,
+                header.rsv1,
+            ) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue, // mid-fragmentation
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        host = %ctx.host,
+                        session_id = %ctx.session_id,
+                        direction = direction.as_str(),
+                        "ws reassembly error, tearing down direction"
+                    );
+                    let _ = writer.shutdown().await;
+                    return Err(e);
+                }
+            };
 
             if is_control(reassembled.opcode)
                 && reassembled.opcode != OPCODE_CLOSE
@@ -1575,6 +1601,54 @@ mod tests {
         assert_eq!(out.len(), 100);
         assert_eq!(&out[..], &payload[..100]);
         assert!(truncated);
+    }
+
+    /// Output the decompressor could not fit in one scratch buffer is still
+    /// pending when the input is exhausted: sizes just past multiples of the
+    /// 16 KiB scratch must not lose the tail.
+    #[test]
+    fn inflater_drains_output_pending_after_input_is_consumed() {
+        for len in [16 * 1024 + 1, 50_000, 60_000, 65_536] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut compressor = Compress::new(flate2::Compression::default(), false);
+            let wire = compress_for_wire(&payload, 15, &mut compressor);
+
+            let (out, truncated, size) = Inflater::new(15, false).inflate(&wire, 1 << 20).unwrap();
+            assert_eq!(out, payload, "len {len}");
+            assert!(!truncated, "len {len}");
+            assert_eq!(size, len as u64);
+
+            let (out, truncated, size) = Inflater::new(15, false).inflate(&wire, 100).unwrap();
+            assert_eq!(out, payload[..100], "len {len}");
+            assert!(truncated, "len {len}");
+            assert_eq!(size, len as u64, "full size survives the cap");
+        }
+    }
+
+    #[test]
+    fn reassembler_counts_the_full_frame_when_only_a_prefix_was_kept() {
+        let mut r = Reassembler::new(1024, 4);
+        let m = r
+            .feed_frame(b"hell", 11, OPCODE_TEXT, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.payload, b"hell");
+        assert_eq!(m.payload_size, 11);
+        assert!(m.truncated);
+
+        // Fragmented: sizes add up across frames.
+        let mut r = Reassembler::new(1024, 4);
+        assert!(
+            r.feed_frame(b"ab", 2, OPCODE_TEXT, false, false)
+                .unwrap()
+                .is_none()
+        );
+        let m = r
+            .feed_frame(b"cd", 10, OPCODE_CONTINUATION, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.payload_size, 12);
+        assert!(m.truncated);
     }
 
     // -- parse_extensions --

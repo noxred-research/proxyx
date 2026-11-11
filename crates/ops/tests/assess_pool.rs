@@ -341,6 +341,72 @@ async fn a_stale_exit_ip_check_warns() -> TestResult {
     Ok(())
 }
 
+/// Sessions on the connected database whose `application_name` is `application`.
+async fn sessions(pg: &PgPool, application: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = $1",
+    )
+    .bind(application)
+    .fetch_one(pg)
+    .await
+}
+
+/// The server drops a closed connection's backend a moment after the client
+/// said goodbye: wait for that, not for a fixed time.
+async fn sessions_gone(pg: &PgPool, application: &str) -> Result<bool, sqlx::Error> {
+    for _ in 0..250 {
+        if sessions(pg, application).await? == 0 {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(false)
+}
+
+#[tokio::test]
+async fn an_assessment_leaves_no_session_on_the_database() -> TestResult {
+    let Some(f) = Fixture::new("proxyx_ops_doctor_assess_sessions", None).await? else {
+        return Ok(());
+    };
+    f.ready_sessions(4).await?;
+    f.healthy_statics(10).await?;
+    let application = "ops_assess_probe";
+    let mut settings = f.settings.clone();
+    settings.database_url = Secret::new(format!(
+        "{}?application_name={application}",
+        f.settings.database_url.expose()
+    ));
+
+    // The probe name does show the sessions of a pool that is open.
+    let open = Db::connect(settings.database_url.expose()).await?;
+    open.ping().await?;
+    assert!(sessions(&f.pg, application).await? > 0);
+    open.close().await;
+    assert!(sessions_gone(&f.pg, application).await?);
+
+    let args = PoolAssessArgs {
+        config: None,
+        json: false,
+        strict: false,
+        window: Duration::from_secs(3600),
+        no_gateway: true,
+        ops_url: None,
+        timeout: Duration::from_secs(3),
+    };
+    let a = assess_pool(&settings, &args).await?;
+    assert_eq!(level(&a, "checks", &f.isp), Level::Ok);
+    assert!(
+        sessions_gone(&f.pg, application).await?,
+        "the assessment left {} session(s) open",
+        sessions(&f.pg, application).await?
+    );
+    // Every row it read is free to be written at once.
+    f.db.record_check(f.ips[0], Some(f.ips[0]), OffsetDateTime::now_utc())
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn rentals_scores_blocks_budget_and_leases_are_read_from_the_stores() -> TestResult {
     let in_ten_days = (OffsetDateTime::now_utc() + time::Duration::days(10))

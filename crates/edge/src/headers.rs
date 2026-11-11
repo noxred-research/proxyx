@@ -334,7 +334,7 @@ fn strip_hop_by_hop(h: &mut Vec<Header>, keep_upgrade: bool) {
         if keep_upgrade && l == "upgrade" {
             return true;
         }
-        !HOP_BY_HOP.contains(&l.as_str()) && !named.contains(&l)
+        !l.starts_with("proxy-") && !HOP_BY_HOP.contains(&l.as_str()) && !named.contains(&l)
     });
 }
 
@@ -430,6 +430,7 @@ mod tests {
             ("Keep-Alive", "timeout=5"),
             ("Proxy-Authorization", "Basic abc"),
             ("Proxy-Connection", "keep-alive"),
+            ("pRoXy-Secret", "must-not-reach-target"),
             ("TE", "trailers"),
             ("Upgrade", "websocket"),
             ("Accept", "*/*"),

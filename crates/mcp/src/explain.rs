@@ -297,6 +297,47 @@ fn proxy_error_advice(cause: ProxyErrorCause) -> Advice {
             next: &["retry; compare upstream_duration_seconds with a direct request"],
             metrics: &["proxyx_intercept_upstream_duration_seconds"],
         },
+        ProxyErrorCause::UpstreamUnavailable => Advice {
+            meaning: "The proxy's circuit breaker for the target (or the org egress proxy, or a private override) is open: no dial was made. Honour the Retry-After header.",
+            likely: &[
+                "recent connection failures to the same target or egress proxy opened the breaker",
+                "the org's egress proxy is down",
+            ],
+            next: &[
+                "wait for Retry-After; the breaker probes by itself and closes after successful probes",
+                "check the target or the org's egress proxy directly",
+            ],
+            metrics: &[
+                "proxyx_intercept_upstream_breaker_state",
+                "proxyx_intercept_upstream_breaker_rejected_total",
+            ],
+        },
+        ProxyErrorCause::UpstreamTls => Advice {
+            meaning: "The proxy's own TLS handshake with the target failed, or the target certificate did not verify (upstream verification is on by default).",
+            likely: &[
+                "the target serves a certificate from a private or unknown CA",
+                "an expired, self-signed or mismatched certificate",
+            ],
+            next: &[
+                "add the target's CA to the session proxy's [tls] ca_bundle",
+                "for authorized tests only, set insecure_upstream_tls on the session",
+            ],
+            metrics: &["proxyx_intercept_tls_handshake_seconds"],
+        },
+        ProxyErrorCause::ConnectionLimit => Advice {
+            meaning: "The session proxy is at tuning.max_connections and refused the connection.",
+            likely: &[
+                "a traffic burst or a client that leaks connections",
+                "tuning.max_connections is low for the load",
+            ],
+            next: &[
+                "retry after a short wait; raise tuning.max_connections or add session proxy replicas",
+            ],
+            metrics: &[
+                "proxyx_intercept_connection_limit_refusals_total",
+                "proxyx_intercept_connections_active",
+            ],
+        },
     }
 }
 
@@ -365,6 +406,9 @@ pub fn all_proxy_codes() -> Vec<Value> {
         ProxyErrorCause::UpstreamDns,
         ProxyErrorCause::UpstreamError,
         ProxyErrorCause::UpstreamTimeout,
+        ProxyErrorCause::UpstreamUnavailable,
+        ProxyErrorCause::UpstreamTls,
+        ProxyErrorCause::ConnectionLimit,
     ]
     .into_iter()
     .map(|cause| {

@@ -470,12 +470,20 @@ impl QueryBranch {
             self.response_sets_cookies,
         );
         if let Some(ref f) = self.request_header {
-            conditions.push("request_headers[?] = ?".to_string());
+            conditions.push(
+                "arrayFirst((v, k) -> lower(k) = ?, \
+                 mapValues(request_headers), mapKeys(request_headers)) = ?"
+                    .to_string(),
+            );
             binds.push(f.key.to_lowercase());
             binds.push(f.value.clone());
         }
         if let Some(ref f) = self.response_header {
-            conditions.push("response_headers[?] = ?".to_string());
+            conditions.push(
+                "arrayFirst((v, k) -> lower(k) = ?, \
+                 mapValues(response_headers), mapKeys(response_headers)) = ?"
+                    .to_string(),
+            );
             binds.push(f.key.to_lowercase());
             binds.push(f.value.clone());
         }
@@ -1385,6 +1393,45 @@ mod tests {
         );
         assert_eq!(binds, vec!["org-1", "%json%"]);
         assert_eq!(routing::select_table(&q, false), "http_captures");
+    }
+
+    #[test]
+    fn header_filters_match_names_case_insensitively_and_values_exactly() {
+        for (request_value, response_value) in [("Agent-1", "Application/JSON"), ("", "")] {
+            let q = TrafficQuery {
+                branches: NonEmpty(vec![QueryBranch {
+                    request_header: Some(HeaderExactFilter {
+                        key: "X-ProxyX-Agent".into(),
+                        value: request_value.into(),
+                    }),
+                    response_header: Some(HeaderExactFilter {
+                        key: "CoNtEnT-TyPe".into(),
+                        value: response_value.into(),
+                    }),
+                    ..Default::default()
+                }]),
+                ..traffic_query(SortOrder::Asc, None, None)
+            };
+            let (sql, binds) = lower(&q);
+            assert_eq!(
+                sql,
+                "org_id = ? AND (arrayFirst((v, k) -> lower(k) = ?, \
+                 mapValues(request_headers), mapKeys(request_headers)) = ? \
+                 AND arrayFirst((v, k) -> lower(k) = ?, \
+                 mapValues(response_headers), mapKeys(response_headers)) = ?)"
+            );
+            assert_eq!(
+                binds,
+                vec![
+                    "org-1",
+                    "x-proxyx-agent",
+                    request_value,
+                    "content-type",
+                    response_value,
+                ]
+            );
+            assert_eq!(routing::select_table(&q, false), "http_captures");
+        }
     }
 
     #[test]

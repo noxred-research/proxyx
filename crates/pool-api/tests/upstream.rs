@@ -169,6 +169,7 @@ async fn set_creates_a_candidate_nobody_can_lease_and_never_returns_the_login() 
     assert_eq!(body["scheme"], "http");
     assert_eq!(body["provider"], "customer");
     assert_eq!(body["has_login"], true);
+    assert_eq!(body["set_by"], "admin");
 
     // Not leasable before validation, not even by its owner; the stub was not dialled.
     assert_eq!(lease(&h, &acme, "s").await?, LeaseOutcome::Empty);
@@ -177,6 +178,7 @@ async fn set_creates_a_candidate_nobody_can_lease_and_never_returns_the_login() 
     // No reply, GET or inventory listing carries the login.
     let (status, got) = call(&h, Method::GET, &acme, "").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["set_by"], body["set_by"]);
     let (_, list) = h.get("/v1/inventory").await;
     for reply in [body.to_string(), got.to_string(), list.to_string()] {
         assert!(

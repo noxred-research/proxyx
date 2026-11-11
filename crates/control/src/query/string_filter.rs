@@ -6,17 +6,14 @@
 //! `IntFilter`, and explicit NULL/present checks. `All` / `Any` / `Not`
 //! compose them per-column.
 //!
-//! ## tokenbf body optimization
+//! ## No token probe on bodies
 //!
 //! The body columns carry `lower(body)` `tokenbf_v1` skip indexes (see
-//! `clickhouse/indexes.sql`). ClickHouse 24.x does not extract tokens
-//! from `LIKE` patterns (issue #68985), so a plain `lower(body) LIKE
-//! '%foo%'` reads every granule even when the bloom would prune most of
-//! them. For single-token alphanumeric patterns we additionally emit
-//! `hasToken(lower(body), lower(?))`, which the planner translates to a
-//! direct bloom probe. The trailing `LIKE` keeps the result
-//! semantically identical (`hasToken` matches whole tokens; `LIKE` keeps
-//! substring semantics for, say, `foo` inside `foobar`).
+//! `clickhouse/indexes.sql`), and `hasToken(lower(body), lower(?))` would
+//! probe them directly. It cannot guard a `contains`: `hasToken` matches
+//! whole tokens, so `hasToken(..) AND lower(body) LIKE ..` drops every row
+//! where the needle is only part of a token (`line` in `line1`). Substring
+//! semantics are `lower(col) LIKE lower(?)` alone.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,8 +30,9 @@ pub enum StringFilter {
     Exact {
         value: String,
     },
-    /// RE2 regex, unanchored, case-sensitive. Use `(?i)` for case
-    /// insensitivity. Patterns are pre-validated at the API entrypoint.
+    /// RE2 regex, unanchored, case-sensitive, `.` not matching a newline.
+    /// Use `(?i)` for case insensitivity and `(?s)` to let `.` match a
+    /// newline. Patterns are pre-validated at the API entrypoint.
     RegexMatch {
         value: String,
     },
@@ -55,37 +53,24 @@ pub enum StringFilter {
     },
 }
 
-/// Static description of a filterable column. The filter lowerer needs
-/// to know two things beyond the column name: whether `lower(col)`
-/// carries a tokenbf skip index (gates the `hasToken` probe), and
-/// whether the column is nullable (informational — `IsNull` /
-/// `IsPresent` are legal on any column).
+/// Static description of a filterable column: the SQL expression that
+/// names it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ColumnDescriptor {
     pub name: &'static str,
-    pub has_lower_tokenbf: bool,
 }
 
 impl ColumnDescriptor {
     const fn plain(name: &'static str) -> Self {
-        Self {
-            name,
-            has_lower_tokenbf: false,
-        }
-    }
-    const fn body(name: &'static str) -> Self {
-        Self {
-            name,
-            has_lower_tokenbf: true,
-        }
+        Self { name }
     }
 }
 
 pub(crate) const HOST: ColumnDescriptor = ColumnDescriptor::plain("host");
 pub(crate) const METHOD: ColumnDescriptor = ColumnDescriptor::plain("method");
 pub(crate) const PATH: ColumnDescriptor = ColumnDescriptor::plain("path");
-pub(crate) const REQUEST_BODY: ColumnDescriptor = ColumnDescriptor::body("request_body");
-pub(crate) const RESPONSE_BODY: ColumnDescriptor = ColumnDescriptor::body("response_body");
+pub(crate) const REQUEST_BODY: ColumnDescriptor = ColumnDescriptor::plain("request_body");
+pub(crate) const RESPONSE_BODY: ColumnDescriptor = ColumnDescriptor::plain("response_body");
 pub(crate) const CORRELATION_ID: ColumnDescriptor = ColumnDescriptor::plain("correlation_id");
 pub(crate) const PARENT_CORRELATION_ID: ColumnDescriptor =
     ColumnDescriptor::plain("parent_correlation_id");
@@ -99,14 +84,9 @@ pub(crate) const MIME_TYPE: ColumnDescriptor = ColumnDescriptor::plain(
      mapValues(response_headers), mapKeys(response_headers)))[1]))",
 );
 
-// WebSocket column descriptors. `payload` carries a tokenbf body index
-// (matches the http_captures request_body / response_body pattern); the
-// rest are plain string columns. CH `Enum8` columns (direction, opcode)
-// expose as plain string columns at the filter level — implicit
-// String<->Enum conversion at WHERE time means a `lower_string` fragment
-// against an Enum8 column with a string bind is accepted as-is.
+// WebSocket column descriptors.
 pub(crate) const WS_HOST: ColumnDescriptor = ColumnDescriptor::plain("host");
-pub(crate) const WS_PAYLOAD: ColumnDescriptor = ColumnDescriptor::body("payload");
+pub(crate) const WS_PAYLOAD: ColumnDescriptor = ColumnDescriptor::plain("payload");
 // `direction`/`opcode` are CH `Enum8`. `lower(...)` and `match(...)` both
 // require `String`, so the column expression is `toString(...)` rather than
 // the raw column name. CH still uses the underlying Enum8 sort key + skip
@@ -124,16 +104,6 @@ pub(crate) fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// True for short, single-token patterns where the body bloom probe is
-/// safe and useful. ClickHouse's tokenbf tokenizer splits on any
-/// non-alphanumeric byte; `hasToken` rejects needles containing separators
-/// such as `_`, `-`, or whitespace. Keep this predicate intentionally
-/// stricter than substring semantics: anything outside ClickHouse's token
-/// alphabet must fall back to `LIKE`.
-fn is_single_token(s: &str) -> bool {
-    s.len() >= 3 && s.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 /// Lower a `StringFilter` against the named column. Returns a SQL
 /// fragment; positional bind values are pushed onto `binds` in the
 /// order `?` placeholders appear in the fragment.
@@ -145,24 +115,19 @@ pub(crate) fn lower_string(
     let name = col.name;
     match f {
         StringFilter::Contains { value } => {
-            let pattern = format!("%{}%", escape_like(value));
-            if col.has_lower_tokenbf && is_single_token(value) {
-                // Bloom-prune via hasToken, refine via LIKE for substring
-                // semantics. Both operands case-insensitive.
-                binds.push(value.clone());
-                binds.push(pattern);
-                format!("hasToken(lower({name}), lower(?)) AND lower({name}) LIKE lower(?)")
-            } else {
-                binds.push(pattern);
-                format!("lower({name}) LIKE lower(?)")
-            }
+            binds.push(format!("%{}%", escape_like(value)));
+            format!("lower({name}) LIKE lower(?)")
         }
         StringFilter::Exact { value } => {
             binds.push(value.clone());
             format!("{name} = ?")
         }
         StringFilter::RegexMatch { value } => {
-            binds.push(value.clone());
+            // ClickHouse compiles with `.` matching newlines, unlike RE2
+            // and the validating `regex` crate. A leading `(?-s)` restores
+            // the standard default for the whole pattern; the pattern's own
+            // flags, `(?s)` included, still apply after it.
+            binds.push(format!("(?-s){value}"));
             format!("match({name}, ?)")
         }
         StringFilter::Length { value } => {
@@ -213,46 +178,26 @@ mod tests {
     }
 
     #[test]
-    fn contains_non_body_uses_plain_like() {
-        let (sql, binds) = lower(
-            HOST,
-            &StringFilter::Contains {
-                value: "Stripe".to_string(),
-            },
-        );
-        assert_eq!(sql, "lower(host) LIKE lower(?)");
-        assert_eq!(binds, vec!["%Stripe%"]);
+    fn contains_is_a_plain_like_on_every_column() {
+        for (col, name) in [
+            (HOST, "host"),
+            (RESPONSE_BODY, "response_body"),
+            (REQUEST_BODY, "request_body"),
+            (WS_PAYLOAD, "payload"),
+        ] {
+            let (sql, binds) = lower(
+                col,
+                &StringFilter::Contains {
+                    value: "Stripe".to_string(),
+                },
+            );
+            assert_eq!(sql, format!("lower({name}) LIKE lower(?)"));
+            assert_eq!(binds, vec!["%Stripe%"]);
+        }
     }
 
     #[test]
-    fn contains_body_single_token_uses_has_token() {
-        let (sql, binds) = lower(
-            RESPONSE_BODY,
-            &StringFilter::Contains {
-                value: "openresty".to_string(),
-            },
-        );
-        assert_eq!(
-            sql,
-            "hasToken(lower(response_body), lower(?)) AND lower(response_body) LIKE lower(?)"
-        );
-        assert_eq!(binds, vec!["openresty", "%openresty%"]);
-    }
-
-    #[test]
-    fn contains_body_multiword_falls_back_to_like() {
-        let (sql, binds) = lower(
-            RESPONSE_BODY,
-            &StringFilter::Contains {
-                value: "open resty".to_string(),
-            },
-        );
-        assert_eq!(sql, "lower(response_body) LIKE lower(?)");
-        assert_eq!(binds, vec!["%open resty%"]);
-    }
-
-    #[test]
-    fn contains_body_separator_falls_back_to_like() {
+    fn contains_escapes_like_wildcards_in_the_needle() {
         let (sql, binds) = lower(
             REQUEST_BODY,
             &StringFilter::Contains {
@@ -261,30 +206,6 @@ mod tests {
         );
         assert_eq!(sql, "lower(request_body) LIKE lower(?)");
         assert_eq!(binds, vec!["%anonymous\\_visitor%"]);
-    }
-
-    #[test]
-    fn contains_body_punctuation_falls_back_to_like() {
-        let (sql, binds) = lower(
-            REQUEST_BODY,
-            &StringFilter::Contains {
-                value: "X-Frame".to_string(),
-            },
-        );
-        assert_eq!(sql, "lower(request_body) LIKE lower(?)");
-        assert_eq!(binds, vec!["%X-Frame%"]);
-    }
-
-    #[test]
-    fn contains_body_short_pattern_falls_back_to_like() {
-        let (sql, binds) = lower(
-            REQUEST_BODY,
-            &StringFilter::Contains {
-                value: "ab".to_string(),
-            },
-        );
-        assert_eq!(sql, "lower(request_body) LIKE lower(?)");
-        assert_eq!(binds, vec!["%ab%"]);
     }
 
     #[test]
@@ -308,7 +229,7 @@ mod tests {
             },
         );
         assert_eq!(sql, "match(path, ?)");
-        assert_eq!(binds, vec!["^/api/v\\d+/"]);
+        assert_eq!(binds, vec!["(?-s)^/api/v\\d+/"]);
     }
 
     #[test]

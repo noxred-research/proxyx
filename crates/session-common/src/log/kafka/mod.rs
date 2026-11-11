@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -228,6 +228,11 @@ impl KafkaConfig {
     }
 }
 
+/// Longest wait between two attempts to reach a broker. The client's own
+/// default is 500 s, so a broker that came back after a long outage (or reset
+/// one connection while starting) was not retried for over a minute.
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Build an rskafka [`Client`] from config.
 async fn build_client(config: &KafkaConfig, component: &str) -> Result<Client> {
     let brokers: Vec<String> = config
@@ -235,8 +240,12 @@ async fn build_client(config: &KafkaConfig, component: &str) -> Result<Client> {
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
-    let mut builder =
-        ClientBuilder::new(brokers).client_id(format!("{}-{}", config.client_id_prefix, component));
+    let mut builder = ClientBuilder::new(brokers)
+        .client_id(format!("{}-{}", config.client_id_prefix, component))
+        .backoff_config(rskafka::BackoffConfig {
+            max_backoff: RECONNECT_MAX_BACKOFF,
+            ..rskafka::BackoffConfig::default()
+        });
 
     if let Some(sasl) = &config.sasl {
         builder = builder.sasl_config(to_rskafka_sasl(sasl)?);
@@ -329,6 +338,9 @@ struct ProducerInner {
     max_request_bytes: usize,
     compression: Compression,
     state: Arc<ConnState>,
+    /// Metadata client and topic, for [`CaptureLogProducer::probe`]. Unset
+    /// for producers built over fake partition clients.
+    metadata: std::sync::OnceLock<(Client, String)>,
 }
 
 /// One caller's records waiting to be coalesced.
@@ -394,6 +406,7 @@ impl KafkaProducer {
             config.compression.to_rskafka(),
             config.linger_ms,
         );
+        let _ = producer.inner.metadata.set((client, config.topic.clone()));
         producer.inner.state.set(true);
         Ok(producer)
     }
@@ -409,6 +422,7 @@ impl KafkaProducer {
             max_request_bytes,
             compression,
             state: ConnState::new("kafka", "producer"),
+            metadata: std::sync::OnceLock::new(),
         });
         if linger_ms == 0 {
             return Self {
@@ -674,6 +688,24 @@ impl CaptureLogProducer for KafkaProducer {
 
     fn healthy(&self) -> bool {
         self.inner.state.is_up()
+    }
+
+    /// Ask the cluster for the topic's metadata: a round trip that reconnects
+    /// and fails while the brokers are down or the topic is gone.
+    async fn probe(&self) -> Result<()> {
+        let Some((client, topic)) = self.inner.metadata.get() else {
+            return Ok(());
+        };
+        let checked = async {
+            let topics = client.list_topics().await.context("listing topics")?;
+            if !topics.iter().any(|t| &t.name == topic) {
+                bail!("topic '{topic}' not found");
+            }
+            Ok(())
+        }
+        .await;
+        self.inner.state.set(checked.is_ok());
+        checked
     }
 }
 

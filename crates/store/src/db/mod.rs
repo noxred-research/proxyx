@@ -165,6 +165,14 @@ impl Db {
         Ok(self.pool.ping().await?)
     }
 
+    /// Close every connection of this pool and of its clones, waiting for the
+    /// ones in use to be returned. A caller that is done with the database
+    /// (a one-shot command, a test) ends its sessions here instead of leaving
+    /// the server to find them closed when the process exits.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }

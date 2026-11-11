@@ -353,6 +353,160 @@ async fn write_search_count_get() {
     h.finish().await;
 }
 
+/// Values at the edges of what the index can express, each with the rows
+/// ClickHouse returns ([`boundary_cases`]): whole-string regexes (which the
+/// `wildcard` field answers wrongly as a regexp), a status beyond the 32-bit
+/// `integer` type, and case folding beyond ASCII.
+#[tokio::test]
+async fn boundary_values_match_clickhouse() {
+    let Some(h) = Harness::start("boundary_values_match_clickhouse").await else {
+        return;
+    };
+    let mut messages = boundary_messages();
+    messages.extend(boundary_close_messages());
+    h.deliver(messages).await;
+    let store = &h.store;
+
+    // This store folds `contains` with Unicode simple case folding;
+    // ClickHouse folds ASCII only, which is a documented difference.
+    let (c, d) = (uuid_n(3), uuid_n(4));
+    let (a, b, e) = (uuid_n(1), uuid_n(2), uuid_n(5));
+    let (f, g) = (uuid_n(6), uuid_n(7));
+    let all = [a, b, c, d, e, f, g];
+    let without = |gone: Uuid| {
+        all.iter()
+            .copied()
+            .filter(|id| *id != gone)
+            .collect::<Vec<_>>()
+    };
+    let rx = |value: &str| json!({ "op": "regex_match", "value": value });
+    let mut cases = boundary_cases();
+    cases.extend([
+        (
+            "contains folds a non-ASCII letter",
+            json!({ "response_body": contains("ÜNÏ") }),
+            vec![c, d],
+        ),
+        (
+            "contains folds around ASCII and a space",
+            json!({ "response_body": contains("ünï b") }),
+            vec![c, d],
+        ),
+        (
+            "not contains a non-ASCII letter",
+            json!({ "response_body": not(contains("ünï")) }),
+            vec![a, b, e, f, g],
+        ),
+        (
+            "k matches KELVIN SIGN",
+            json!({ "response_body": contains("k") }),
+            vec![f],
+        ),
+        (
+            "K matches KELVIN SIGN",
+            json!({ "response_body": contains("K") }),
+            vec![f],
+        ),
+        (
+            "KELVIN SIGN matches k",
+            json!({ "response_body": contains("\u{212a}") }),
+            vec![f],
+        ),
+        (
+            "s matches LONG S",
+            json!({ "response_body": contains("s") }),
+            vec![g],
+        ),
+        (
+            "S matches LONG S",
+            json!({ "response_body": contains("S") }),
+            vec![g],
+        ),
+        (
+            "LONG S matches s",
+            json!({ "response_body": contains("\u{17f}") }),
+            vec![g],
+        ),
+        (
+            "not k leaves out KELVIN SIGN",
+            json!({ "response_body": not(contains("k")) }),
+            without(f),
+        ),
+        (
+            "not LONG S leaves out s",
+            json!({ "response_body": not(contains("\u{17f}")) }),
+            without(g),
+        ),
+        (
+            "(?i)k matches KELVIN SIGN",
+            json!({ "response_body": rx("(?i)^k$") }),
+            vec![f],
+        ),
+        (
+            "(?i) class matches LONG S",
+            json!({ "response_body": rx("(?i)^[r-t]$") }),
+            vec![g],
+        ),
+        (
+            "(?i)\\w matches KELVIN SIGN",
+            json!({ "response_body": rx(r"(?i)^\w$") }),
+            vec![f, g],
+        ),
+        (
+            "(?i)\\W does not",
+            json!({ "response_body": rx(r"(?i)^\W$") }),
+            vec![],
+        ),
+    ]);
+    for (name, filter, expected) in cases {
+        let query = branch(filter);
+        assert_eq!(ids(store, &query).await, expected, "{name}");
+        assert_eq!(
+            store.count_requests(&query).await.unwrap(),
+            expected.len() as u64,
+            "{name} count"
+        );
+    }
+    let mut ws_cases = boundary_ws_cases();
+    let (k, s) = (uuid_n(603), uuid_n(604));
+    let payload = |filter: Value| json!({ "payload": filter });
+    ws_cases.extend([
+        ("ws k matches KELVIN SIGN", payload(contains("k")), vec![k]),
+        ("ws KELVIN SIGN matches K", payload(contains("K")), vec![k]),
+        ("ws s matches LONG S", payload(contains("s")), vec![s]),
+        ("ws LONG S matches S", payload(contains("\u{17f}")), vec![s]),
+        (
+            "ws not k",
+            payload(not(contains("k"))),
+            vec![uuid_n(601), uuid_n(602), s],
+        ),
+        (
+            "ws not S",
+            payload(not(contains("S"))),
+            vec![uuid_n(601), uuid_n(602), k],
+        ),
+    ]);
+    for (name, filter, expected) in ws_cases {
+        let query = wq(json!({ "branches": [filter] }));
+        let found: Vec<Uuid> = store
+            .search_ws(&query)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(found, expected, "{name}");
+        assert_eq!(
+            store.count_ws(&query).await.unwrap(),
+            expected.len() as u64,
+            "{name} count"
+        );
+    }
+
+    h.finish().await;
+}
+
 #[tokio::test]
 async fn cursor_paging_in_every_order() {
     let Some(h) = Harness::start("cursor_paging_in_every_order").await else {
