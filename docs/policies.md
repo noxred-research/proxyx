@@ -238,10 +238,16 @@ a developer replaces it in the provider panel and updates the inventory. See
 | `limits.org_max_gb_per_day` | unset: no budget | Traffic one org may use per UTC day across all providers. At the limit, new tunnels get `503 org_budget`; open tunnels are not cut. `0` is spent from the start. |
 
 Warmer budget behaviour: at 80% of a day or hour limit the warmer only keeps `min_ready`, one create at a time;
-at 100% it creates nothing until the window ends. A `cost` value above its ceiling makes the whole set invalid.
+at 100% it creates nothing until the window ends. It also stops earlier when the bytes left no longer pay for
+one more create (it charges 24 KiB for the exit-IP check of each), so a ready count below `min_ready` at 70 to 99%
+of a day limit is this rule, not a fault. The gateway applies the same limits to an on-demand create: at a spent
+limit it opens no session; a request is served by an existing session that can take it, else `cache_empty`. Byte
+limits are written in decimal GB and compared as whole bytes (`0.0000077` is exactly 7,700 bytes), so a counter equal
+to its limit is spent. A `cost` value above its ceiling makes the whole set invalid.
 A `cost` value that is unset while its ceiling is below the default takes the ceiling. Fair use is per IP and shared by every org on the IP, so only `global` and `route_class` policies may set
 `cost.fair_use_gb_per_ip_month` or `limits.fair_use_gb_per_ip_month`; an `org` policy that does is refused.
-For a static IP the gateway warns at 80% of fair use and stops new leases of the IP at 100% until the month ends.
+For a static IP the gateway warns at 80% of fair use. At 100% the IP takes new leases only as a last
+resort when no unit remains within the soft limits, until the month ends; existing leases continue.
 
 ## Regions
 

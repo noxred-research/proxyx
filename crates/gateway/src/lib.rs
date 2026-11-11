@@ -79,15 +79,18 @@ pub struct GatewayCtx {
     pub tunnels: Tunnels,
 }
 
-/// The bound listeners.
-pub(crate) struct Bound {
+/// The bound listeners. A caller that must know the sockets are owned before
+/// it reports ready calls [`Bound::bind`], then hands the result to [`run_on`].
+pub struct Bound {
     connect: TcpListener,
     socks: TcpListener,
     probe: TcpListener,
 }
 
 impl Bound {
-    pub(crate) async fn bind(settings: &Settings) -> anyhow::Result<Self> {
+    /// Bind the CONNECT, SOCKS5 and probe listeners of `settings`. The error
+    /// names the first one that cannot bind and its address.
+    pub async fn bind(settings: &Settings) -> anyhow::Result<Self> {
         let bind = |name: &'static str, addr: SocketAddr| async move {
             TcpListener::bind(addr)
                 .await
@@ -100,7 +103,8 @@ impl Bound {
         })
     }
 
-    pub(crate) fn addrs(&self) -> anyhow::Result<[SocketAddr; 3]> {
+    /// The local addresses of the CONNECT, SOCKS5 and probe listeners.
+    pub fn addrs(&self) -> anyhow::Result<[SocketAddr; 3]> {
         let addr = |l: &TcpListener| l.local_addr().context("failed to read a listener address");
         Ok([addr(&self.connect)?, addr(&self.socks)?, addr(&self.probe)?])
     }
@@ -112,6 +116,17 @@ impl Bound {
 /// Fails when a listener cannot bind or `probe_org` is not an org id.
 pub async fn run(ctx: GatewayCtx, cancel: CancellationToken) -> anyhow::Result<()> {
     let bound = Bound::bind(&ctx.settings).await?;
+    run_on(ctx, bound, cancel).await
+}
+
+/// [`run`] on listeners the caller already bound with [`Bound::bind`].
+///
+/// Fails when `probe_org` is not an org id.
+pub async fn run_on(
+    ctx: GatewayCtx,
+    bound: Bound,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     run_bound(ctx, bound, cancel, Pacing::default()).await
 }
 

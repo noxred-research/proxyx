@@ -33,10 +33,16 @@ $ curl -s -x socks5h://alice-sid-job1:wonderland@127.0.0.1:3128 http://origin.te
 127.0.0.3
 ```
 
+`examples/edge.toml` is a production template, not a directly runnable demo. Replace its
+documentation-only addresses and routed IPv6 prefix, set the actual interface name, create
+`auth.users_file` with Alice's hash, replace Guest's placeholder hash, and make the access-log
+directory writable by the service account before running `--check`. Use the loopback example
+when those host prerequisites are unavailable.
+
 ## Installing on a multi-IP host
 
 1. **Put the addresses on the machine.** The proxy only connects *from* addresses the host owns; it never configures the network. Add an address with `ip addr add 192.0.2.11/24 dev eth0` (a secondary address on the interface that already has the subnet) and `ip -6 addr add 2001:db8::11/64 dev eth0` for IPv6. Make them permanent with the tool that configures the interface (netplan `addresses:`, NetworkManager, `systemd-networkd` `Address=`, `/etc/network/interfaces`). Cloud hosts usually need the address attached to the instance's network interface in the provider's console first. Check with `ip -brief addr`.
-2. **A whole IPv6 block** (a routed /64 or /48): do not add every address. Route the block to the host instead, `ip route add local 2001:db8:1234::/64 dev lo`, and name it in a pool as `prefixes = ["2001:db8:1234::/64"]`. Every connection then draws its source address from the block.
+2. **A whole IPv6 block** (a routed /64 or /48): do not add every address. Install a local route, `ip -6 route add local 2001:db8:1234::/64 dev lo`, and enable `sysctl -w net.ipv6.ip_nonlocal_bind=1` so Linux permits binding generated addresses that are not individually assigned. Make both settings persistent with the host's network configuration and sysctl configuration, then name the pool as `prefixes = ["2001:db8:1234::/64"]`. Every connection draws its source address from the block. The sysctl applies to the network namespace, not just ProxyX; use a dedicated network namespace when nonlocal binding must not affect other applications. IPv4 local routes make their source addresses bindable without changing that IPv6 setting.
 3. **Reverse path filtering and the firewall.** Replies to a secondary address return on the interface that owns it, so default `rp_filter` works; if you use `rp_filter = 1` with several interfaces, route each source address out of the interface it lives on (`ip rule add from 192.0.2.11 lookup 100`). Allow the listener ports (`3128`, `1080`) inbound and nothing else.
 4. **Install the binary and the unit.** Copy `proxyx` to `/usr/local/bin`, `deploy/systemd/proxyx-edge.sysusers.conf` to `/etc/sysusers.d/proxyx.conf` (`systemd-sysusers`), and `deploy/systemd/proxyx-edge.service` to `/etc/systemd/system/`. Put the configuration in `/etc/proxyx/edge.toml` (`chown root:proxyx`, mode `0640`, and the htpasswd file likewise): the unit runs `proxyx edge --check` before every start, reloads on `systemctl reload proxyx-edge`, and runs as the unprivileged `proxyx` user with only `CAP_NET_BIND_SERVICE` (needed only for a listener below port 1024).
 5. **Check, then start.** `proxyx edge --check --config /etc/proxyx/edge.toml` fails when a listed address is not assigned to the host or cannot be bound, when a rule names a user or pool that does not exist, when a password hash format is not supported, and on any misspelled key. `systemctl enable --now proxyx-edge`.
@@ -298,7 +304,7 @@ When every address of the destination's family is out of service the answer is `
 **Active health checks** (`[health]`, every `interval`, 10 s by default; `interval = "0"` turns them off):
 
 * **Parents**: a probe connects to each parent from its egress pool and, with `parent_target = "host:port"`, opens a tunnel to that target through it (HTTP `CONNECT` or SOCKS5 `CONNECT`, with the parent's login), so it proves the parent *and* its path out. `unhealthy_threshold` failed probes in a row (2) take the parent out of use, `healthy_threshold` good ones (1) bring it back. Pick a target you may probe every few seconds (your own service, or a public resolver port).
-* **Egress addresses**: every explicitly listed or discovered address is checked to be still assigned to a local interface and bindable, every prefix to be still routed to this host. A failed check takes the address out of the rotation at once; the next passing check puts it back. (A pool built from `interface = "eth0"` is read at start and on reload; reload after adding addresses.)
+* **Egress addresses**: every explicitly listed or discovered address is checked to be still assigned to a local interface and bindable; prefix checks sample source-address bindability. A failed check takes the address or prefix out of rotation; the next passing check puts it back. Prefix checks do not inspect the routing table or prove end-to-end reachability: with `ip_nonlocal_bind` enabled they can still pass after a local route disappears. Monitor the prefix's routes separately. (A pool built from `interface = "eth0"` is read at start and on reload; reload after adding addresses.)
 
 Per-parent `probe` and chain `probe` accept `type = "tcp"` with `target = "host:port"`,
 `type = "http"` with an `http://` or verified `https://` URL, expected `status`, optional `body_contains` and bounded
@@ -382,11 +388,11 @@ parent_max_idle = 64
 | `timeouts.response_header` | `60s` | waiting for the target's response head after the request was sent (`504`) |
 | `timeouts.idle` | `10m` | a tunnel, an upgraded connection, a UDP association or a body transfer with no byte in either direction |
 | `timeouts.keepalive` | `60s` | an HTTP client connection waiting for its next request |
-| `timeouts.total` | `0` (none) | the longest one request, tunnel or UDP association may last, whatever moves on it (a forwarded HTTP request answers `504` when it is hit) |
+| `timeouts.total` | `0` (none) | the longest one request, tunnel or UDP association may last, whatever moves on it (a forwarded HTTP request answers `504` before its final response starts; an already-started response is closed without appending another response) |
 | `health.timeout` | `5s` | one health probe |
 | `server.shutdown_grace` | `30s` | SIGTERM until the remaining connections are closed |
 
-Every timeout except `total` must be above zero (checked at start). `total` is the only way to bound a tunnel that is never idle.
+Every setting in `[timeouts]` except `total` must be above zero (checked at start). `total` is the only way to bound a tunnel that is never idle. `health.timeout` must be positive while active checks are enabled; `server.shutdown_grace = "0"` requests an immediate shutdown.
 
 ## Header policy
 
@@ -416,7 +422,7 @@ The proxy resolves names itself (once per request, for the rules and the destina
 
 ## Logs, metrics and health
 
-* **Access log**: `[access_log] output = "file" | "stdout" | "stderr" | "off"`, `format = "squid"` (the native `access.log` format, readable by squid tools), `"combined"` (Apache) or `"json"`. One line per request, written by a separate thread: a slow disk drops lines (counted in `proxyx_edge_access_log_dropped_total`) and never slows a request. SIGHUP reopens the file. The JSON line carries the client, listener, protocol, user, method, URL, status, bytes, `egress_ip`, `pool`, `target_ip`, `parent`, matched `rule` and `result`.
+* **Access log**: `[access_log] output = "/path/to/access.log"` writes a file; `"stdout"`, `"stderr"` and `"off"` select those destinations instead. There is no separate `path` key, and `"file"` would be a literal relative filename. `format = "squid"` (the native `access.log` format, readable by squid tools), `"combined"` (Apache) or `"json"`. One line per request, written by a separate thread: a slow disk drops lines (counted in `proxyx_edge_access_log_dropped_total`) and never slows a request. SIGHUP reopens the file. The JSON line carries the client, listener, protocol, user, method, URL, status, bytes, `egress_ip`, `pool`, `target_ip`, `parent`, matched `rule` and `result`.
 * **Process log**: structured JSON to stderr (journald), `log.json = false` for text, `RUST_LOG` or `log.level` for the filter. Passwords are never logged.
 * **Ops listener** (`server.ops_listen`): `/metrics` ([catalogue](metrics/edge.md)), JSON/CSV `/stats`, `/healthz`, `/readyz` (503 while stopping). Bind it to loopback or a management network.
 
@@ -425,7 +431,7 @@ The proxy resolves names itself (once per request, for the rules and the destina
 * **Reload**: `systemctl reload proxyx-edge` (SIGHUP) re-reads the file and applies users, rules, limits, pools, parents, header policy and DNS settings to new requests; open tunnels and in-flight requests keep running. A listener that is new or has a new `listen` address is bound first (a bind failure rejects the whole reload); a removed one stops accepting while its open connections go on. A file that does not parse or validate is rejected as a whole, the running configuration stays and the reason is logged (`proxyx_edge_config_reloads_total{result="failed"}`). `server.ops_listen` needs a restart. Bandwidth and rate budgets and the login cache start fresh after a reload.
 * **Alerts to start with**: `proxyx_edge_parent_breaker_state == 2`, `proxyx_edge_parent_healthy == 0`, `proxyx_edge_egress_addresses{state=~"open|unhealthy"} > 0`, a rising `rate(proxyx_edge_requests_total{result=~"connect_error|parent_error|timeout"}[5m])`, `proxyx_edge_config_reloads_total{result="failed"}`.
 * **Stop**: SIGTERM stops accepting and waits up to `server.shutdown_grace` (30 s) for open tunnels.
-* **Findings from the access log**: `result` is `ok`, `auth_required`, `denied`, `limited`, `dns_error`, `connect_error`, `timeout`, `parent_error`, `bad_request` or `internal`; the client sees `X-ProxyX-Error` with `forbidden`, `destination_denied`, `option_denied`, `auth_required`, `auth_blocked`, `rate_limited`, `too_many_connections`, `dns_error`, `connect_failed`, `connect_timeout`, `no_egress_address`, `parent_error`, `no_parent` or `bad_request`. SOCKS clients get the nearest reply code (2 not allowed, 4 host unreachable, 5 refused, 6 TTL expired for a timeout, 1 general).
+* **Findings from the access log**: `result` is `ok`, `auth_required`, `denied`, `limited`, `dns_error`, `connect_error`, `timeout`, `parent_error`, `bad_request` or `internal`; the client sees `X-ProxyX-Error` with `forbidden`, `destination_denied`, `option_denied`, `auth_required`, `auth_blocked`, `rate_limited`, `too_many_connections`, `dns_error`, `connect_failed`, `connect_timeout`, `no_egress_address`, `egress_unavailable`, `parent_error`, `no_parent`, `bad_request`, `bad_gateway`, `timeout` or `internal`. SOCKS clients get the nearest reply code (2 not allowed, 4 host unreachable, 5 refused, 6 TTL expired for a timeout, 1 general).
 
 ## Protocol behavior to know
 
@@ -458,7 +464,7 @@ The pool gateway can lease the machine's own addresses as static inventory with 
 | Symptom | Check |
 |---|---|
 | `--check` says `not assigned to any local interface` | the address is not on the host: `ip -brief addr`, `ip addr add` |
-| `cannot bind ... route the prefix to this host` | `ip route add local <prefix> dev lo` for a `prefixes` pool |
+| `cannot bind ... route the prefix to this host` | install the local route (`ip -6 route add local <IPv6-prefix> dev lo`); generated IPv6 sources also need `net.ipv6.ip_nonlocal_bind=1`. For IPv4 prefixes, use `ip route add local <prefix> dev lo`. |
 | `403 destination_denied` for a host you own | the target is private: add a rule with `allow_internal = true` for just that destination |
 | `407` forever from a script | the client sends the password only after a `407` (curl does; some libraries need `-U` or preemptive auth); `proxyx_edge_auth_failures_total{reason="invalid"}` |
 | `429 auth_blocked` | 20 wrong logins from the source in a minute; wait or raise `auth.fail_limit` |

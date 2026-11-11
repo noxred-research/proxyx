@@ -227,3 +227,50 @@ async def test_rotated_token_is_picked_up(tmp_path: Path) -> None:
     await client.get_targets()
 
     assert tokens == ["Bearer secret-token", "Bearer rotated"]
+
+
+@pytest.mark.parametrize("contents", [None, b" \n", b"\xff"])
+async def test_unavailable_secret_is_a_bounded_api_error(
+    tmp_path: Path, contents: bytes | None
+) -> None:
+    seen: list[httpx.Request] = []
+    client = client_for(
+        tmp_path, lambda request: seen.append(request) or httpx.Response(200, json={})
+    )
+    token = tmp_path / "token"
+    if contents is None:
+        token.unlink()
+    else:
+        token.write_bytes(contents)
+
+    try:
+        with pytest.raises(ApiError, match="token file unavailable"):
+            await client.get_targets()
+        assert seen == []
+    finally:
+        await client.aclose()
+
+
+async def test_secret_restored_between_attempts_is_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+    pauses: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["authorization"])
+        return httpx.Response(200, json={})
+
+    async def restore(delay: float) -> None:
+        pauses.append(delay)
+        (tmp_path / "token").write_text("restored\n")
+
+    client = client_for(tmp_path, handler)
+    (tmp_path / "token").unlink()
+    monkeypatch.setattr("proxyx_prober.client.asyncio.sleep", restore)
+    try:
+        await client.get_targets()
+        assert len(pauses) == 1
+        assert seen == ["Bearer restored"]
+    finally:
+        await client.aclose()

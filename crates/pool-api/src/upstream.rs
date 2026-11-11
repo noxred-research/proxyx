@@ -290,6 +290,7 @@ pub(crate) async fn set(
         withdraw(&state, old).await?;
     }
     let mut out = unit_json(&set.row, login.is_some());
+    out["set_by"] = json!(actor);
     add_policy_warning(&mut out, &loaded, &org, &set.row.entry.provider);
     Ok(Json(out))
 }

@@ -26,7 +26,7 @@ The rules select on the job name, so use these names (or edit the rules). Every 
 | Limiter | `proxyx-limiter` | none | `/metrics` | Only when `PROXYX_LIMITER_METRICS_ADDR` is set, for example `127.0.0.1:39092`. |
 | Edge proxy | `proxyx-edge` | none | `/metrics` | Only when `server.ops_listen` is set. |
 
-Health and readiness endpoints are in [operations](operations.md#health-and-readiness). Prometheus only reads `/metrics`; use `/readyz` for load balancer checks.
+Health and readiness endpoints are in [operations](operations.md#health-and-readiness). Prometheus only reads `/metrics`. Use `/readyz` for the pool and edge load balancers, `/health/ready` for the session proxy and control API, and `/health` for the ingester.
 
 ## Loading the files
 
@@ -57,7 +57,7 @@ Every role has a down alert based on `up`. The session proxy also exports its re
 | `ProxyXWarmerDown` | critical | `up` is 0 for a warmer for 2 minutes. | [003](runbooks/003-cache-below-low-watermark.md) |
 | `ProxyXInterceptDown` | critical | `up` is 0 for a session proxy for 2 minutes. | Check the process and its admin listener (`GET :8888/health`). A listener that failed to bind leaves the process running, so also read its log. |
 | `ProxyXControlAPIDown` | critical | `up` is 0 for the control API for 2 minutes. | Check the process, then `GET :9000/health/ready`: Postgres and Redis must answer. |
-| `ProxyXIngesterDown` | critical | `up` is 0 for an ingester for 2 minutes. | Check the process and `GET :9001/health`, which is 503 once the consumer task has exited. Captures wait in the broker until it runs again. |
+| `ProxyXIngesterDown` | critical | `up` is 0 for an ingester for 2 minutes. | Check the process and `GET :9001/health`, which is 503 during a broker outage or an open capture-store circuit. An unexpected consumer or health-server exit terminates the command; restart it after fixing the failure. Captures wait in the broker. |
 | `ProxyXLimiterDown` | critical | `up` is 0 for the limiter for 2 minutes. | Restart it and check `PROXYX_LIMITER_METRICS_ADDR` if it is up but not scraped. Session proxies deny or fail open by their fail-open policy; a restarted limiter starts with full buckets. |
 | `ProxyXEdgeDown` | critical | `up` is 0 for an edge proxy for 2 minutes. | Check the process and that `server.ops_listen` is set; without it nothing is served. |
 | `ProxyXProberScrapeDown` | warning | `up` is 0 for the prober for 15 minutes. | [012](runbooks/012-prober-not-reporting.md) |

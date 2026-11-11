@@ -103,7 +103,11 @@ class ProxyXClient:
         for attempt in range(1, self._attempts + 1):
             if attempt > 1:
                 await asyncio.sleep(_JITTER.uniform(0, self._backoff_s * 2**attempt))
-            token = read_secret_file(self._token_file)
+            try:
+                token = read_secret_file(self._token_file)
+            except (OSError, ValueError) as exc:
+                last = f"token file unavailable ({type(exc).__name__})"
+                continue
             try:
                 response = await self._http.request(
                     method,

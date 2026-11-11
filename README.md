@@ -105,7 +105,7 @@ cargo build --release          # target/release/proxyx and target/release/proxyx
 
 You need the pinned Rust toolchain (see [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` installs it), CMake, a C/C++ compiler and Clang (BoringSSL and librdkafka build from source), and `perl`. The protobuf compiler is vendored.
 
-Start PostgreSQL, a Redis-compatible server and (for the session flow) ClickHouse, then use the files in [`examples/`](examples/) as a starting point. A pool gateway needs two databases' worth of schema, so give the pool and the control plane separate databases (PostgreSQL by default; see [docs/databases.md](docs/databases.md) for MariaDB and SQLite):
+Start PostgreSQL, a Redis-compatible server and (for the session flow) ClickHouse, then use the files in [`examples/`](examples/) as a starting point. When running both planes, give the pool and the control plane separate databases (PostgreSQL by default; see [docs/databases.md](docs/databases.md) for MariaDB and SQLite):
 
 ```
 export PROXYX_POOL_DATABASE_URL=postgres://proxyx:proxyx@localhost:5432/proxyx_pool
@@ -179,15 +179,15 @@ One `proxyx` binary runs one role per process, and `proxyx-intercept` runs the s
 
 | Command | Role | Listens on | Needs |
 |---|---|---|---|
-| `proxyx gateway` | Pool gateway: CONNECT and SOCKS5 ingress, leasing, `/v1` control API | 8080, 1080, 8082 (probe), 8081 (API), 8888 (ops) | Postgres, Redis |
-| `proxyx warmer` | Pool maintenance: warming, keepalive, quality checks, sweeper | 8888 (ops) | Postgres, Redis |
-| `proxyx migrate pool` | Apply (or `--check`) the pool schema | none | Postgres |
+| `proxyx gateway` | Pool gateway: CONNECT and SOCKS5 ingress, leasing, `/v1` control API | 8080, 1080, 8082 (probe), 8081 (API), 8888 (ops) | PostgreSQL, MariaDB or SQLite; Redis |
+| `proxyx warmer` | Pool maintenance: warming, keepalive, quality checks, sweeper | 8888 (ops) | PostgreSQL, MariaDB or SQLite; Redis |
+| `proxyx migrate pool` | Apply (or `--check`) the pool schema | none | PostgreSQL, MariaDB or SQLite |
 | `proxyx-intercept` | Session proxy: routing, TLS interception, capture | 8443 (CONNECT), 1080 (SOCKS5), 8888 (admin) | Redis; optionally the limiter |
-| `proxyx control api` | Sessions, orgs, query, export and GraphQL API | 9000 | Postgres, Redis, ClickHouse or OpenSearch |
-| `proxyx control ingester` | Consume captures, write the capture store, close sessions | 9001 (health) | Postgres, ClickHouse or OpenSearch, the broker |
-| `proxyx control keys create\|list\|disable` | Manage API keys (`pxk_...`) | none | Postgres |
+| `proxyx control api` | Sessions, orgs, query, export and GraphQL API | 9000 | PostgreSQL, MariaDB or SQLite; Redis; ClickHouse or OpenSearch/Elasticsearch |
+| `proxyx control ingester` | Consume captures, write the capture store, close sessions | 9001 (health) | PostgreSQL, MariaDB or SQLite; ClickHouse or OpenSearch/Elasticsearch; the broker |
+| `proxyx control keys create\|list\|disable` | Manage API keys (`pxk_...`) | none | PostgreSQL, MariaDB or SQLite |
 | `proxyx control schema export\|validate\|manifest` | GraphQL schema tooling | none | none |
-| `proxyx migrate control` | Apply (or `--check`) the Postgres and capture-store schemas | none | Postgres, ClickHouse or OpenSearch |
+| `proxyx migrate control` | Apply (or `--check`) relational, capture-store and broker schemas | none | Selected SQL database, capture store and broker, according to `--target` |
 | `proxyx edge --config FILE [--check]` | Self-hosted multi-IP forward proxy: HTTP, CONNECT, SOCKS4/5, rules, limits, parents | your listeners, ops listener | one TOML file, no database |
 | `proxyx limiter [ADDR]` | In-memory rate-limit service | 39091 | none |
 
@@ -195,7 +195,7 @@ One `proxyx` binary runs one role per process, and `proxyx-intercept` runs the s
 
 ## Configuration
 
-Every component reads a TOML file and `PROXYX_<COMPONENT>_*` environment variables (`PROXYX_POOL_*`, `PROXYX_INTERCEPT_*`, `PROXYX_CONTROL_*`, `PROXYX_LIMITER_*`), with `--config FILE` overriding both. [`docs/configuration.md`](docs/configuration.md) lists every key with its default and environment variable, and [`examples/`](examples/) has minimal working files. Provider adapters, policies and the static inventory are versioned TOML data under `data_dir`: see [providers](docs/providers.md) and [policies](docs/policies.md).
+The pool, session proxy and control plane read TOML and their `PROXYX_POOL_*`, `PROXYX_INTERCEPT_*` or `PROXYX_CONTROL_*` environment variables; an explicit `--config FILE` takes precedence. The edge reads its required TOML file only. The limiter reads `PROXYX_LIMITER_*` environment variables and an optional listen address; it has no configuration file. [`docs/configuration.md`](docs/configuration.md) lists every key with its default and environment variable, and [`examples/`](examples/) has minimal working files. Provider adapters, policies and the static inventory are versioned TOML data under `data_dir`: see [providers](docs/providers.md) and [policies](docs/policies.md).
 
 ## Use with crawlx
 

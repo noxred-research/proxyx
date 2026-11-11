@@ -68,7 +68,9 @@ macro_rules! org_settings_upsert {
     };
 }
 /// Create a view job, or reclaim a failed one. `?` order: view id, org id, query id.
-/// The status of the old row is read before any column is assigned.
+/// The status of the old row is read before any column is assigned. The
+/// query id of a pending, running or completed job is kept; a failed job (or
+/// a legacy row without one) takes the new attempt's id.
 macro_rules! view_job_upsert {
     () => {
         "INSERT INTO traffic_view_jobs (view_id, org_id, query_id) VALUES (?, ?, ?)
@@ -79,7 +81,10 @@ macro_rules! view_job_upsert {
                                    THEN NULL ELSE traffic_view_jobs.error END,
                  s3_key     = CASE WHEN traffic_view_jobs.status = 'failed'
                                    THEN NULL ELSE traffic_view_jobs.s3_key END,
-                 query_id   = EXCLUDED.query_id,
+                 query_id   = CASE WHEN traffic_view_jobs.status = 'failed'
+                                        OR traffic_view_jobs.query_id IS NULL
+                                        OR traffic_view_jobs.query_id = ''
+                                   THEN EXCLUDED.query_id ELSE traffic_view_jobs.query_id END,
                  updated_at = now()"
     };
 }

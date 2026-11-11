@@ -135,16 +135,15 @@ cargo bench -p proxyx-bench                                       # pool_micro a
 cargo bench -p proxyx-bench --features intercept-bench --bench intercept_micro
 cargo bench -p proxyx-bench --features control-bench   --bench control_micro
 cargo bench -p proxyx-bench --bench pool_micro -- --quick         # a few seconds per bench
-cargo bench -p proxyx-bench -- --test                             # run every bench once, no timing
+cargo bench -p proxyx-bench -- --test                             # default benches once, no timing
 ```
 
-`intercept-bench` and `control-bench` must never be enabled together (BoringSSL and OpenSSL in one binary);
-the benches have `required-features`, so a plain `cargo bench -p proxyx-bench` runs only the first two files.
+Run `intercept-bench` and `control-bench` separately to keep their BoringSSL and OpenSSL measurement paths isolated. Each benchmark has `required-features`, so a plain `cargo bench -p proxyx-bench` runs only the first two files. Enabling both features built all four executables in the local check; that build-only result is not proof that combining both TLS stacks in one executable is safe.
 
 Load tool, with the services this repository's tests use (Postgres on 45400, Valkey on 45401):
 
 ```sh
-B=$CARGO_TARGET_DIR/release
+B=${CARGO_TARGET_DIR:-target}/release
 
 # pool gateway: spawn it with a generated configuration, sweep the concurrency
 $B/proxyx-bench gateway --mode tunnel  --spawn $B/proxyx --concurrency 1,8,32,128,512 --duration 5s --warmup 2s
@@ -282,12 +281,12 @@ Common flags:
   `px-kind-static-cc-fr`) and the generated key.
 - Session proxy (`--spawn` a `proxyx-intercept` binary; flags `--redis-url`, `--redis-prefix`). It generates
   two certificate authorities, one for the TLS stub origin and one for the proxy to sign with
-  (`ca.der` and `ca.key.der` in the work directory, loaded by the proxy's `file` CA mode), writes a proxy
+  (`ca.der` and `ca.key.der` in the work directory, loaded by the proxy's `file` CA mode; the private key is written with mode `0600`), writes a proxy
   configuration with the rate limit raised far above any load, starts the proxy, waits for `/health`,
   writes a session into Redis under `<prefix>:session:<id>:data` the way the control plane does
   ([session-proxy.md](session-proxy.md)), and sends one request to prove the path works. In `passthrough` the
   session captures no host and the client trusts the origin's CA; in `mitm` it captures `localhost` and the
-  client trusts the proxy's CA. The session and the capture stream are removed afterwards.
+  client trusts the proxy's CA. The generated benchmark session sets `insecure_upstream_tls = true` in MITM mode because the local stub origin uses a fresh private CA; it does not change the proxy's global verification setting. These runs do not measure upstream certificate verification. The session and the capture stream are removed afterwards.
 
 **Attach mode** (`--pid`) leaves setup to you: the tool samples the process and sends the load, and starts
 only the stubs it needs itself. For the gateway you give `--proxy`, `--password` (the org key) and
@@ -547,6 +546,10 @@ with operations per second and p99 latency.
 proxyx limiter 127.0.0.1:39091 &
 limiter-bench 127.0.0.1:39091 1000000 32 32 all 1      # addr, ops, clients, batch, workloads, pipeline depth
 ```
+
+The `all` selection runs uniform, Zipf-skewed and concurrent workloads. Run the rate-limited workload separately with `openloop_rate_limited`, for example `limiter-bench 127.0.0.1:39091 100000 4 32 openloop_rate_limited 1`.
+
+The arguments are positional and every one is optional: `ADDR` (default `127.0.0.1:39091`), `OPS` (consumes per workload, default 1000000), `CLIENTS` (connections, one thread each, 1 to 4096, default 32), `BATCH` (consumes per frame, 1 to 4096, default 32), `WORKLOAD` (`all`, `uniform`, `zipfian`, `concurrent` or `openloop_rate_limited`, default `all`) and `PIPELINE_DEPTH` (frames in flight per connection, 1 to 1024, default 1). `OPS` must be at least `CLIENTS`, because each client runs `OPS / CLIENTS` consumes. `--help` prints this usage. A value that is not an integer in range, an unknown workload or an extra argument is a usage error (exit status 2, nothing is run); a limiter that cannot be reached is exit status 1.
 
 It measures the service under sustained multi-client load. The `limiter_loopback` group above measures one
 operation's cost from a single caller. The two answer different questions and neither replaces the other.

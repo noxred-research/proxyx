@@ -65,6 +65,8 @@ Defaults are the values the code used before they became configurable; see [conf
 
 Known gap: TCP keepalive cannot be set on Redis sockets with the pinned client library; Redis calls are bounded by timeouts instead.
 
+Limiter clients do not replay a failed exchange. If the server consumed tokens but the response was lost, even EOF before the first response byte cannot prove that the consume did not happen. The client reports the configured fail policy with `degraded = true`; a later operation uses a fresh connection. Pooled connections expire after 30 seconds of idleness by default, before the service's default 60-second idle timeout. Keep the client's `max_idle` below a shorter server idle timeout.
+
 ## Migrations
 
 Schemas are **forward-only**. Migrations are embedded in the binary; a release never edits a migration it has shipped and only adds new ones. There is no automatic down-migration, so a rollback of the binary runs against the newer schema. To make that safe, each release keeps schema changes backward compatible with the previous release (add before you use, remove one release later).
@@ -133,9 +135,19 @@ A gateway that restarts with a different `data_dir` tree than the one stored doe
 ## Backups and retention
 
 - **The relational database** (PostgreSQL, MariaDB or SQLite) holds everything that is hard to rebuild: org keys (hashes), policies, inventory, customer upstream logins, audit rows, API keys, session lifecycle and export jobs. Back it up and test restores.
-- **Redis** (pool) needs no backup. **Redis** (sessions and stream) needs persistence only to the extent you cannot lose captures between the proxy and the ingester.
+- **Redis** (pool) needs no backup: when it comes back empty, a warmer notices the missing seed marker and rebuilds the ready sets from the database (log line `redis was empty, rebuilt it from postgres`). Leases and sticky sessions that lived only in Redis are gone, so clients reconnect. **Redis** (sessions and stream) holds the live session records as well as the capture stream. Enable AOF persistence on it: after a crash of a Redis without persistence the session proxy answers `407` for sessions that were live, and the captures not yet ingested are lost. A session already in a proxy's local cache keeps working through a short outage; one that is not cached is refused until Redis is back.
 - **ClickHouse** holds captures. The default table retention is twelve months; change it with a new ClickHouse migration, and apply your own data-protection rules to bodies and headers.
 - **Exports** (Parquet in object storage) expire `traffic_views_ttl_secs` after completion (default 24 hours); the control API's reaper deletes the object and the job row.
+
+Restoring the pool database from a PostgreSQL dump:
+
+```sh
+pg_dump -Fc -f pool.dump proxyx_pool                   # the roles keep running
+createdb proxyx_pool_restored && pg_restore --no-owner -d proxyx_pool_restored pool.dump
+proxyx migrate pool --check                            # with database_url pointing at the restored database: nothing pending
+```
+
+Stop the gateways and warmers, empty the pool Redis (`FLUSHDB` on its database; never copy hot-state keys back from before the restore), point `database_url` at the restored database and start the roles. The warmer rebuilds Redis from the database, and keys, policies and inventory are the ones of the backup: an org key or inventory change made after the backup is not in the restored database, and its holder is refused (`407`) until you create it again. For SQLite, `sqlite3 FILE ".backup COPY"` takes the same consistent copy while the roles run.
 
 ## Secrets and rotation
 
@@ -158,3 +170,44 @@ Never put secrets into configuration files that you commit; use `secrets_dir` fi
 - Run in `auth_mode = "keys"` unless an authenticating gateway fronts the control API, and then set `env` to anything but `dev` and fill `internal_allowed_cidrs`.
 - Use the `file` or `env` CA mode with one CA shared between the session proxy and the control plane; keep the CA key readable by the session proxy only.
 - Run the containers as the non-root user the image defines and drop capabilities.
+
+## Docker Compose profiles
+
+[`docker/docker-compose.yml`](../docker/docker-compose.yml) starts PostgreSQL, Valkey, ClickHouse and every role. Profiles swap one dependency each, and they combine: the relational database (`mariadb` or `sqlite`, with its env file), the capture store (`opensearch`) and the captures-log broker (`kafka` or `rabbitmq`) are independent choices.
+
+| Choice | Command |
+|---|---|
+| MariaDB | `docker compose --env-file docker/db-mariadb.env -f docker/docker-compose.yml --profile mariadb up -d --build --wait` |
+| SQLite | `docker compose --env-file docker/db-sqlite.env -f docker/docker-compose.yml --profile sqlite up -d --build --wait` |
+| OpenSearch captures | `PROXYX_CAPTURE_STORE=opensearch docker compose -f docker/docker-compose.yml --profile opensearch up -d --build --wait` |
+| Kafka broker | `PROXYX_BROKER=kafka docker compose -f docker/docker-compose.yml --profile kafka up -d --build --wait` |
+| RabbitMQ broker | `PROXYX_BROKER=rabbitmq docker compose -f docker/docker-compose.yml --profile rabbitmq up -d --build --wait` |
+
+Combine them by repeating `--profile` and setting both variables, for example `--env-file docker/db-mariadb.env --profile mariadb --profile opensearch --profile kafka` with `PROXYX_CAPTURE_STORE=opensearch PROXYX_BROKER=kafka`. Selecting a profile without its variable starts the server but leaves the roles on the default (ClickHouse, Redis Streams), and the reverse (a variable without its profile) leaves the roles pointing at a host that does not exist. The session proxy and the control plane read the same `PROXYX_BROKER`, so they cannot disagree.
+
+Every datastore keeps its data in a named volume. `docker compose down` keeps the volumes: keys, sessions' captured rows, the dev CA and the secrets survive, and `init` and the migrations rerun as no-ops. `docker compose down -v` removes them. Valkey has no volume, so the session state and rate-limit buckets it held are gone after `down`; the warmer rebuilds the pool's ready sets from the database. After a datastore restart the roles reconnect on their own, and the ingester's `/health` answers `503 broker connection down` until its Kafka or RabbitMQ consumer has rejoined (seconds to a minute).
+
+The host disk matters for OpenSearch: above 95 % use it marks every index read-only and the ingester's bulk writes fail with HTTP 429. Free space, or set `cluster.routing.allocation.disk.threshold_enabled=false` on the throwaway node.
+
+Every host port is bound to `127.0.0.1`. The compose file has no port variables; to move a port, add an override file with `ports: !override ["127.0.0.1:NEW:CONTAINER"]` for that service and pass it with a second `-f`.
+
+## VPN egress sidecar
+
+[`docker/Dockerfile.egress`](../docker/Dockerfile.egress) builds a container that brings up one VPN tunnel (WireGuard, OpenVPN or Tailscale) and serves a SOCKS5 proxy (`microsocks`) that leaves through it. Point a static inventory entry of the `vpn-pool` adapter at the sidecar ([providers](providers.md#local-egress-sidecars-vpn-pool)). Run it with `--cap-add NET_ADMIN --device /dev/net/tun` and no published port beyond the networks that need it: the SOCKS port listens on `0.0.0.0` inside the container.
+
+| Variable | Meaning |
+|---|---|
+| `VPN_TYPE` | `wireguard`, `openvpn` or `tailscale`. Required. |
+| `VPN_CONFIG` | Path of the WireGuard or OpenVPN config inside the container. WireGuard names the interface after the file (`wg0.conf` gives `wg0`). |
+| `TAILSCALE_AUTH_KEY`, `TAILSCALE_ARGS` | Pre-auth key, and extra `tailscale up` flags such as `--login-server=URL` (Headscale) or `--exit-node=IP`. `tailscale up` is bounded to 60 seconds. |
+| `SOCKS_PORT`, `SOCKS_USER`, `SOCKS_PASS` | SOCKS5 port (1080) and optional login. Set both of the login variables or neither; the container refuses to start with one. |
+| `HEALTH_HOST` | Address pinged through the tunnel before the proxy starts (default `1.1.1.1`). Choose an address that only answers inside the VPN, such as the tunnel's own gateway, so a leaked route cannot pass the check. |
+
+Behavior to rely on:
+
+- The proxy starts only after the ping through the tunnel succeeds. A bad config, an unreachable VPN server or control plane, or a rejected key makes the container exit non-zero with the reason on stderr; no SOCKS port is opened.
+- The container supervises the tunnel. If the OpenVPN or `tailscaled` process dies, the WireGuard interface disappears or `microsocks` exits, the container exits (code 1) instead of serving over its direct route. Run it with `restart: unless-stopped` so a new tunnel comes up.
+- `docker stop` runs the shutdown trap: it stops `microsocks`, takes the tunnel down and exits (143) within a few seconds.
+- A WireGuard config that routes everything (`AllowedIPs = 0.0.0.0/0`) makes `wg-quick` set `net.ipv4.conf.all.src_valid_mark`, which a container can only get at start: add `--sysctl net.ipv4.conf.all.src_valid_mark=1` (Compose `sysctls`).
+- Tailscale runs with a kernel TUN device, so the SOCKS proxy reaches tailnet addresses and an exit node. Joining needs a reachable control plane and a valid auth key, and `--login-server` selects a self-hosted Headscale.
+- The SOCKS login and the keys reach the container as environment variables or mounted files, which `docker inspect` shows to anyone with Docker access. Mount the config read-only with mode `0600` and use a key that is reusable only if you need it to be.

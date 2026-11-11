@@ -162,6 +162,26 @@ mod routing_tests {
     }
 
     #[tokio::test]
+    async fn socks_invalid_session_username_gets_auth_failure_reply() {
+        let (ctx, _captures, ca_dir) = test_context(Vec::new()).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let handler = tokio::spawn(socks::handle_socks5(stream, peer, ctx));
+        client.write_all(b"\x05\x01\x02").await.unwrap();
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0x02]);
+        client.write_all(b"\x01\x03bad\x01x").await.unwrap();
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x01, 0x01]);
+        assert!(handler.await.unwrap().is_err());
+        let _ = std::fs::remove_dir_all(ca_dir);
+    }
+
+    #[tokio::test]
     async fn routing_preserves_explicit_upstream_tls_policy() {
         for insecure_upstream_tls in [false, true] {
             let session_id = Uuid::new_v4();

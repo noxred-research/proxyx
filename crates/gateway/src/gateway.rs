@@ -16,7 +16,7 @@ use common::Secret;
 use common::config::{DRAIN_CAP, Settings};
 use common::metrics::Metrics;
 use common::retry::BreakerConfig;
-use common::session::BYTES_PER_GB;
+use common::session::gb_to_bytes;
 use common::types::{OrgId, Rotation, StickyScope, Target};
 use dial::ProxyStream;
 use moka::future::Cache;
@@ -551,8 +551,7 @@ impl Gateway {
 
 /// True when `used` bytes reach `max_gb` gigabytes. A budget of zero is spent.
 pub(crate) fn budget_spent(used: u64, max_gb: f64) -> bool {
-    // Byte counts stay far below 2^52, so the conversion is exact.
-    used as f64 >= max_gb * BYTES_PER_GB
+    used >= gb_to_bytes(max_gb)
 }
 
 /// The lease key and the failed-lease memo key of a request.
@@ -725,5 +724,13 @@ mod tests {
         assert!(budget_spent(1_000_000_000, 1.0));
         assert!(budget_spent(0, 0.0));
         assert!(!budget_spent(0, 0.000_001));
+    }
+
+    #[test]
+    fn a_fractional_gb_budget_is_spent_at_exactly_its_byte_count() {
+        // 0.0000077 GB * 1e9 is 7700.000000000001 in f64: the limit is 7700 bytes.
+        assert!(!budget_spent(7_699, 0.000_007_7));
+        assert!(budget_spent(7_700, 0.000_007_7));
+        assert!(budget_spent(7_701, 0.000_007_7));
     }
 }

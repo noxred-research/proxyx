@@ -126,7 +126,7 @@ The file is TOML; [`examples/mcp.toml`](../examples/mcp.toml) lists every key wi
 | `[audit]` | `path` |
 | `[metrics]` | `sample_interval_secs`, `history` |
 | `[credentials.NAME]` | `username`, `password_file`: a login a tool can use by name |
-| `[llm]` | `endpoint`, `model`, `api_key_file`, `timeout_secs`, `max_input_chars`, `max_output_tokens` |
+| `[llm]` | `endpoint`, `model`, `api_key_file`, `ca_file`, `timeout_secs`, `max_input_chars`, `max_output_tokens` |
 
 URLs must not carry credentials. A tool is listed only when its backend is configured: without `endpoints.pool` the inventory, policy and block tools do not exist; without `endpoints.roles` the monitoring tools do not.
 
@@ -297,9 +297,13 @@ One JSON object per line, appended to `audit.path` (default `state_dir/audit.jso
 
 `phase` is `intent` (written before a mutation touches a backend) or `result`. `outcome` is `ok`, `error`, `refused`, `dry_run` or `pending_approval`. Arguments are redacted before they are written. Each entry carries the hash of the previous one, so removing or editing a line breaks the chain; `proxyx mcp audit --verify` finds the first broken line. For stronger guarantees set the append-only attribute (`chattr +a`) or ship the file to a write-once store. The log records what the MCP server did, not what other credentials did: the gateway's own audit trail names this server through `X-Operator`.
 
+Independent MCP processes may share the audit path. Each append holds an operating-system file lock while it reads the current chain tail and writes the next entry, so stdio clients, an HTTP server and operator commands do not fork the hash chain.
+
 ## LLM-assisted tools
 
 Without `[llm]` the tools that can work without a model do (rules and statistics) and `suggest_policy` is not listed. With it, the server calls any OpenAI-compatible `chat/completions` endpoint (OpenAI, an Anthropic-compatible gateway, Ollama, vLLM): temperature 0, `response_format` `json_schema` (falling back to `json_object` for servers that refuse it), a timeout, a response size cap, no redirects, the key only in the bearer header, nothing logged. Every answer is validated against a strict schema before it is used; one that does not match is an `llm_error`, not a guess. Captured content is wrapped in `<untrusted_data>` tags and the system prompt tells the model to treat it as data. See [ai.md](ai.md#llm-assisted-operations).
+
+**Private CA and transport limits.** For a vLLM, Ollama or gateway behind a reverse proxy with a private CA, set `llm.ca_file` to a PEM file holding the CA certificate (one or several certificates); the certificates are trusted in addition to the public roots, and `llm.ca_file` is the supported way to trust a private CA. The server checks the certificate chain and the host name, so a certificate issued for another name is refused. A failed handshake is reported as a TLS failure (`the LLM endpoint is unreachable: TLS handshake failed ...`), not as a connection failure. `llm.timeout_secs` bounds the whole call including a response that arrives slowly (`timed out`), the connect has its own 5 second limit, and a response above 2 MiB, with or without a `Content-Length`, is refused as too large. A redirect is never followed, so neither the bearer key nor the prompt reaches another origin: a `3xx` answer is an `llm_error` carrying the status.
 
 ## Protocol details
 

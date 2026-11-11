@@ -1,4 +1,6 @@
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
@@ -125,7 +127,7 @@ class FakePlaywright:
 
 
 def driver_for(browser: FakeBrowser) -> PlaywrightDriver:
-    return PlaywrightDriver(browser)  # type: ignore[arg-type]
+    return PlaywrightDriver(browser, LOGIN)  # type: ignore[arg-type]
 
 
 def install(
@@ -159,7 +161,12 @@ async def test_body_is_cut_to_the_inspected_prefix() -> None:
     assert len(load.body) == BODY_LIMIT
 
 
-async def test_navigation_timeout_is_a_load_timeout() -> None:
+async def test_navigation_timeout_is_a_load_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        driver_module, "_proxy_credentials_rejected", AsyncMock(return_value=False)
+    )
     browser = FakeBrowser(FakePage(goto_error=PlaywrightTimeoutError("Timeout 5000ms")))
 
     with pytest.raises(LoadTimeout, match="within 5s"):
@@ -247,3 +254,96 @@ async def test_close_failure_after_the_loads_does_not_discard_them(
 
     assert load.status == 200
     assert browser.close_calls == 1
+
+
+def proxy_connection(monkeypatch: pytest.MonkeyPatch, head: bytes | Exception):
+    reader = SimpleNamespace(
+        readuntil=(
+            AsyncMock(side_effect=head)
+            if isinstance(head, Exception)
+            else AsyncMock(return_value=head)
+        )
+    )
+    writer = SimpleNamespace(
+        write=Mock(),
+        drain=AsyncMock(),
+        close=Mock(),
+        transport=SimpleNamespace(abort=Mock()),
+    )
+    connector = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(driver_module.asyncio, "open_connection", connector)
+    return reader, writer, connector
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n",
+        b"HTTP/1.1 200 Connection established\r\n\r\n",
+        b"HTTP/1.1 502 Bad Gateway\r\n\r\n",
+        b"invalid 407\r\n\r\n",
+        OSError("connection failed"),
+        asyncio.IncompleteReadError(b"HTTP/1.1 407", None),
+        asyncio.LimitOverrunError("head too large", 4097),
+        b"HTTP/1.1 407 Rejected\r\nX-Large: " + b"x" * 4096 + b"\r\n\r\n",
+    ],
+)
+async def test_only_explicit_proxy_407_reclassifies_a_navigation_timeout(
+    monkeypatch: pytest.MonkeyPatch, head: bytes | Exception
+) -> None:
+    _, writer, connector = proxy_connection(monkeypatch, head)
+    browser = FakeBrowser(FakePage(goto_error=PlaywrightTimeoutError("Timeout")))
+    rejected = (
+        isinstance(head, bytes)
+        and head.startswith(b"HTTP/1.1 407")
+        and len(head) <= 4096
+    )
+
+    with pytest.raises(ProxyCredentialsRejected if rejected else LoadTimeout):
+        await driver_for(browser).load(URL, 5)
+
+    assert connector.call_args.kwargs == {"ssl": False, "limit": 4096}
+    request = writer.write.call_args.args[0]
+    assert request.startswith(b"CONNECT example.test:443 HTTP/1.1\r\n")
+    writer.close.assert_called_once()
+    writer.transport.abort.assert_called_once()
+    assert browser.contexts_closed == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_proxy_diagnostic_deadline_and_cancellation_close_the_socket(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    reader, writer, _ = proxy_connection(monkeypatch, b"")
+    waiting = asyncio.Event()
+
+    async def stalled(_: bytes) -> bytes:
+        waiting.set()
+        await asyncio.sleep(60)
+        return b""
+
+    reader.readuntil = stalled
+    monkeypatch.setattr(driver_module, "_PROXY_DIAGNOSTIC_TIMEOUT_S", 0.01)
+    task = asyncio.create_task(driver_module._proxy_credentials_rejected(LOGIN, URL))
+    await waiting.wait()
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        assert await task is False
+    writer.close.assert_called_once()
+    writer.transport.abort.assert_called_once()
+
+
+async def test_proxy_diagnostic_preserves_tls_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, connector = proxy_connection(
+        monkeypatch, b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"
+    )
+    login = ProxyLogin("https://proxy.test:8443", LOGIN.username, LOGIN.password)
+
+    assert await driver_module._proxy_credentials_rejected(login, URL)
+    assert connector.call_args.args == ("proxy.test", 8443)
+    assert connector.call_args.kwargs == {"ssl": True, "limit": 4096}

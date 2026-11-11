@@ -72,6 +72,7 @@ async fn proxy_authentication_challenges_checks_and_blocks_a_guessing_source() {
     assert_eq!(r.header("x-proxyx-error"), Some("auth_blocked"));
     let m = edge.metrics();
     assert!(m.contains("proxyx_edge_auth_failures_total{listener=\"main\",reason=\"invalid\",service=\"proxyx-edge\"} 3"), "{m}");
+    assert!(m.contains("proxyx_edge_auth_failures_total{listener=\"main\",reason=\"missing\",service=\"proxyx-edge\"} 2"), "{m}");
     assert!(m.contains("reason=\"blocked\""), "{m}");
 }
 

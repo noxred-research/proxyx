@@ -12,19 +12,25 @@ set -eu
 # WireGuard / OpenVPN:
 #   VPN_CONFIG            Path to the config file inside the container
 #
-# Tailscale:
+# Tailscale (needs NET_ADMIN and /dev/net/tun, like the other two):
 #   TAILSCALE_AUTH_KEY    Pre-auth key for headless login
-#   TAILSCALE_ARGS        Extra flags for `tailscale up` (optional)
+#   TAILSCALE_ARGS        Extra flags for `tailscale up` (optional), for example
+#                         `--login-server=URL` or `--exit-node=IP`
 #
 # Optional:
 #   SOCKS_PORT            SOCKS5 listen port (default: 1080)
-#   SOCKS_USER            SOCKS5 auth username
+#   SOCKS_USER            SOCKS5 auth username (set together with SOCKS_PASS)
 #   SOCKS_PASS            SOCKS5 auth password
-#   HEALTH_HOST           Host to ping for health check (default: 1.1.1.1)
+#   HEALTH_HOST           Host to ping through the tunnel before serving (default: 1.1.1.1).
+#                         Use an address that answers ping only inside the VPN when you can.
+#
+# The container exits when the tunnel (or microsocks) stops, so the restart policy starts a
+# fresh tunnel; it never serves over the container's direct route.
 # --------------------------------------------------------------------------
 
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 HEALTH_HOST="${HEALTH_HOST:-1.1.1.1}"
+WG_IFACE=""
 VPN_PID=""
 MICROSOCKS_PID=""
 
@@ -41,11 +47,16 @@ cleanup() {
     esac
     echo "Shutdown complete."
 }
-trap cleanup TERM INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 130' INT
 
 # -- Validate ---------------------------------------------------------------
 
 [ -z "${VPN_TYPE:-}" ] && die "VPN_TYPE not set (wireguard|openvpn|tailscale)"
+
+if [ -n "${SOCKS_USER:-}" ] || [ -n "${SOCKS_PASS:-}" ]; then
+    [ -n "${SOCKS_USER:-}" ] && [ -n "${SOCKS_PASS:-}" ] || die "set both SOCKS_USER and SOCKS_PASS, or neither"
+fi
 
 # -- Start VPN --------------------------------------------------------------
 
@@ -56,6 +67,7 @@ case "$VPN_TYPE" in
         echo "Starting WireGuard..."
         wg-quick up "$VPN_CONFIG"
         echo "WireGuard interface is up."
+        WG_IFACE=$(basename "$VPN_CONFIG" .conf)
         ;;
     openvpn)
         [ -z "${VPN_CONFIG:-}" ] && die "VPN_CONFIG not set"
@@ -74,7 +86,10 @@ case "$VPN_TYPE" in
             if ip link show tun0 >/dev/null 2>&1; then
                 break
             fi
-            [ "$i" -eq 30 ] && die "OpenVPN tunnel did not come up within 30s"
+            if [ "$i" -eq 30 ]; then
+                tail -n 20 /tmp/openvpn.log >&2 || true
+                die "OpenVPN tunnel did not come up within 30s"
+            fi
             sleep 1
         done
         VPN_PID=$(cat /tmp/openvpn.pid)
@@ -82,14 +97,24 @@ case "$VPN_TYPE" in
         ;;
     tailscale)
         [ -z "${TAILSCALE_AUTH_KEY:-}" ] && die "TAILSCALE_AUTH_KEY not set"
+        # Kernel TUN, not userspace networking: microsocks dials through the container's own
+        # routes, so only a real interface carries its connections into the tailnet (and to an
+        # exit node), and only a real interface makes the connectivity check below meaningful.
+        mkdir -p /dev/net && [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
         echo "Starting Tailscale daemon..."
-        tailscaled --state=/tmp/tailscale.state --tun=userspace-networking &
+        tailscaled --state=/tmp/tailscale.state &
         VPN_PID=$!
-        sleep 2
+        for i in $(seq 1 10); do
+            [ -S /var/run/tailscale/tailscaled.sock ] && break
+            [ "$i" -eq 10 ] && die "tailscaled did not start within 10s"
+            sleep 1
+        done
 
         echo "Bringing Tailscale up..."
+        # The timeout stops an unreachable control plane from hanging the container. A later
+        # --timeout in TAILSCALE_ARGS overrides it.
         # shellcheck disable=SC2086
-        tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes ${TAILSCALE_ARGS:-}
+        tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --timeout=60s ${TAILSCALE_ARGS:-}
         echo "Tailscale is up."
         ;;
     *)
@@ -123,6 +148,29 @@ MICROSOCKS_PID=$!
 
 echo "Egress proxy ready (socks5://0.0.0.0:$SOCKS_PORT)"
 
-# -- Wait for child processes -----------------------------------------------
-# Block until microsocks exits or we get a signal (handled by trap).
-wait "$MICROSOCKS_PID"
+# -- Supervise --------------------------------------------------------------
+# Once the tunnel is gone, microsocks would keep answering over the container's own route and
+# clients would leave from the host's address instead of the VPN exit. Stop instead, so the
+# restart policy brings up a fresh tunnel. A signal runs the trap, which exits.
+
+# A dead child stays a zombie until reaped, and `kill -0` still succeeds on a zombie.
+alive() {
+    case "$(cat "/proc/$1/stat" 2>/dev/null)" in
+        ""|*") Z "*) return 1 ;;
+    esac
+    return 0
+}
+
+tunnel_up() {
+    case "$VPN_TYPE" in
+        wireguard) ip link show dev "$WG_IFACE" >/dev/null 2>&1 ;;
+        *)         alive "$VPN_PID" ;;
+    esac
+}
+
+while :; do
+    alive "$MICROSOCKS_PID" || { cleanup; die "microsocks exited"; }
+    tunnel_up || { cleanup; die "VPN tunnel is gone"; }
+    sleep 2 &
+    wait $!
+done

@@ -13,17 +13,20 @@ use super::ca::CertificateAuthority;
 /// the leg that destination servers fingerprint. The inbound leg (client →
 /// proxy) is always terminated by rustls and is not affected.
 ///
-/// Extension ordering is BoringSSL-native, which matches Chrome exactly.
-/// Firefox profiles omit FFDHE groups (ffdhe2048/ffdhe3072) because BoringSSL
-/// cannot express them via set_curves_list; all other parameters match live
-/// captures from utls/curl-impersonate.
+/// This is a TLS-only approximation built from the knobs BoringSSL exposes:
+/// cipher list, groups, signature algorithms, ALPN, GREASE, extension
+/// permutation, OCSP/SCT requests and ECH GREASE. Wire captures against utls
+/// parrots and locally installed browsers (see `docs/session-proxy.md`) show
+/// the remaining differences: no certificate compression, ALPS,
+/// delegated credentials or record-size limit, a BoringSSL-fixed TLS 1.3 suite
+/// order, no FFDHE groups, and no HTTP/2 SETTINGS emulation.
 /// The integer discriminants must stay in sync with the `ALL` array order —
 /// enforced by the compile-time assertion in `MitmHandler::new`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum TlsProfile {
     /// Chrome 133+. Cipher and sigalg order unchanged from 131; curves gain
-    /// X25519MLKEM768 (post-quantum hybrid, default since Chrome 131) and P-521.
+    /// X25519MLKEM768 (post-quantum hybrid, default since Chrome 131).
     Chrome133 = 0,
     /// Firefox < 128. No post-quantum group; FFDHE groups omitted (BoringSSL
     /// limitation). Cipher order stable across all Firefox versions.
@@ -127,8 +130,9 @@ impl TlsProfile {
         match self {
             // Chrome 133: X25519MLKEM768 first (post-quantum hybrid, default
             // since Chrome 131 with ML-KEM codepoint 0x11EC), then classical.
-            // P-521 added in Chrome 133. Verified against utls HelloChrome_133.
-            TlsProfile::Chrome133 => "X25519MLKEM768:X25519:P-256:P-384:P-521",
+            // No P-521: utls HelloChrome_133 and shipping Chrome/Chromium
+            // advertise exactly x25519, P-256, P-384 after the hybrid.
+            TlsProfile::Chrome133 => "X25519MLKEM768:X25519:P-256:P-384",
             // Firefox < 128: no post-quantum group.
             TlsProfile::Firefox120 => "X25519:P-256:P-384:P-521",
             // Firefox 128+: X25519MLKEM768 added as first group.
@@ -189,6 +193,29 @@ impl TlsProfile {
     fn permute_extensions(self) -> bool {
         matches!(self, TlsProfile::Chrome133)
     }
+
+    /// Whether to send a `status_request` (OCSP stapling) extension.
+    ///
+    /// Present in the captured utls HelloChrome_133 / HelloFirefox_120 parrots and
+    /// in locally installed Chrome, Chromium and Firefox. No Safari 18 reference
+    /// could be captured, so that profile is left unchanged.
+    fn requests_ocsp_stapling(self) -> bool {
+        !matches!(self, TlsProfile::Safari18)
+    }
+
+    /// Whether to send a `signed_certificate_timestamp` extension.
+    ///
+    /// Chrome only: utls HelloFirefox_120 does not send it.
+    fn requests_signed_cert_timestamps(self) -> bool {
+        matches!(self, TlsProfile::Chrome133)
+    }
+
+    /// Whether to send an ECH GREASE `encrypted_client_hello` extension.
+    ///
+    /// Present in the captured Chrome and Firefox parrots and browsers.
+    fn sends_ech_grease(self) -> bool {
+        !matches!(self, TlsProfile::Safari18)
+    }
 }
 
 /// Build a pre-configured outbound `SslConnector` for the given profile.
@@ -219,15 +246,27 @@ pub fn build_connector(
     builder.set_grease_enabled(profile.grease_enabled());
     builder.set_permute_extensions(profile.permute_extensions());
 
+    if profile.requests_ocsp_stapling() {
+        builder.enable_ocsp_stapling();
+    }
+    if profile.requests_signed_cert_timestamps() {
+        builder.enable_signed_cert_timestamps();
+    }
+
     Ok(builder.build())
 }
 
 /// Derive one connection's policy without changing its browser fingerprint.
+///
+/// `profile` must be the profile `connector` was built for: ECH GREASE is a
+/// per-connection setting that `SslConnector` cannot carry.
 pub(super) fn configure_upstream(
     connector: &SslConnector,
+    profile: TlsProfile,
     insecure: bool,
 ) -> Result<boring::ssl::ConnectConfiguration> {
     let mut config = connector.configure()?;
+    config.set_enable_ech_grease(profile.sends_ech_grease());
     config.set_verify_hostname(!insecure);
     config.set_verify(if insecure {
         SslVerifyMode::NONE
@@ -351,6 +390,7 @@ mod tests {
 
     async fn connect_origin(
         connector: &SslConnector,
+        profile: TlsProfile,
         config: Arc<ServerConfig>,
         host: &str,
         insecure: bool,
@@ -362,11 +402,7 @@ mod tests {
             let _ = tokio_rustls::TlsAcceptor::from(config).accept(tcp).await;
         });
         let tcp = TcpStream::connect(address).await.unwrap();
-        let config = if insecure {
-            configure_upstream(connector, true).unwrap()
-        } else {
-            connector.configure().unwrap()
-        };
+        let config = configure_upstream(connector, profile, insecure).unwrap();
         let accepted = tokio_boring::connect(config, host, tcp)
             .await
             .map(|_| ())
@@ -386,20 +422,20 @@ mod tests {
         for profile in TlsProfile::ALL {
             let system = build_connector(*profile, None).unwrap();
             assert!(
-                connect_origin(&system, origin.clone(), "localhost", false)
+                connect_origin(&system, *profile, origin.clone(), "localhost", false)
                     .await
                     .is_err()
             );
             let trusted = build_connector(*profile, Some(&bundle)).unwrap();
-            connect_origin(&trusted, origin.clone(), "localhost", false)
+            connect_origin(&trusted, *profile, origin.clone(), "localhost", false)
                 .await
                 .unwrap();
             assert!(
-                connect_origin(&trusted, origin.clone(), "wrong.example", false)
+                connect_origin(&trusted, *profile, origin.clone(), "wrong.example", false)
                     .await
                     .is_err()
             );
-            connect_origin(&system, origin.clone(), "localhost", true)
+            connect_origin(&system, *profile, origin.clone(), "localhost", true)
                 .await
                 .unwrap();
         }
@@ -476,5 +512,128 @@ mod tests {
         assert!(intercept.await.unwrap().is_err());
         assert!(exchange_rx.recv().await.is_none());
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod client_hello_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    const SUPPORTED_GROUPS: u16 = 10;
+    const STATUS_REQUEST: u16 = 5;
+    const SIGNED_CERTIFICATE_TIMESTAMP: u16 = 18;
+    const ENCRYPTED_CLIENT_HELLO: u16 = 0xFE0D;
+
+    struct WireHello {
+        /// `supported_groups` in wire order, GREASE removed.
+        groups: Vec<u16>,
+        /// Extension types, GREASE removed, sorted (Chrome permutes the order).
+        extensions: Vec<u16>,
+    }
+
+    fn is_grease(value: u16) -> bool {
+        value & 0x0F0F == 0x0A0A
+    }
+
+    /// Send one real ClientHello for `profile` through the production
+    /// `configure_upstream` path and parse what reached the wire.
+    async fn wire_hello(profile: TlsProfile) -> WireHello {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; 5];
+            tcp.read_exact(&mut header).await.unwrap();
+            let mut record = vec![0_u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            tcp.read_exact(&mut record).await.unwrap();
+            record
+        });
+        let connector = build_connector(profile, None).unwrap();
+        let tcp = TcpStream::connect(address).await.unwrap();
+        // The server closes after reading the hello, so the handshake fails; only the bytes matter.
+        let config = configure_upstream(&connector, profile, false).unwrap();
+        let _ = tokio_boring::connect(config, "localhost", tcp).await;
+        let hello = server.await.unwrap();
+        // handshake header(4) + version(2) + random(32), then session id, suites, compression.
+        let mut at = 4 + 2 + 32;
+        at += 1 + usize::from(hello[at]);
+        at += 2 + usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 1 + usize::from(hello[at]);
+        let end = at + 2 + usize::from(u16::from_be_bytes([hello[at], hello[at + 1]]));
+        at += 2;
+        let mut wire = WireHello {
+            groups: Vec::new(),
+            extensions: Vec::new(),
+        };
+        while at + 4 <= end {
+            let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+            let len = usize::from(u16::from_be_bytes([hello[at + 2], hello[at + 3]]));
+            if !is_grease(kind) {
+                wire.extensions.push(kind);
+            }
+            if kind == SUPPORTED_GROUPS {
+                wire.groups = hello[at + 6..at + 4 + len]
+                    .chunks_exact(2)
+                    .map(|group| u16::from_be_bytes([group[0], group[1]]))
+                    .filter(|group| !is_grease(*group))
+                    .collect();
+            }
+            at += 4 + len;
+        }
+        wire.extensions.sort_unstable();
+        wire
+    }
+
+    #[tokio::test]
+    async fn client_hello_groups_match_the_reference_browsers() {
+        const X25519: u16 = 29;
+        const P256: u16 = 23;
+        const P384: u16 = 24;
+        const P521: u16 = 25;
+        const X25519_MLKEM768: u16 = 0x11EC;
+        for (profile, expected) in [
+            // utls HelloChrome_133 and shipping Chrome: no P-521.
+            (
+                TlsProfile::Chrome133,
+                vec![X25519_MLKEM768, X25519, P256, P384],
+            ),
+            (TlsProfile::Firefox120, vec![X25519, P256, P384, P521]),
+            (
+                TlsProfile::Firefox135,
+                vec![X25519_MLKEM768, X25519, P256, P384, P521],
+            ),
+            (TlsProfile::Safari18, vec![X25519, P256, P384, P521]),
+        ] {
+            assert_eq!(wire_hello(profile).await.groups, expected, "{profile:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_hello_carries_the_reference_status_sct_and_ech_extensions() {
+        for (profile, status, sct, ech) in [
+            (TlsProfile::Chrome133, true, true, true),
+            (TlsProfile::Firefox120, true, false, true),
+            (TlsProfile::Firefox135, true, false, true),
+            (TlsProfile::Safari18, false, false, false),
+        ] {
+            let extensions = wire_hello(profile).await.extensions;
+            assert_eq!(
+                extensions.contains(&STATUS_REQUEST),
+                status,
+                "{profile:?} status_request"
+            );
+            assert_eq!(
+                extensions.contains(&SIGNED_CERTIFICATE_TIMESTAMP),
+                sct,
+                "{profile:?} signed_certificate_timestamp"
+            );
+            assert_eq!(
+                extensions.contains(&ENCRYPTED_CLIENT_HELLO),
+                ech,
+                "{profile:?} encrypted_client_hello"
+            );
+        }
     }
 }

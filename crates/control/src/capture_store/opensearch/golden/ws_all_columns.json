@@ -36,10 +36,10 @@
                 }
               },
               {
-                "wildcard": {
+                "regexp": {
                   "payload": {
                     "case_insensitive": true,
-                    "value": "*ticker*"
+                    "value": ".*tic[KkK]er.*"
                   }
                 }
               },

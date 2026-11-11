@@ -82,9 +82,55 @@ pub fn completions_url(endpoint: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// Why a request did not get a response, in words that name the fix: a certificate the
+/// system does not trust is not a connection problem.
+fn send_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timed out"
+    } else if chain_mentions_tls(error) {
+        "TLS handshake failed: the server certificate is not trusted or does not match the host (trust a private CA with llm.ca_file)"
+    } else if error.is_connect() {
+        "could not connect"
+    } else {
+        "request failed"
+    }
+}
+
+/// Whether an error or any of its sources talks about TLS or a certificate.
+fn chain_mentions_tls(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(error);
+    while let Some(current) = next {
+        let text = current.to_string().to_ascii_lowercase();
+        if text.contains("certificate") || text.contains("tls") || text.contains("handshake") {
+            return true;
+        }
+        next = current.source();
+    }
+    false
+}
+
+/// The certificates of `llm.ca_file`, trusted in addition to the built-in roots.
+fn read_ca_bundle(path: &std::path::Path) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    use anyhow::Context as _;
+    let pem = std::fs::read(path)
+        .with_context(|| format!("cannot read llm.ca_file {}", path.display()))?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
+        format!(
+            "llm.ca_file {} is not a PEM certificate bundle",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !certificates.is_empty(),
+        "llm.ca_file {} holds no certificate",
+        path.display()
+    );
+    Ok(certificates)
+}
+
 impl Llm {
     /// # Errors
-    /// When the endpoint is not a URL, the key file cannot be read or the client cannot be built.
+    /// When the endpoint is not a URL, the key or CA file cannot be read or the client cannot be built.
     pub fn new(config: &LlmConfig) -> anyhow::Result<Self> {
         let url = completions_url(&config.endpoint)
             .map_err(|error| anyhow::anyhow!("llm.endpoint: {error}"))?;
@@ -93,12 +139,17 @@ impl Llm {
             .as_deref()
             .map(read_secret)
             .transpose()?;
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("proxyx-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+            .user_agent(concat!("proxyx-mcp/", env!("CARGO_PKG_VERSION")));
+        if let Some(path) = &config.ca_file {
+            for certificate in read_ca_bundle(path)? {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             url,
@@ -114,25 +165,22 @@ impl Llm {
         if let Some(key) = &self.key {
             request = request.bearer_auth(key.expose());
         }
-        let mut response = request.send().await.map_err(|error| {
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| LlmError::Transport(send_failure(&error).to_owned()))?;
+        let status = response.status().as_u16();
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
             LlmError::Transport(
                 if error.is_timeout() {
                     "timed out"
-                } else if error.is_connect() {
-                    "could not connect"
                 } else {
-                    "request failed"
+                    "the response could not be read"
                 }
-                .to_owned(),
+                .into(),
             )
-        })?;
-        let status = response.status().as_u16();
-        let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| LlmError::Transport("the response could not be read".into()))?
-        {
+        })? {
             if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
                 return Err(LlmError::Invalid("the response is too large".into()));
             }
@@ -305,5 +353,75 @@ mod tests {
         );
         assert!(!wrapped.contains("clip-secret"), "{wrapped}");
         assert!(wrapped.contains("[redacted]"), "{wrapped}");
+    }
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|inner| inner as _)
+        }
+    }
+
+    #[test]
+    fn a_certificate_failure_deep_in_the_chain_is_a_tls_failure() {
+        let tls = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer",
+                    None,
+                ))),
+            ))),
+        );
+        assert!(chain_mentions_tls(&tls));
+        let refused = Layer(
+            "error sending request",
+            Some(Box::new(Layer("Connection refused (os error 111)", None))),
+        );
+        assert!(!chain_mentions_tls(&refused));
+    }
+
+    const PRIVATE_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIDKTCCAhGgAwIBAgIUKUTz3Zpo7i/oafAZpixrCiJdItkwDQYJKoZIhvcNAQEL
+BQAwHDEaMBgGA1UEAwwRbWNwcmVtIHByaXZhdGUgQ0EwHhcNMjYxMTExMTE1MDU0
+WhcNMjYxMjExMTE1MDU0WjAcMRowGAYDVQQDDBFtY3ByZW0gcHJpdmF0ZSBDQTCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAPXcd5FeA4SG9txTcTNr8S2K
+jPeWg8W3mKMwR093GdH6OgKTPRrAGlim37f05VSC+0uNgKr2vyYzwsnie02++tas
++hIT5ecRCg03ltt3sZfgmbA1uW0uHzfgLLlAaeu/UjMiEi4GP6Xn6IrwmtpTZINk
+uPzOpWRKAueW6P70/hcEeMraqtFGPWOiYZeSZIcGkEZVFvqqFzYJ7R4WmBLgUATY
+6jf+YwqAnbWOP8wjKOm6atiCvhyp1yQyj2W+BMrtuwfNrCb3pJNsvAUXb/y9nBCs
+aUMFy9j5AKxmYw7FYWdqfR6+k0hw02vULTApUztv+yjY+FLNbpRC+kEEYvXZmikC
+AwEAAaNjMGEwHQYDVR0OBBYEFAMIdZzZYXjMvmW7JEJv5717IN/1MB8GA1UdIwQY
+MBaAFAMIdZzZYXjMvmW7JEJv5717IN/1MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P
+AQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQAFzEBjIvZuNJ20FMyG01MCuoR6
+BL8Ya7XogSd8utWXwsIrfK9OKbWLMLcLaG9jC3B5UGfCfuE4JJ8bJlTsbgouaW1G
++L/F/nnlqksoy9MZyJFNCE5Ik5sPD+Sz6yBQ1lfufLspl6p6mmCP6SAGfVPFWEd9
+DRD2nBgFo779qMYboQP4n8OVUB0KxfOXi2FRVZ4Ck7riLPgB5uG99oBKU2O5+af8
+wvWFUM7FuB0fHqiejTl5At7WLnh8KO2q44hvt0t4ukRB261n0ErlGZnpcFLEadHC
+LMN5vjYe/iXfsl4WlsRypoLFJsr2zA/HanLatRPT4Af48nixJay8bQupOnrg
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn the_ca_file_must_hold_a_certificate() {
+        let dir = std::env::temp_dir().join(format!("proxyx-mcp-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let good = dir.join("good.pem");
+        std::fs::write(&good, PRIVATE_CA).expect("write");
+        assert_eq!(read_ca_bundle(&good).expect("bundle").len(), 1);
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, "no certificate here\n").expect("write");
+        assert!(read_ca_bundle(&empty).is_err());
+        assert!(read_ca_bundle(&dir.join("missing.pem")).is_err());
+        std::fs::remove_dir_all(&dir).expect("clean");
     }
 }

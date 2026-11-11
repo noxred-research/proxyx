@@ -295,6 +295,39 @@ async fn org_cache_policy_cannot_exceed_a_ceiling_or_name_another_scope() -> Tes
 // --- org keys ---
 
 #[tokio::test]
+async fn key_creation_requires_json_content_type_only_when_a_body_is_present() -> TestResult {
+    let h = or_skip!(harness("key_content_type").await?);
+    let url = format!("{}/v1/orgs/acme/keys", h.base);
+    for content_type in [None, Some("text/plain")] {
+        let mut request = h.client.post(&url).bearer_auth(ADMIN).body("{}");
+        if let Some(value) = content_type {
+            request = request.header("content-type", value);
+        }
+        let response = request.send().await?;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: Value = response.json().await?;
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("Content-Type")
+        );
+    }
+    let response = h.client.post(&url).bearer_auth(ADMIN).send().await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = h
+        .client
+        .post(&url)
+        .bearer_auth(ADMIN)
+        .header("content-type", "application/vnd.example+json")
+        .body(r#"{"label":"json"}"#)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_new_org_key_is_returned_once_and_only_its_hash_is_stored() -> TestResult {
     let h = or_skip!(harness("keys").await?);
     let resp = h

@@ -9,9 +9,12 @@
 //!
 //! Transport behaviour is set by [`ResilienceConfig`]: bounded connect and
 //! per-exchange timeouts, TCP keepalive, idle pool expiry and a circuit breaker
-//! that stops dialing a dead service after repeated failures. A reused socket
-//! gets one fresh connection and replay only if it disconnects before any
-//! response byte. Fresh sockets, partial responses and timeouts are not retried.
+//! that stops dialing a dead service after repeated failures. EOF or timeout
+//! after a write is ambiguous: the server may have applied the request even if
+//! no response byte arrived. Exchanges are never reconnected and replayed.
+//! Failed connections are dropped; later operations can open fresh connections.
+//! `consume` returns a degraded result per [`FailMode`], not a server success;
+//! `create`, `drain` and `snapshot` propagate transport errors.
 //! [`Client::connect`] uses the defaults; [`Client::connect_with`] takes an
 //! explicit config.
 
@@ -96,9 +99,8 @@ impl ClientInner {
     /// Failed operations drop their connection instead of returning it.
     fn take(&self) -> io::Result<Connection> {
         self.health.allow()?;
-        while let Some(mut conn) = self.pool.lock().pop() {
+        while let Some(conn) = self.pool.lock().pop() {
             if conn.last_used.elapsed() < self.health.config.max_idle {
-                conn.reused = true;
                 return Ok(conn);
             }
         }
@@ -298,5 +300,306 @@ fn outcome(allowed: bool, remaining: u64, retry_after_ns: u64) -> Outcome {
         remaining,
         retry_after_ns,
         degraded: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use limiter_proto::{
+        decode_consume_reqs, decode_create_reqs, decode_snapshot_reqs, encode_consume_results,
+        encode_create_results, encode_drain_results, encode_snapshot_results, parse_frame,
+        ConsumeResult, CreateResult, DrainResult, SnapshotResult, MAGIC, MAX_FRAME_BYTES,
+        OP_CONSUME, OP_CREATE, OP_DRAIN, OP_SNAPSHOT, VERSION,
+    };
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    const LIMITS: Limits = Limits {
+        capacity: 10,
+        refill_rate: 0,
+        ttl_ns: 60_000_000_000,
+    };
+    const UPDATED_LIMITS: Limits = Limits {
+        capacity: 8,
+        ..LIMITS
+    };
+
+    fn resilience() -> ResilienceConfig {
+        ResilienceConfig {
+            connect_timeout: Duration::from_secs(2),
+            io_timeout: Duration::from_secs(2),
+            breaker: None,
+            ..ResilienceConfig::default()
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).unwrap();
+        let length = u32::from_be_bytes(header) as usize;
+        assert!((5..=MAX_FRAME_BYTES).contains(&length));
+        let mut bytes = header.to_vec();
+        bytes.resize(4 + length, 0);
+        stream.read_exact(&mut bytes[4..]).unwrap();
+        bytes
+    }
+
+    /// A non-refilling, single-bucket wire server. It applies one mutation on
+    /// the warmed connection, drops its entire response, then serves recovery.
+    /// Replayed requests are applied again, so duplicate debits remain visible.
+    fn lost_response_server(listener: &TcpListener, dropped_op: u8) -> JoinHandle<[usize; 3]> {
+        let listener = listener.try_clone().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut calls = [0; 3];
+            let mut capacity = 0;
+            let mut tokens = 0;
+            let mut lost = false;
+            loop {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing recovery connection");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut hello = [0; 5];
+                stream.read_exact(&mut hello).unwrap();
+                assert_eq!(&hello[..4], &MAGIC);
+                assert_eq!(hello[4], VERSION);
+                stream.write_all(&[VERSION]).unwrap();
+                loop {
+                    let bytes = read_request(&mut stream);
+                    let frame = parse_frame(&bytes).unwrap().unwrap();
+                    assert_eq!(frame.count, 1);
+                    let mut reply = Vec::new();
+                    match frame.op {
+                        OP_CREATE => {
+                            let request = decode_create_reqs(frame.payload, 1).unwrap()[0];
+                            assert_eq!(request.key, b"lost-response");
+                            assert_eq!(request.refill_rate, 0);
+                            capacity = request.capacity;
+                            tokens = if calls[0] == 0 {
+                                capacity
+                            } else {
+                                tokens.min(capacity)
+                            };
+                            calls[0] += 1;
+                            encode_create_results(
+                                &mut reply,
+                                &[CreateResult {
+                                    status: ST_OK,
+                                    handle: 1,
+                                }],
+                            );
+                        }
+                        OP_CONSUME | OP_DRAIN => {
+                            let request = decode_consume_reqs(frame.payload, 1)
+                                .unwrap()
+                                .next()
+                                .unwrap();
+                            assert_eq!(request.handle, 1);
+                            if frame.op == OP_CONSUME {
+                                calls[1] += 1;
+                                let allowed = tokens >= request.amount;
+                                if allowed {
+                                    tokens -= request.amount;
+                                }
+                                encode_consume_results(
+                                    &mut reply,
+                                    &[ConsumeResult {
+                                        status: ST_OK,
+                                        allowed,
+                                        remaining: tokens,
+                                        retry_after_ns: 0,
+                                    }],
+                                );
+                            } else {
+                                calls[2] += 1;
+                                let drained = tokens.min(request.amount);
+                                tokens -= drained;
+                                encode_drain_results(
+                                    &mut reply,
+                                    &[DrainResult {
+                                        status: ST_OK,
+                                        drained,
+                                    }],
+                                );
+                            }
+                        }
+                        OP_SNAPSHOT => {
+                            assert!(lost, "snapshot must follow the lost response");
+                            let handle = decode_snapshot_reqs(frame.payload, 1)
+                                .unwrap()
+                                .next()
+                                .unwrap();
+                            assert_eq!(handle, 1);
+                            encode_snapshot_results(
+                                &mut reply,
+                                &[SnapshotResult {
+                                    status: ST_OK,
+                                    capacity,
+                                    refill_rate: 0,
+                                    tokens,
+                                    last_refill_ns: 0,
+                                }],
+                            );
+                        }
+                        op => panic!("unexpected operation {op}"),
+                    }
+                    if !lost
+                        && frame.op == dropped_op
+                        && calls[0] > 0
+                        && (dropped_op != OP_CREATE || calls[0] == 2)
+                    {
+                        lost = true;
+                        // Close only after applying the request, without writing
+                        // even the first response byte.
+                        drop(stream);
+                        break;
+                    }
+                    stream.write_all(&reply).unwrap();
+                    if frame.op == OP_SNAPSHOT {
+                        return calls;
+                    }
+                }
+            }
+        })
+    }
+
+    fn assert_recovery(
+        op: u8,
+        fail_mode: FailMode,
+        failed: bool,
+        consumed: Option<Outcome>,
+        snapshot: Snapshot,
+        calls: [usize; 3],
+        stats: ClientStats,
+    ) {
+        assert!(failed, "mutation transport failure must not become success");
+        let expected_calls = match op {
+            OP_CREATE => [2, 0, 0],
+            OP_CONSUME => [1, 1, 0],
+            OP_DRAIN => [1, 0, 1],
+            _ => unreachable!(),
+        };
+        assert_eq!(calls, expected_calls, "mutation must apply exactly once");
+        assert_eq!(snapshot.tokens, if op == OP_CREATE { 8 } else { 7 });
+        assert_eq!(snapshot.capacity, if op == OP_CREATE { 8 } else { 10 });
+        assert_eq!(stats.transport_errors, 1);
+        assert_eq!(stats.degraded, u64::from(op == OP_CONSUME));
+        if let Some(result) = consumed {
+            assert_eq!(
+                result,
+                Outcome {
+                    allowed: fail_mode == FailMode::Open,
+                    remaining: 0,
+                    retry_after_ns: 0,
+                    degraded: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn lost_mutation_responses_are_not_replayed_and_consume_degrades() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        for fail_mode in [FailMode::Open, FailMode::Closed] {
+            for op in [OP_CONSUME, OP_CREATE, OP_DRAIN] {
+                let server = lost_response_server(&listener, op);
+                let client = Client::connect_with(
+                    &addr,
+                    ClientConfig {
+                        pool_size: 1,
+                        fail_mode,
+                    },
+                    resilience(),
+                );
+                let bucket = client.create(b"lost-response", LIMITS).unwrap();
+                let mut consumed = None;
+                let failed = match op {
+                    OP_CREATE => client.create(b"lost-response", UPDATED_LIMITS).is_err(),
+                    OP_CONSUME => {
+                        consumed = Some(bucket.consume(3));
+                        true
+                    }
+                    OP_DRAIN => bucket.drain(3).is_err(),
+                    _ => unreachable!(),
+                };
+                // A separate operation recovers on a new connection and reads
+                // authoritative state; it must not repeat the lost mutation.
+                let snapshot = bucket.snapshot().unwrap();
+                let calls = server.join().unwrap();
+                assert_recovery(
+                    op,
+                    fail_mode,
+                    failed,
+                    consumed,
+                    snapshot,
+                    calls,
+                    client.stats(),
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_lost_mutation_responses_are_not_replayed_and_consume_degrades() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        for fail_mode in [FailMode::Open, FailMode::Closed] {
+            for op in [OP_CONSUME, OP_CREATE, OP_DRAIN] {
+                let server = lost_response_server(&listener, op);
+                let client = AsyncClient::connect_with(
+                    &addr,
+                    ClientConfig {
+                        pool_size: 1,
+                        fail_mode,
+                    },
+                    resilience(),
+                );
+                let bucket = client.create(b"lost-response", LIMITS).await.unwrap();
+                let mut consumed = None;
+                let failed = match op {
+                    OP_CREATE => client
+                        .create(b"lost-response", UPDATED_LIMITS)
+                        .await
+                        .is_err(),
+                    OP_CONSUME => {
+                        consumed = Some(bucket.consume(3).await);
+                        true
+                    }
+                    OP_DRAIN => bucket.drain(3).await.is_err(),
+                    _ => unreachable!(),
+                };
+                let snapshot = bucket.snapshot().await.unwrap();
+                let calls = server.join().unwrap();
+                assert_recovery(
+                    op,
+                    fail_mode,
+                    failed,
+                    consumed,
+                    snapshot,
+                    calls,
+                    client.stats(),
+                );
+            }
+        }
     }
 }

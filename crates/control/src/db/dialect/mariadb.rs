@@ -69,15 +69,20 @@ macro_rules! org_settings_upsert {
              proxy_password = VALUES(proxy_password), updated_at = UTC_TIMESTAMP(6)"
     };
 }
-/// `status` is assigned last: `error` and `s3_key` read the old status.
+/// Create a view job, or reclaim a failed one. Assignments run left to right
+/// and see the columns already assigned, so `status` is assigned last:
+/// `query_id`, `error` and `s3_key` read the old status. The query id of a
+/// pending, running or completed job is kept; a failed job (or a legacy row
+/// without one) takes the new attempt's id.
 macro_rules! view_job_upsert {
     () => {
         "INSERT INTO traffic_view_jobs (view_id, org_id, query_id) VALUES (?, ?, ?)
          ON DUPLICATE KEY UPDATE
+             query_id   = CASE WHEN status = 'failed' OR query_id IS NULL OR query_id = ''
+                               THEN VALUES(query_id) ELSE query_id END,
              error      = CASE WHEN status = 'failed' THEN NULL ELSE error END,
              s3_key     = CASE WHEN status = 'failed' THEN NULL ELSE s3_key END,
              status     = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
-             query_id   = VALUES(query_id),
              updated_at = UTC_TIMESTAMP(6)"
     };
 }

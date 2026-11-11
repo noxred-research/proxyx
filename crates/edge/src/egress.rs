@@ -687,7 +687,7 @@ impl Pool {
     }
 
     /// Can this pool serve a connection now: an address that is healthy and
-    /// not shut out by its breaker, or a prefix that is still routed here.
+    /// not shut out by its breaker, or a prefix whose sampled addresses remain bindable.
     pub fn is_usable(&self) -> bool {
         (!self.prefixes.is_empty() && self.prefix_health.is_healthy())
             || self.addrs.iter().any(|a| a.usable())
@@ -899,9 +899,9 @@ fn local_addresses() -> HashSet<IpAddr> {
     set
 }
 
-/// Check that addresses of `net` can be sources: the network must be routed to
-/// this host (`ip route add local <net> dev lo`), so that binding any of its
-/// addresses works. A few of them are tried: the first, the last, and two at random.
+/// Check that sampled source addresses of `net` are bindable.
+/// Routed, unassigned sources may also require the family's `ip_nonlocal_bind` sysctl.
+/// Bindability alone does not prove that a local route remains installed.
 pub fn check_prefix(net: &IpNet) -> Result<(), String> {
     let host_bits = u32::from(net.max_prefix_len() - net.prefix_len());
     if host_bits >= 128 || (net.addr().is_ipv4() && host_bits >= 32) {
@@ -933,7 +933,12 @@ pub fn check_prefix(net: &IpNet) -> Result<(), String> {
         let sock = socket2::Socket::new(domain, socket2::Type::STREAM, None)
             .map_err(|e| format!("open socket: {e}"))?;
         sock.bind(&SocketAddr::new(ip, 0).into()).map_err(|e| {
-            format!("cannot bind {ip} from {net}: {e} (route the prefix to this host: `ip route add local {net} dev lo`)")
+            let (family, setting) = if ip.is_ipv6() {
+                ("-6 ", "net.ipv6.ip_nonlocal_bind")
+            } else {
+                ("", "net.ipv4.ip_nonlocal_bind")
+            };
+            format!("cannot bind {ip} from {net}: {e} (route the prefix to this host: `ip {family}route add local {net} dev lo`; generated, unassigned sources may also need `{setting}=1`)")
         })?;
     }
     Ok(())

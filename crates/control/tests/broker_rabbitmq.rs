@@ -397,3 +397,27 @@ async fn bad_credentials_fail_fast() {
     assert!(RabbitMqConsumer::new(&wrong, "test").await.is_err());
     rabbit.finish().await;
 }
+
+#[tokio::test]
+async fn probe_checks_the_queues_and_keeps_the_publish_channel() {
+    let Some(rabbit) = Rabbit::start().await else {
+        return;
+    };
+    let producer = rabbit.producer().await;
+    producer.probe().await.unwrap();
+    publish_all(producer.as_ref(), &[capture_record("src-0", 0)]).await;
+
+    // A producer configured for more partitions than were declared finds the
+    // missing queue, without closing the channel the publishes use.
+    let mut wider = rabbit.config.clone();
+    wider.partitions += 1;
+    let wide = RabbitMqProducer::new(&wider, "test").await.unwrap();
+    let error = format!("{:#}", wide.probe().await.unwrap_err());
+    assert!(error.contains("is missing"), "{error}");
+    for _ in 0..3 {
+        assert!(wide.probe().await.is_err());
+    }
+    producer.probe().await.unwrap();
+    publish_all(producer.as_ref(), &[capture_record("src-0", 1)]).await;
+    rabbit.finish().await;
+}

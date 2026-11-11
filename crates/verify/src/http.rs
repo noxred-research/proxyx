@@ -198,6 +198,9 @@ pub(crate) fn direct_client(timeout: Duration) -> Result<Client, ClientError> {
 
 fn base_builder(timeout: Duration) -> ClientBuilder {
     Client::builder()
+        // Admission must trust the same native roots as the gateway's TLS dial.
+        // This call also keeps the required reqwest feature checked at compile time.
+        .tls_built_in_native_certs(true)
         .no_proxy()
         .timeout(timeout)
         .redirect(Policy::none())
@@ -225,6 +228,14 @@ pub(crate) async fn read_capped(
 mod tests {
     use super::*;
     use crate::testutil::{Stub, upstream};
+
+    #[test]
+    fn verified_http_clients_support_native_trust_roots() {
+        base_builder(Duration::from_secs(1))
+            .tls_built_in_native_certs(true)
+            .build()
+            .expect("native-root TLS client");
+    }
 
     #[tokio::test]
     async fn an_ipv6_upstream_builds_a_client_as_well_as_a_name_or_an_ipv4_one() {

@@ -85,6 +85,42 @@ pub struct Loaded {
     pub loaded_at: Instant,
 }
 
+/// Load once, with no reload loop behind it, for a caller that only reads
+/// the current state (`proxyx assess`): nothing keeps running or holds a
+/// connection after this returns. With `sync_git` it first syncs changed git
+/// files into Postgres. Bound by the same time limit as one reload.
+pub async fn load(
+    db: &Db,
+    settings: &Settings,
+    metrics: &Metrics,
+    sync_git: bool,
+) -> anyhow::Result<Loaded> {
+    first_load(
+        db,
+        settings,
+        metrics,
+        sync_git,
+        &Applied::new(settings.reload_every),
+    )
+    .await
+}
+
+async fn first_load(
+    db: &Db,
+    settings: &Settings,
+    metrics: &Metrics,
+    sync_git: bool,
+    applied: &Applied,
+) -> anyhow::Result<Loaded> {
+    tokio::time::timeout(
+        RELOAD_TIMEOUT,
+        load_once(db, settings, metrics, sync_git, None, applied),
+    )
+    .await
+    .context("failed to load the initial configuration in time")?
+    .context("failed to load the initial configuration")
+}
+
 /// Load once (blocking until it works), then reload every
 /// `settings.reload_every` until `cancel` fires. With `sync_git` the first
 /// and every later load first syncs changed git files into Postgres.
@@ -100,13 +136,7 @@ pub async fn sync_and_watch(
 ) -> anyhow::Result<watch::Receiver<Arc<Loaded>>> {
     let settings = settings.clone();
     let applied = Arc::new(Applied::new(settings.reload_every));
-    let first = tokio::time::timeout(
-        RELOAD_TIMEOUT,
-        load_once(&db, &settings, &metrics, sync_git, None, &applied),
-    )
-    .await
-    .context("failed to load the initial configuration in time")?
-    .context("failed to load the initial configuration")?;
+    let first = first_load(&db, &settings, &metrics, sync_git, &applied).await?;
     tracing::info!(
         sync_git,
         inventory_rows = first.snapshot.inventory.len(),

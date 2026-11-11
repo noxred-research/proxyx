@@ -160,6 +160,14 @@ pub trait CaptureLogProducer: Send + Sync {
     fn healthy(&self) -> bool {
         true
     }
+
+    /// Check that the broker answers, reconnecting first when the connection
+    /// is gone, without publishing anything. The proxy runs it while publishes
+    /// are failing, so that readiness recovers when the broker is back even if
+    /// no capture arrives to prove it. Brokers that cannot tell succeed.
+    async fn probe(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// One message read off the captures log.

@@ -442,7 +442,10 @@ async fn view_jobs_are_claimed_once_and_failed_ones_are_reclaimed() -> TestResul
     on_every_backend!("views", |db, raw| {
         let (view, org) = (Uuid::new_v4(), uniq("org-"));
         let created = db.upsert_view_job(view, &org, "q1").await?;
-        assert_eq!(created.status, "pending");
+        assert_eq!(
+            (created.status.as_str(), created.query_id.as_str()),
+            ("pending", "q1")
+        );
 
         // Two tasks race to claim; one wins.
         let (x, y) = tokio::join!(db.claim_view_job(view), db.claim_view_job(view));
@@ -453,12 +456,16 @@ async fn view_jobs_are_claimed_once_and_failed_ones_are_reclaimed() -> TestResul
             "an upsert leaves a running job alone"
         );
         assert_eq!(
+            again.query_id, "q1",
+            "an upsert keeps the attempt id of a running job"
+        );
+        assert_eq!(
             db.view_job(view, &org)
                 .await?
                 .ok_or("job")?
                 .query_id
                 .as_deref(),
-            Some("q2")
+            Some("q1")
         );
         assert!(db.view_job(view, "someone-else").await?.is_none());
 
@@ -478,24 +485,75 @@ async fn view_jobs_are_claimed_once_and_failed_ones_are_reclaimed() -> TestResul
                 .is_some()
         );
 
-        // A failed job comes back as pending with its error and key cleared.
+        // A failure is recorded only for the attempt the row holds.
+        assert!(!db.fail_view_job(view, "q2", "stale").await?);
+        assert_eq!(
+            db.view_job(view, &org).await?.ok_or("job")?.status,
+            "running"
+        );
+        assert!(db.fail_view_job(view, "q1", "boom").await?);
+        assert!(
+            !db.fail_view_job(view, "q1", "again").await?,
+            "a failed job does not fail twice"
+        );
+        let failed = db.view_job(view, &org).await?.ok_or("job")?;
+        assert_eq!(
+            (
+                failed.status.as_str(),
+                failed.error.as_deref(),
+                failed.query_id.as_deref()
+            ),
+            ("failed", Some("boom"), Some("q1"))
+        );
+
+        // A failed job comes back as pending with its error and key cleared,
+        // under the id of the new attempt.
         raw.execute(
-            "UPDATE traffic_view_jobs SET status = 'failed', error = 'boom', s3_key = 'k'
-             WHERE view_id = ?",
+            "UPDATE traffic_view_jobs SET s3_key = 'k' WHERE view_id = ?",
             &[view.into()],
         )
         .await?;
         let reclaimed = db.upsert_view_job(view, &org, "q3").await?;
         assert_eq!(
-            (reclaimed.status.as_str(), reclaimed.error, reclaimed.s3_key),
-            ("pending", None, None)
+            (
+                reclaimed.status.as_str(),
+                reclaimed.error,
+                reclaimed.s3_key,
+                reclaimed.query_id.as_str()
+            ),
+            ("pending", None, None, "q3")
+        );
+        assert_eq!(
+            db.upsert_view_job(view, &org, "q4").await?.query_id,
+            "q3",
+            "an upsert keeps the attempt id of a pending job"
         );
 
         db.complete_view_job(view, "exports/a.parquet").await?;
-        let done = db.upsert_view_job(view, &org, "q4").await?;
+        assert!(
+            !db.fail_view_job(view, "q3", "late").await?,
+            "a completed job does not fail"
+        );
+        let done = db.upsert_view_job(view, &org, "q5").await?;
         assert_eq!(
-            (done.status.as_str(), done.s3_key.as_deref()),
-            ("completed", Some("exports/a.parquet"))
+            (
+                done.status.as_str(),
+                done.s3_key.as_deref(),
+                done.query_id.as_str()
+            ),
+            ("completed", Some("exports/a.parquet"), "q3")
+        );
+
+        // A legacy row without an attempt id takes the proposed one.
+        raw.execute(
+            "UPDATE traffic_view_jobs SET query_id = NULL WHERE view_id = ?",
+            &[view.into()],
+        )
+        .await?;
+        let legacy = db.upsert_view_job(view, &org, "q6").await?;
+        assert_eq!(
+            (legacy.status.as_str(), legacy.query_id.as_str()),
+            ("completed", "q6")
         );
 
         // Expiry looks at `completed_at`.

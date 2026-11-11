@@ -149,6 +149,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         403 => "Forbidden",
+        408 => "Request Timeout",
         407 => "Proxy Authentication Required",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
@@ -582,14 +583,38 @@ impl Session {
         abs: &Absolute,
         opened: Opened,
     ) -> Outcome {
-        let work = self.forward(state, client, head, framing, keep_wanted, abs, opened);
+        let mut response_started = false;
+        let work = self.forward(
+            state,
+            client,
+            head,
+            framing,
+            keep_wanted,
+            abs,
+            opened,
+            &mut response_started,
+        );
         let total = state.cfg.timeouts.total;
         if total.is_zero() {
             return work.await;
         }
-        tokio::time::timeout(total, work)
-            .await
-            .unwrap_or_else(|_| Outcome::new(504, "timeout"))
+        match tokio::time::timeout(total, work).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                // A final response already on the wire cannot be replaced or followed by a 504.
+                if !response_started {
+                    self.send_error(
+                        client,
+                        504,
+                        "timeout",
+                        "request total timeout exceeded",
+                        false,
+                    )
+                    .await;
+                }
+                Outcome::new(504, "timeout")
+            }
+        }
     }
 
     /// Forward one plain HTTP request and its response.
@@ -603,6 +628,7 @@ impl Session {
         keep_wanted: bool,
         abs: &Absolute,
         opened: Opened,
+        response_started: &mut bool,
     ) -> Outcome {
         let t = &state.cfg.timeouts;
         let max = state.cfg.http.max_header_bytes;
@@ -680,6 +706,7 @@ impl Session {
                 return Outcome { retry: true, ..out };
             }
             self.parent_report(&parent, false);
+            *response_started = true;
             self.send_error(
                 client,
                 502,
@@ -730,6 +757,7 @@ impl Session {
                         HeadError::Timeout => (504, "connect_timeout"),
                         _ => (502, "bad_gateway"),
                     };
+                    *response_started = true;
                     self.send_error(
                         client,
                         status,
@@ -764,6 +792,7 @@ impl Session {
 
         if parent.is_some() && http_proxy && resp.status == 407 {
             self.parent_report(&parent, false);
+            *response_started = true;
             self.send_error(
                 client,
                 502,
@@ -791,6 +820,7 @@ impl Session {
                 .apply_rule_response(&mut hdrs, rule.as_deref());
             hdrs.push(("Connection".to_owned(), b"Upgrade".to_vec()));
             let line = format!("HTTP/1.1 101 {}", resp.reason);
+            *response_started = true;
             if client
                 .stream
                 .write_all(&render_head(&line, &hdrs))
@@ -810,6 +840,7 @@ impl Session {
         let resp_framing = match response_framing(resp.status, head_request, &resp.headers) {
             Ok(f) => f,
             Err(m) => {
+                *response_started = true;
                 self.send_error(client, 502, "bad_gateway", m, false).await;
                 out.status = 502;
                 out.result = "connect_error";
@@ -827,6 +858,7 @@ impl Session {
             hdrs.push(("Connection".to_owned(), b"close".to_vec()));
         }
         let line = format!("HTTP/1.1 {} {}", resp.status, resp.reason);
+        *response_started = true;
         if client
             .stream
             .write_all(&render_head(&line, &hdrs))

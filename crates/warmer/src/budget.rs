@@ -1,7 +1,7 @@
 //! The cost meter's decision: slow at 80% of a limit, stop at 100%,
 //! resume when the window (UTC day for traffic, UTC hour for creates) ends.
 
-use common::session::BYTES_PER_GB;
+use common::session::gb_to_bytes;
 use policy::Cost;
 use store::CostUsage;
 
@@ -46,9 +46,9 @@ fn share(used: f64, limit: f64) -> f64 {
 
 /// Judge `used` against `cost`. A limit of 0 is exhausted from the start.
 pub(crate) fn assess(cost: &Cost, used: CostUsage) -> Spend {
-    let byte_limit = cost.max_gb_per_day * BYTES_PER_GB;
+    let byte_limit = gb_to_bytes(cost.max_gb_per_day);
     // Counts are far below 2^52, so the casts are exact.
-    let bytes_ratio = share(used.bytes_today as f64, byte_limit);
+    let bytes_ratio = share(used.bytes_today as f64, byte_limit as f64);
     let creates_ratio = share(
         used.creates_this_hour as f64,
         f64::from(cost.max_creates_per_hour),
@@ -62,7 +62,7 @@ pub(crate) fn assess(cost: &Cost, used: CostUsage) -> Spend {
         Budget::Open
     };
     let by_count = u64::from(cost.max_creates_per_hour).saturating_sub(used.creates_this_hour);
-    let by_bytes = (byte_limit.max(0.0) as u64).saturating_sub(used.bytes_today) / CREATE_BYTES;
+    let by_bytes = byte_limit.saturating_sub(used.bytes_today) / CREATE_BYTES;
     Spend {
         ratio,
         budget,
@@ -72,6 +72,8 @@ pub(crate) fn assess(cost: &Cost, used: CostUsage) -> Spend {
 
 #[cfg(test)]
 mod tests {
+    use common::session::BYTES_PER_GB;
+
     use super::*;
 
     fn cost(gb: f64, creates: u32) -> Cost {
@@ -139,5 +141,13 @@ mod tests {
     fn a_zero_limit_is_exhausted() {
         assert_eq!(assess(&cost(0.0, 10), used(0, 0)).budget, Budget::Stopped);
         assert_eq!(assess(&cost(5.0, 0), used(0, 0)).budget, Budget::Stopped);
+    }
+
+    #[test]
+    fn a_fractional_gb_limit_stops_at_its_exact_byte_count() {
+        // 0.0000077 GB * 1e9 is 7700.000000000001 in f64: the limit is 7700 bytes.
+        let c = cost(0.000_007_7, 100);
+        assert_eq!(assess(&c, used(7_699, 0)).budget, Budget::Slow);
+        assert_eq!(assess(&c, used(7_700, 0)).budget, Budget::Stopped);
     }
 }

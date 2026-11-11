@@ -4,6 +4,7 @@
 //! interception certificates with (the load client trusts it in MITM mode) and
 //! the CA of the stub origin (the client trusts it in passthrough mode).
 
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,12 +54,25 @@ impl Ca {
     }
 
     /// Write `ca.der` and `ca.key.der`, the file names the session proxy's
-    /// `generate` and `file` CA modes read.
+    /// `generate` and `file` CA modes read. The private key is written with mode `0600`.
     pub fn write_to(&self, dir: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let (cert, key) = (dir.join("ca.der"), dir.join("ca.key.der"));
         std::fs::write(&cert, self.cert_der())?;
-        std::fs::write(&key, self.key_der())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&key)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&self.key_der())?;
         Ok((cert, key))
     }
 
@@ -180,6 +194,18 @@ mod tests {
         assert_eq!(cert.file_name().and_then(|n| n.to_str()), Some("ca.der"));
         assert_eq!(key.file_name().and_then(|n| n.to_str()), Some("ca.key.der"));
         assert_eq!(std::fs::read(&cert).expect("read"), ca.cert_der());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&key)
+                    .expect("key metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

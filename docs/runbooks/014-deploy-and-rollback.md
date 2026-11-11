@@ -6,7 +6,7 @@ A deployment fails migration checks, a newly started gateway never becomes ready
 There is no dedicated deployment alert. Inspect readiness and `proxyx_pool_postgres_down`, `proxyx_pool_snapshot_age_seconds`, and `proxyx_pool_config_reload_failed`. An incompatible stored state is not necessarily classified as a configuration rejection; a zero rejection gauge does not prove compatibility.
 
 ## Impact
-ProxyX migrations move forward. An old binary can reject a schema, migration history, or stored value written by a newer release. A running process may retain a frozen last-good snapshot; a fresh incompatible process cannot finish loading. Redis leases can mask this while some new connections still succeed.
+ProxyX migrations move forward. `proxyx migrate pool` rejects migration history newer than its embedded migrations, but serving roles do not use that migration-history check as a startup gate: a gateway can become ready against a newer schema when its snapshot queries and value parsers still work. An old binary can nevertheless fail on incompatible schema or stored values. A running process may retain a frozen last-good snapshot; readiness and working Redis leases do not prove rollback compatibility.
 
 A concrete compatibility boundary is `crates/store/migrations/20261019000001_degraded_state.sql`: it allows `degraded` inventory state. Code that cannot parse that state is not a safe rollback target after a new warmer or probe result writes it.
 

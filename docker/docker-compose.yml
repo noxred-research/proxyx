@@ -97,7 +97,9 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U proxyx -d proxyx_pool && pg_isready -U proxyx -d proxyx_control"]
+      # Over TCP: the image runs a socket-only server while it creates the databases on first start,
+      # and a socket probe would report ready before the real server listens.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U proxyx -d proxyx_pool && pg_isready -h 127.0.0.1 -U proxyx -d proxyx_control"]
       interval: 5s
       timeout: 3s
       retries: 20

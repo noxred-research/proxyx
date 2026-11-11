@@ -176,7 +176,12 @@ fn redis_url() -> Option<String> {
     let base = std::env::var("PROXYX_TEST_REDIS_URL").ok()?;
     let (scheme, rest) = base.split_once("://")?;
     let authority = rest.split('/').next().unwrap_or(rest);
-    Some(format!("{scheme}://{authority}/{REDIS_DB}"))
+    let db = rest
+        .split_once('/')
+        .map(|(_, db)| db)
+        .filter(|db| !db.is_empty())
+        .unwrap_or(REDIS_DB);
+    Some(format!("{scheme}://{authority}/{db}"))
 }
 
 /// Create the database `proxyx_api_<name>_test` empty, and return its URL.

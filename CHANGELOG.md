@@ -10,6 +10,10 @@ First public development line, version 0.1.0.
 
 ### Added
 
+- Optional `traffic_views_s3_endpoint` for S3-compatible traffic-view exports, shared by ClickHouse writes and object metadata/deletion operations.
+- Runnable Rust-client `capture_session` example covering session creation, trusted fetches, release, processing wait and capture search.
+- `llm.ca_file` for private-CA HTTPS LLM endpoints, with startup validation and clear TLS/timeout errors.
+- `limiter-bench --help` and strict argument validation, including meaningful usage and connection-failure exit codes.
 - **Publication security hardening.** Code-owner-gated advisory, full-history secret and workflow scans, plus public-repository CodeQL for Rust and GitHub Actions; explicit `.github` ownership; private development secret creation and incomplete-CA refusal; broader secret, database and capture exclusions; corrected private conduct reporting, fixture guidance and third-party notices.
 - **MariaDB and SQLite as alternatives to PostgreSQL** for the pool (`PROXYX_POOL_DATABASE_URL`) and the control plane (`PROXYX_CONTROL_DATABASE_URL`): the URL scheme selects `postgres://` (default), `mariadb://`/`mysql://` (MariaDB 10.6+) or `sqlite://PATH?mode=rwc` (one host only). New crate `proxyx-db`; per-backend migration directories with equal versions; `proxyx migrate pool|control` and `--check` work on all three (`migrate control --target database`, alias `postgres`); `proxyx doctor` checks the backend version; compose profiles `mariadb` and `sqlite`; test variables `PROXYX_TEST_BACKEND`, `PROXYX_TEST_MARIADB_URL`, `PROXYX_TEST_SQLITE_DIR`. See [databases.md](docs/databases.md) for the limits: SQLite is single host and logs a warning at start, MariaDB text compares case-insensitively.
 - Control API request limits (`[http]`): per-request deadline (`504`), in-flight cap (`503` with `Retry-After`) and a per-credential token bucket (`429` with `Retry-After`), with `proxyx_control_api_refusals_total{reason}`.
@@ -50,6 +54,38 @@ First public development line, version 0.1.0.
   - Benchmarks: `crates/bench` with criterion microbenchmarks and the `proxyx-bench` load tool for the gateway and the session proxy, `ci/bench-smoke.sh`, and measured numbers in [benchmarks.md](docs/benchmarks.md).
   - systemd units for the gateway, warmer, session proxy, control API, ingester and limiter in `deploy/systemd`; the compose limiter has a health check.
 - **Documentation.** Architecture, configuration reference, gateway, providers, policies, session proxy, control API, capture pipeline and operations pages under `docs/`.
+
+### Fixed
+
+- Limiter clients no longer replay an ambiguous mutating request after a reused connection loses its reply. A successful server-side consume could otherwise debit tokens twice; idle checkout expiry remains enabled.
+- Concurrent MCP processes sharing an audit file serialize appends under an operating-system file lock and use the current chain tail, preventing duplicate sequence numbers and broken audit verification.
+- Close client connections promptly after EOF-delimited upstream responses, preserve `Host` authority when translating to HTTP/2, and reply with RFC 1929 authentication failure for malformed SOCKS5 session credentials.
+- Reject missing or non-file explicit session/control configuration paths instead of silently using defaults. Recognize `upstream_unavailable`, `upstream_tls` and `connection_limit` in the Rust client's typed proxy errors.
+- Keep rendered and Chromium-hidden proxy `407` failures out of prober route-quality reports, and retry missing, unreadable or empty control-token files instead of crashing polling.
+- Return edge HTTP timeout responses before headers start, without corrupting partial responses; strip the complete `Proxy-*` header family while preserving separate parent authentication.
+- Keep edge process logs on stderr and JSON access logs on stdout; count access-log sink failures and missing-authentication challenges accurately.
+- Correct routed IPv6 source-prefix diagnostics and deployment instructions to include the Linux nonlocal-bind requirement and bind-only health limitations.
+- Detect every limiter tuning variable in `doctor` and validate metrics listeners, connection limits, idle deadlines and keepalive values.
+- Create benchmark CA keys with private permissions and explicitly authorize only the benchmark session's ephemeral upstream certificate.
+- Make one-shot pool assessments load without a background watcher and close their database pool before returning. Reset PostgreSQL test schemas without forcing a server-wide database-drop checkpoint.
+- Support authenticated plain-HTTP browser probes with bounded request/response framing, credential stripping and single-exchange isolation; preserve the public gateway's CONNECT-only contract.
+- Use native trust roots consistently when verifying and dialing HTTPS upstream proxies; report permanent pool migration errors directly instead of hiding them behind retry deadlines.
+- Require JSON for nonempty org-key creation bodies, include the operator setter in customer-upstream PUT replies, and publish readiness only after every configured gateway listener binds.
+- Supervise control API and ingester listeners, drain active API requests during shutdown, and avoid requiring unrelated database dependencies for standalone broker/store migrations.
+- Match capture header names case-insensitively, reject malformed WebSocket cursors with `400`, and poll single-node ClickHouse exports without requiring a cluster macro.
+- Generate AWS-compatible CloudFront signature substitutions and preserve failed export jobs with separate retry-attempt identities.
+- Decode standard zlib-wrapped deflate and preserve truncated identity bodies; retain OpenSearch documents on per-item authorization failures instead of silently dropping them.
+- Bound Redis reconnect backoff so session readiness and publishing recover promptly after a restart; report full HTTP/WebSocket sizes and accurate truncation metadata while keeping bounded capture prefixes.
+- Drain all pending permessage-deflate output, tunnel opaque SOCKS server-first protocols promptly, reject zero-capacity queues at startup, and pass RabbitMQ mutual-TLS client keys in the required PEM format.
+- Align Chrome133 supported groups with the pinned reference and enable supported OCSP, SCT and ECH-GREASE extensions by TLS profile. Document remaining TLS-only approximation limits rather than implying complete browser or HTTP/2 impersonation.
+- Correct OpenSearch/Elasticsearch regexes with a single anchored match, empty-value matches and out-of-range integer filters; improve Unicode case folding in capture searches.
+- Make ClickHouse regex dots exclude newlines unless explicitly requested, and remove a token-only prefilter that incorrectly rejected substring matches inside bodies.
+- Mark capture readiness unhealthy after exhausted publish attempts, recover through bounded backend probes or clean publishes, account for otherwise silent shutdown/encoding drops, and cap Kafka reconnect backoff.
+- Preserve truncated bodies with unsupported content encodings and safely encode export object keys for reserved, control, slash and Unicode org identifiers.
+- Keep ingester health down until Kafka authentication succeeds, rather than briefly reporting a healthy connection during failed startup.
+- Compare fractional-GB budgets as whole bytes so exact-limit org, provider-day and static fair-use counters are exhausted correctly.
+- Gate Compose PostgreSQL readiness on its TCP server, not its temporary initialization socket.
+- Supervise VPN sidecar tunnels and SOCKS processes, reject half-configured SOCKS credentials, support kernel-TUN Tailscale and full-tunnel WireGuard prerequisites, and clean up on signals.
 
 ### Security
 

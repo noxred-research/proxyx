@@ -15,6 +15,9 @@ pub struct ViewJobUpsert {
     pub status: String,
     pub s3_key: Option<String>,
     pub error: Option<String>,
+    /// The attempt id the row holds: the proposed one when the row was
+    /// created or reclaimed, otherwise the id of the attempt in progress.
+    pub query_id: String,
 }
 
 /// One export job, for the status poll.
@@ -39,7 +42,10 @@ impl ViewJobRow {
 
 delegate! {
     /// Create the job of `view_id`, or reclaim a failed one (it becomes
-    /// `pending` again). Any other state is left as it is.
+    /// `pending` again, with its error cleared). Any other state is left as
+    /// it is. `query_id` identifies the export attempt: the row takes it when
+    /// it is created, reclaimed or has none; a pending, running or completed
+    /// job keeps the id it has.
     pub async fn upsert_view_job(&self, view_id: Uuid, org_id: &str, query_id: &str) -> DbResult<ViewJobUpsert>;
 
     /// Move a `pending` job to `running`. Whether this call did it (false:
@@ -60,6 +66,11 @@ delegate! {
 
     /// Mark the export `completed`, with the object key.
     pub async fn complete_view_job(&self, view_id: Uuid, s3_key: &str) -> DbResult<()>;
+
+    /// Mark the pending or running attempt `query_id` of `view_id` `failed`
+    /// with `error`. Whether this call did it (false: the job holds another
+    /// attempt or is already finished).
+    pub async fn fail_view_job(&self, view_id: Uuid, query_id: &str, error: &str) -> DbResult<bool>;
 
     /// Delete the job, so the next create starts it again.
     pub async fn delete_view_job(&self, view_id: Uuid) -> DbResult<()>;

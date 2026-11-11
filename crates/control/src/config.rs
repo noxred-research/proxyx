@@ -353,6 +353,13 @@ pub struct ControlConfig {
     #[serde(default = "default_traffic_views_s3_region")]
     pub traffic_views_s3_region: String,
 
+    /// Optional HTTP(S) S3-compatible endpoint for traffic view exports.
+    /// Uses path-style bucket addressing for both ClickHouse and the S3 client.
+    /// Unset keeps the AWS virtual-hosted endpoint.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_ENDPOINT`.
+    #[serde(default)]
+    pub traffic_views_s3_endpoint: Option<String>,
+
     // ── Parquet export query settings ─────────────────────────────────────
     // These control ClickHouse memory usage during INSERT INTO s3() exports.
     // Defaults are tuned for tables with wide body columns (multi-MB rows).
@@ -554,6 +561,26 @@ mod tests {
         assert_eq!(rabbit.rabbitmq.as_ref().unwrap().partitions, 4);
         // Redis Streams needs no section.
         assert!(load("").validate_broker().is_ok());
+    }
+
+    #[test]
+    fn traffic_views_s3_endpoint_defaults_to_none() {
+        let config = load("");
+        assert!(config.traffic_views_s3_endpoint.is_none());
+        assert_eq!(config.traffic_views_s3_region, "us-east-1");
+    }
+
+    #[test]
+    fn traffic_views_s3_endpoint_accepts_custom_endpoint() {
+        let config = load(
+            "traffic_views_s3_endpoint = \"http://minio:9000/storage/\"\n\
+             traffic_views_s3_region = \"eu-west-1\"\n",
+        );
+        assert_eq!(
+            config.traffic_views_s3_endpoint.as_deref(),
+            Some("http://minio:9000/storage/")
+        );
+        assert_eq!(config.traffic_views_s3_region, "eu-west-1");
     }
 
     #[test]

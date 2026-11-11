@@ -37,6 +37,15 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
         config.tuning.max_connections > 0,
         "tuning.max_connections must be greater than 0"
     );
+    // A zero-capacity channel panics when it is created.
+    anyhow::ensure!(
+        config.tuning.exchange_channel_capacity > 0,
+        "tuning.exchange_channel_capacity must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.request_log.channel_capacity > 0,
+        "request_log.channel_capacity must be greater than 0"
+    );
     let _sentry_guard = common::sentry::init(&config.sentry, "proxyx-intercept");
     let _otel_guard = common::telemetry::init("proxyx-intercept");
     // Release builds abort on panic, so this ERROR line is the only structured

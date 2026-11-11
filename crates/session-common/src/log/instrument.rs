@@ -133,6 +133,10 @@ impl CaptureLogProducer for InstrumentedProducer {
     fn healthy(&self) -> bool {
         self.inner.healthy()
     }
+
+    async fn probe(&self) -> Result<()> {
+        self.inner.probe().await
+    }
 }
 
 struct InstrumentedConsumer {

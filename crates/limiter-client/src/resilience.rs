@@ -58,14 +58,6 @@ impl Default for ResilienceConfig {
     }
 }
 
-/// Only clean disconnects before a response starts permit replay on a reused socket.
-pub(crate) fn retryable_disconnect(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
-    )
-}
-
 /// Circuit state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {

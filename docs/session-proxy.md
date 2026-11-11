@@ -54,7 +54,7 @@ socks5://<session-uuid>:password@proxy.example.com:1080
 | Listener | How the id is read | Failure |
 |---|---|---|
 | CONNECT / HTTP | `Proxy-Authorization: Basic base64(<uuid>:<anything>)` | `407` with `Proxy-Authenticate: Basic realm="proxy"` for a missing or malformed header, bad UUID, unknown or expired session. `503` when the session backend is unavailable. |
-| SOCKS5 | username of the RFC 1929 sub-negotiation (method `0x02` is required) | see [Errors](#errors): the handshake still succeeds and the failure is reported in band |
+| SOCKS5 | username of the RFC 1929 sub-negotiation (method `0x02` is required) | a malformed UUID receives RFC 1929 authentication failure (`0x01`); for a valid UUID, see [Errors](#errors): the handshake succeeds and any lookup or routing failure is reported in band |
 
 The proxy strips `Proxy-Authorization` and `Proxy-Connection` from every request it forwards and from every request it captures, so the session credential never reaches the origin or ClickHouse.
 
@@ -209,6 +209,8 @@ A captured connection waits for the next request up to 30 s of idleness, then cl
 
 Chunked bodies impose an 8 KiB limit on each chunk-size line (including extensions) and each trailer line, plus a 64 KiB aggregate trailer limit. Metadata reads have deadlines as well as body idle limits, on streaming HTTP/1.1 and buffered HTTP/1.1-to-HTTP/2 paths. Oversized or stalled framing is rejected and the connection closes.
 
+Responses without `Content-Length` or chunked transfer framing are delimited by the upstream's EOF. The proxy advertises `Connection: close` and closes the client leg immediately after forwarding that body; it does not wait for the next-request idle timeout. HTTP/1.1-to-HTTP/2 translation preserves the client's `Host` authority, including explicit ports and bracketed IPv6 addresses, in `:authority`.
+
 Compressed WebSocket frames and fragmented compressed messages must fit `tuning.max_ws_compressed_message_bytes` (default 16777216 bytes, 16 MiB). The proxy checks declared sizes before buffering payloads and closes with code `1009` when the bound is exceeded. This transport limit is separate from the captured-payload cap.
 
 ### Upstream TLS trust
@@ -261,17 +263,37 @@ On Unix, generated CA directories use mode `0700`, and private keys are created 
 
 ## TLS profiles
 
-The outbound handshake imitates a browser so destination servers fingerprint the proxy like a real client. One connector per profile is built at startup; the profile is chosen per session from the `agent` string given at session creation (`TlsProfile::for_agent`, case-insensitive):
+The outbound handshake approximates a browser's TLS ClientHello so destination servers see a browser-like client rather than a default library. It is a TLS-only approximation, not an exact browser clone (see [Verified scope and limits](#verified-scope-and-limits)). One connector per profile is built at startup; the profile is chosen per session from the `agent` string given at session creation (`TlsProfile::for_agent`, case-insensitive):
 
 | `agent` contains | Profile | Notes |
 |---|---|---|
-| nothing (no `agent`) or no match | `Chrome133` | default |
-| `chrome` or `chromium` | `Chrome133` | X25519MLKEM768 first, GREASE, extension order permuted per handshake |
-| `firefox`, version `Firefox/N` with N >= 128, or no parsable version | `Firefox135` | X25519MLKEM768 first, no GREASE |
-| `firefox`, N < 128 | `Firefox120` | no post-quantum group |
-| `safari` (and not chrome) | `Safari18` | AES-256 first, GREASE |
+| nothing (no `agent`), empty, or no match | `Chrome133` | default |
+| `chrome` or `chromium` | `Chrome133` | X25519MLKEM768 first, GREASE, extension order permuted per handshake, OCSP/SCT requests, ECH GREASE |
+| `firefox`, version `Firefox/N` with N >= 128, or no parsable version | `Firefox135` | X25519MLKEM768 first, no GREASE, OCSP request, ECH GREASE |
+| `firefox`, N < 128 | `Firefox120` | no post-quantum group, otherwise as `Firefox135` |
+| `safari` (and not chrome) | `Safari18` | AES-256 first in the TLS 1.2 suite list, GREASE, no OCSP/SCT/ECH extensions |
 
-Chrome is tested first, so a Chrome user agent that also mentions Safari selects `Chrome133`. All profiles require TLS 1.2 or newer and advertise ALPN `h2, http/1.1`. The Firefox profiles omit the FFDHE groups because BoringSSL cannot express them.
+Chrome is tested first, so a Chrome user agent that also mentions Safari or Firefox selects `Chrome133`. The version is read from the literal text `Firefox/N`; an agent such as `FIREFOX/100.0` matches Firefox but has no parsable version, so it selects `Firefox135`. All profiles require TLS 1.2 or newer (`supported_versions` offers 1.3 and 1.2 only) and advertise ALPN `h2, http/1.1`. The Firefox profiles omit the FFDHE groups because BoringSSL cannot express them.
+
+### Verified scope and limits
+
+The profiles were checked by capturing the real ClientHello the proxy sends to a local raw TLS listener and comparing normalized fields (GREASE values, random, session ID, key-share bytes and, for Chrome, extension order are excluded) against two kinds of reference captured on the same host: utls parrots `HelloChrome_133` and `HelloFirefox_120`, and installed Chrome 157, Chromium 156 and Firefox 159. Those installed browsers are newer than the pinned profiles, so only the fields the profiles pin are compared.
+
+What the captures confirm:
+
+- Each `agent` selection maps to the profile in the table; profiles differ from one another on the wire; all agents of one profile produce the same normalized hello.
+- `Chrome133` matches `HelloChrome_133` on TLS 1.2 cipher suites and order, signature algorithms, supported groups (`X25519MLKEM768`, `x25519`, `secp256r1`, `secp384r1`, no `secp521r1`), key-share groups, GREASE, extension permutation and ALPN, and also sends `status_request`, `signed_certificate_timestamp` and `encrypted_client_hello` (GREASE).
+- `Firefox120` matches `HelloFirefox_120` on TLS 1.2 suites, signature algorithms and groups apart from the omitted FFDHE groups; both Firefox profiles also send `status_request` and `encrypted_client_hello` (GREASE). `Firefox135`'s groups match Firefox 159.
+- Extension order is permuted per handshake for `Chrome133` only.
+- Upstream verification stays on for every profile; a bad chain or hostname gives `502` with `X-ProxyX-Error: upstream_tls`, and the documented insecure exceptions keep the same ClientHello. The WebSocket HTTP/1.1 fallback dial uses the same profile with ALPN `http/1.1` only.
+
+Known differences from the reference browsers, which this version does not remove:
+
+- BoringSSL's safe API offers no certificate compression, ALPS, delegated credentials or record-size-limit extensions, so the profiles never send them. The JA3/JA4 hashes therefore differ from real browsers and from the utls parrots.
+- The TLS 1.3 suite order is fixed by BoringSSL (AES-128, AES-256, ChaCha20). Firefox sends AES-128, ChaCha20, AES-256. For `Safari18` only the TLS 1.2 list leads with AES-256.
+- `Firefox135` is not pinned against a Firefox 135 capture. Firefox 159 additionally sends `signed_certificate_timestamp` and certificate compression, and sends fewer TLS 1.2 suites and signature algorithms than the profile (no ECDSA CBC suites, no SHA-1 schemes).
+- `Safari18` has no external reference; only its documented markers (AES-256-first TLS 1.2 suites, GREASE, no post-quantum group) are asserted.
+- HTTP/2 is not emulated. The upstream HTTP/2 connection is identical for every profile: empty client `SETTINGS`, no connection `WINDOW_UPDATE`, pseudo-header order `:method`, `:scheme`, `:authority`, `:path`. No browser HTTP/2 capture was taken, so the match of these values to any browser is neither claimed nor verified.
 
 ## Rate limiting
 
@@ -321,7 +343,7 @@ The proxy distinguishes its own errors from the origin's. Responses it generates
 | no upstream response headers within `network.upstream_response_header_timeout_ms` (30 s) | intercepted HTTP | `504` | `X-Proxy-Error: upstream did not send response headers in time` |
 | WebSocket upgrade could not be captured | intercepted HTTP | `502` | `X-Proxy-Error: websocket upgrade could not be captured by the proxy` |
 
-The SOCKS5 listener cannot return these in the SOCKS reply: it always answers the CONNECT with success (`0x00`) before the session and the upstream are checked, so a failure surfaces as the response to the client's first request. It reads that request (plaintext HTTP is answered directly; TLS is terminated with a fixed certificate for `proxyx-error.invalid` and then answered; anything else is closed), and replies with `X-ProxyX-Error` naming the cause:
+For a syntactically valid session UUID, the SOCKS5 listener answers CONNECT with success (`0x00`) before the upstream is checked, so a missing session or dial failure surfaces as the response to the client's first request. A malformed UUID instead receives RFC 1929 authentication failure before CONNECT. On a captured host the first client bytes pick the protocol (TLS, HTTP, or anything else, which is tunneled opaquely); a target that sends first (an SMTP, SSH or MySQL banner) is tunneled opaquely at once, without waiting for the client or for `network.socks_handshake_timeout_ms`. For in-band failures it reads the request (plaintext HTTP is answered directly; TLS is terminated with a fixed certificate for `proxyx-error.invalid` and then answered; anything else is closed), and replies with `X-ProxyX-Error` naming the cause:
 
 | `X-ProxyX-Error` | Status | Meaning |
 |---|---|---|
@@ -344,9 +366,15 @@ Captures travel through two bounded queues, and a slow broker pushes back all th
 1. a per-tunnel channel of `tuning.exchange_channel_capacity` (default 8) HTTP exchanges and another for WebSocket messages, drained by a task per tunnel;
 2. the process-wide request-log writer queue of `request_log.channel_capacity` (default 256), drained by one task that publishes everything queued as a batch.
 
-A full channel blocks the sender, which blocks the tunnel; there is no drop on overflow. Publishing retries failed records with exponential backoff (50 ms doubling to 5 s) up to five failed attempts per record; only a record that fails all attempts is dropped and counted in `proxyx_intercept_captures_dropped_total` (and logged at `error`). A publish call that takes more than 5 s logs `capture batch publish stalled`. Records are keyed by `source_id`, which keeps one source's captures in order. The full delivery model, the envelope and ClickHouse storage are in [capture-pipeline.md](capture-pipeline.md).
+A full channel blocks the sender, which blocks the tunnel; there is no drop on overflow. Publishing retries failed records with exponential backoff (50 ms doubling to 5 s) up to five failed attempts per record; only a record that fails all attempts is dropped and counted in `proxyx_intercept_captures_dropped_total` (and logged at `error`); a capture sent after shutdown began, or one that cannot be encoded, is counted there too, so every accepted capture is either published or counted dropped. A publish call that takes more than 5 s logs `capture batch publish stalled`. Records are keyed by `source_id`, which keeps one source's captures in order. The full delivery model, the envelope and ClickHouse storage are in [capture-pipeline.md](capture-pipeline.md).
 
-Header values are cut at 512 bytes (`tuning.max_header_capture`, on a character boundary) in the capture, and bodies at `tuning.max_body_capture` (default 512 KiB). Forwarded traffic is never truncated.
+During a Redis outage (`broker_kind = "redis_stream"`) the writer holds the oldest record and retries it; the queue behind it fills and backpressures the tunnels. The head record is dropped (and counted) when it exhausts its five attempts, so a long outage loses the head records one at a time while the rest keep their place. Measured against a stopped Valkey: a 20 s outage dropped one capture and a 150 s outage dropped three. When Redis returns the connection manager reconnects within a few seconds (`redis` readiness and `capture_pipeline` recovered 1 to 4 s after the server came back in every run), the queue drains and traffic needs no restart. Delivery is at-least-once: an `XADD` that Redis applied but whose reply was lost (a stalled rather than refused connection) is sent again, so a stream can hold a duplicate with the same `event_id`, which the control plane's insert tolerates. Stream order across different client connections is arrival order at the writer, so captures that were blocked behind an outage can interleave out of request order; the `timestamp` of each capture is the request time and carries the true order.
+
+During a RabbitMQ outage (`broker_kind = "rabbitmq"`) every publish fails at once: the producer reconnects with its own backoff (`rabbitmq.reconnect_initial_backoff_ms`, doubling up to `rabbitmq.reconnect_max_backoff_ms`), so a capture uses its five attempts in under a second and is dropped and counted, and `capture_pipeline` readiness turns `503` with the last error as detail. While it is failing the proxy asks the broker every `health.check_interval_ms` (reconnect, then a passive declare of each partition queue), so readiness returns without further traffic as soon as the producer has reconnected, and after a clean batch otherwise. Measured against a killed broker with a unique id in each request: a 20 s outage dropped the 123 captures proxied meanwhile, `captures_dropped_total` rose by exactly 123, the 71 others were in the queues and none of the 123 was, readiness was `503` for the whole outage and `200` again 10 s after the broker returned (the reconnect backoff), with no restart. A confirm that times out (a frozen broker) can still have been applied, so a dropped capture may also appear in the queue: delivery is at-least-once.
+
+During a Kafka outage the client retries inside the publish call, so nothing is dropped: the batch waits, the queue fills and backpressures the tunnels, and readiness fails when nothing was published for `health.capture_publish_stale_ms` (60 s) or the queue stayed full for `health.capture_stall_window_ms` (30 s). The client's reconnect backoff is capped at 5 s, so publishing resumes within seconds of the broker accepting connections (measured 19 to 21 s after a killed single-node broker was started, which is its own start-up time); before the cap a broker that reset one connection while starting was not retried for 77 s. All 542 captures of an 80 s outage were published, none dropped.
+
+Header values are cut at 512 bytes (`tuning.max_header_capture`, on a character boundary) in the capture, and bodies at `tuning.max_body_capture` (default 512 KiB). `request_body_size`, `response_body_size` and a WebSocket message's `payload_size` always hold the full size (decoded body, or decompressed message), whatever was kept, and `*_truncated` says whether the stored bytes are a prefix. Forwarded traffic is never truncated.
 
 ## Health and readiness
 
@@ -370,7 +398,7 @@ Readiness is the conjunction of these, all reported in the body and as `proxyx_i
 | Check | Fails when | Recovers when |
 |---|---|---|
 | `redis` | `health.redis_failure_threshold` (default 3) consecutive `PING`s through the shared Redis connection fail or take longer than `health.redis_timeout_ms` (1 s). The ping runs every `health.check_interval_ms` (2 s). | the next `PING` succeeds |
-| `capture_pipeline` | the capture queue has stayed at or above `health.capture_stall_fraction` (0.9) of `request_log.channel_capacity` for longer than `health.capture_stall_window_ms` (30 s), **or** captures are queued or being published and nothing was published for `health.capture_publish_stale_ms` (60 s). A queue that only fills during a burst and drains does not fail it; an idle writer is healthy however long it has been idle. | the queue drops below the fraction and publishing makes progress |
+| `capture_pipeline` | the capture queue has stayed at or above `health.capture_stall_fraction` (0.9) of `request_log.channel_capacity` for longer than `health.capture_stall_window_ms` (30 s), **or** captures are queued or being published and nothing was published for `health.capture_publish_stale_ms` (60 s). **or** the writer dropped a capture after its fifth failed attempt and no batch has published cleanly since. The last rule catches a broker that fails at once (a refused connection, a nack) and never stalls the writer. A queue that only fills during a burst and drains does not fail it; an idle writer is healthy however long it has been idle. | the queue drops below the fraction and publishing makes progress; after dropped captures, the next batch publishes cleanly **or** the broker answers the probe the check runs every `health.check_interval_ms` while it is failing (RabbitMQ: reconnect and declare each partition queue passively; Kafka: topic metadata; Redis: `PING`), so a balancer that stopped sending traffic still sees it recover |
 | `listeners` | a listener has not bound yet or its accept loop has exited, for example after a bind error | the listener is bound again (in practice a restart) |
 
 Readiness is also `503` with `"draining":true` from the moment the proxy receives `SIGTERM` or Ctrl-C (`proxyx_intercept_draining` is 1). This happens first, before any listener closes, so a balancer sees the proxy go not-ready before connections are refused; `health.drain_notice_ms` (default 0) adds a pause between the two for balancers that need a few probe intervals.
@@ -452,7 +480,7 @@ Sources, lowest priority first: `./intercept.toml` (or `/etc/proxyx/intercept.to
 | `no_capture_hosts` | empty | list or comma-separated string |
 | `broker_kind` | `redis_stream` | `redis_stream`, `kafka` or `rabbitmq` (`redpanda` is a deprecated alias of `kafka`); must match the control plane |
 | `request_log.stream_name` | `proxyx:request_log` | Redis stream; must equal the control plane's `request_log_stream` |
-| `request_log.channel_capacity` | 256 | writer queue and batch size |
+| `request_log.channel_capacity` | 256 | writer queue and batch size; must be greater than 0 |
 | `request_log.max_stream_len` | 1000000 | `XADD MAXLEN ~ N`; 0 disables trimming |
 | `kafka.*` | none | required when `broker_kind = "kafka"`; see [capture-pipeline.md](capture-pipeline.md#broker) |
 | `rabbitmq.*` | none | required when `broker_kind = "rabbitmq"`; see [capture-pipeline.md](capture-pipeline.md#rabbitmq-rabbitmq) |
@@ -460,8 +488,8 @@ Sources, lowest priority first: `./intercept.toml` (or `/etc/proxyx/intercept.to
 | `ca.*` | `type = "generate"`, `data_dir = "data"` | see [CA](#ca-and-client-trust) |
 | `tuning.max_body_capture` | 524288 | bytes |
 | `tuning.max_header_capture` | 512 | bytes per header value |
-| `tuning.exchange_channel_capacity` | 8 | per-tunnel capture channel |
-| `tuning.max_connections` | 10000 | |
+| `tuning.exchange_channel_capacity` | 8 | per-tunnel capture channel; must be greater than 0 |
+| `tuning.max_connections` | 10000 | must be greater than 0 |
 | `tuning.shutdown_drain_timeout_secs` | 300 | |
 | `network.*` | see [configuration.md](configuration.md#session-proxy-network-options) | timeouts, HTTP keep-alive, DNS cache, egress retries, TCP keepalive |
 | `breaker.*` | see [Upstream circuit breaker](#upstream-circuit-breaker) and [configuration.md](configuration.md#session-proxy-network-options) | per-upstream circuit breaker; `breaker.enabled = false` turns it off |

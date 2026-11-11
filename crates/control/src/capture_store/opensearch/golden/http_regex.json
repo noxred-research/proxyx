@@ -10,7 +10,7 @@
         "regexp": {
           "path": {
             "case_insensitive": true,
-            "value": "(\\/v[0-9]+\\/users\\/[0-9]+)"
+            "value": "(\\/v[0-9]+\\/u[Ssſ]er[Ssſ]\\/[0-9]+)"
           }
         }
       }

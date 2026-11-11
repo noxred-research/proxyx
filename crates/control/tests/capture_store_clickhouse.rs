@@ -22,7 +22,7 @@ use proxyx_control::capture_store::{
 };
 use proxyx_control::pipeline::ClickHouseSink;
 use proxyx_control::pipeline::clickhouse::ClickHouseConfig;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 mod support;
@@ -95,7 +95,7 @@ async fn write_through_the_pipeline_and_read_back() {
     rich.method = "POST".into();
     rich.request_headers = vec![
         wire::Header {
-            name: "x-trace".into(),
+            name: "X-Trace".into(),
             value: "abc".into(),
         },
         wire::Header {
@@ -183,14 +183,38 @@ async fn write_through_the_pipeline_and_read_back() {
         ids(&store, &branch(json!({ "request_sends_cookies": true }))).await,
         vec![uuid_n(30)]
     );
-    assert_eq!(
-        ids(
-            &store,
-            &branch(json!({ "request_header": { "key": "x-trace", "value": "abc" } }))
-        )
-        .await,
-        vec![uuid_n(30)]
-    );
+    for (filter, keys, value) in [
+        ("request_header", ["x-trace", "X-TRACE", "x-TrAcE"], "abc"),
+        (
+            "request_header",
+            ["x-proxyx-agent", "X-PROXYX-AGENT", "x-PrOxYx-AgEnT"],
+            "agent-7",
+        ),
+        (
+            "response_header",
+            ["content-type", "CONTENT-TYPE", "cOnTeNt-TyPe"],
+            "Application/JSON; charset=utf-8",
+        ),
+    ] {
+        for key in keys {
+            let query = branch(json!({ (filter): { "key": key, "value": value } }));
+            assert_eq!(ids(&store, &query).await, vec![uuid_n(30)]);
+            assert_eq!(store.count_requests(&query).await.unwrap(), 1);
+        }
+        let wrong_value = branch(json!({
+            (filter): { "key": keys[0], "value": value.to_ascii_uppercase() }
+        }));
+        assert!(ids(&store, &wrong_value).await.is_empty());
+        assert_eq!(store.count_requests(&wrong_value).await.unwrap(), 0);
+    }
+    for filter in ["request_header", "response_header"] {
+        for (value, expected_count) in [("", 27), ("nonempty", 0)] {
+            let query = branch(json!({
+                (filter): { "key": "X-ProxyX-Missing-Header", "value": value }
+            }));
+            assert_eq!(store.count_requests(&query).await.unwrap(), expected_count);
+        }
+    }
     assert_eq!(
         ids(
             &store,
@@ -276,7 +300,192 @@ async fn write_through_the_pipeline_and_read_back() {
 
     // Exports are available with this store.
     let dynamic: &dyn CaptureStore = &store;
-    assert!(dynamic.require_view_exporter().is_ok());
+    let exporter = dynamic.require_view_exporter().unwrap();
+
+    // A stock single node has no `cluster` macro: polling an unknown query id
+    // must read the local system tables and find nothing, not fail.
+    let missing_qid = format!("pxt-missing-{}", Uuid::new_v4());
+    assert!(exporter.progress(&missing_qid).await.unwrap().is_none());
+    assert!(exporter.outcome(&missing_qid).await.unwrap().is_none());
+
+    admin
+        .query(&format!("DROP DATABASE {database}"))
+        .execute()
+        .await
+        .unwrap();
+}
+
+/// The values at the edges of the query language return the rows the
+/// OpenSearch store returns ([`boundary_cases`]): `.` does not match a
+/// newline although ClickHouse's own RE2 default lets it, and numeric filters
+/// beyond a column's type are answered, not rejected.
+#[tokio::test]
+async fn boundary_values_match_opensearch() {
+    let Ok(url) = std::env::var("PROXYX_TEST_CLICKHOUSE_URL") else {
+        eprintln!("SKIP: PROXYX_TEST_CLICKHOUSE_URL is not set");
+        return;
+    };
+    if std::env::var_os("PROXYX_CONTROL_CLICKHOUSE__LOCAL_SINGLE_NODE").is_none() {
+        eprintln!("SKIP: PROXYX_CONTROL_CLICKHOUSE__LOCAL_SINGLE_NODE is not set");
+        return;
+    }
+    let user = std::env::var("PROXYX_TEST_CLICKHOUSE_USER").ok();
+    let password = std::env::var("PROXYX_TEST_CLICKHOUSE_PASSWORD").ok();
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64;
+    set_base_nanos(now - now % 1_000_000_000 - 3_600 * 1_000_000_000);
+
+    let database = format!("pxt_{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let mut admin = clickhouse::Client::default().with_url(&url);
+    if let Some(user) = &user {
+        admin = admin.with_user(user);
+    }
+    if let Some(password) = &password {
+        admin = admin.with_password(password);
+    }
+    admin
+        .query(&format!("CREATE DATABASE {database}"))
+        .execute()
+        .await
+        .unwrap();
+    let config = ClickHouseConfig {
+        url,
+        database: Some(database.clone()),
+        user,
+        password,
+        table: None,
+        bulk_size: 500,
+        flush_interval_secs: 1,
+        max_buffer_bytes: 256 * 1024 * 1024,
+        circuit_breaker_threshold: 5,
+        circuit_breaker_reset_secs: 60,
+    };
+    let client = proxyx_control::runtime::clickhouse_client(&config);
+    proxyx_control::migrations::run_clickhouse(&client)
+        .await
+        .unwrap();
+    let store = ClickHouseStore::new(client);
+    let sink = Arc::new(ClickHouseSink::new(config.clone(), None, None, None, None).unwrap());
+    let mut messages = boundary_messages();
+    messages.extend(boundary_close_messages());
+    let sent = messages.len();
+    assert_eq!(deliver_via(sink, messages).await, sent);
+
+    // ClickHouse's `lower` folds ASCII only, which is a documented difference
+    // from the OpenSearch store.
+    let (a, b, c, d, e) = (uuid_n(1), uuid_n(2), uuid_n(3), uuid_n(4), uuid_n(5));
+    let (f, g) = (uuid_n(6), uuid_n(7));
+    let all = vec![a, b, c, d, e, f, g];
+    let rx = |value: &str| json!({ "op": "regex_match", "value": value });
+    let mut cases = boundary_cases();
+    cases.extend([
+        (
+            "contains folds ASCII letters only",
+            json!({ "response_body": contains("ÜNÏ") }),
+            vec![d],
+        ),
+        (
+            "contains folds around ASCII and a space",
+            json!({ "response_body": contains("ünï b") }),
+            vec![c],
+        ),
+        (
+            "not contains a non-ASCII letter",
+            json!({ "response_body": not(contains("ünï")) }),
+            vec![a, b, d, e, f, g],
+        ),
+        // ASCII-only folding: `k` and `s` do not match their Unicode variants.
+        (
+            "k does not match KELVIN SIGN",
+            json!({ "response_body": contains("k") }),
+            vec![],
+        ),
+        (
+            "KELVIN SIGN matches itself",
+            json!({ "response_body": contains("\u{212a}") }),
+            vec![f],
+        ),
+        (
+            "s does not match LONG S",
+            json!({ "response_body": contains("S") }),
+            vec![],
+        ),
+        (
+            "LONG S matches itself",
+            json!({ "response_body": contains("\u{17f}") }),
+            vec![g],
+        ),
+        ("not k", json!({ "response_body": not(contains("k")) }), all),
+        (
+            "(?i)k matches KELVIN SIGN",
+            json!({ "response_body": rx("(?i)^k$") }),
+            vec![f],
+        ),
+        (
+            "(?i) class matches LONG S",
+            json!({ "response_body": rx("(?i)^[r-t]$") }),
+            vec![g],
+        ),
+        (
+            "(?i)\\w matches KELVIN SIGN",
+            json!({ "response_body": rx(r"(?i)^\w$") }),
+            vec![f, g],
+        ),
+        (
+            "(?i)\\W does not",
+            json!({ "response_body": rx(r"(?i)^\W$") }),
+            vec![],
+        ),
+    ]);
+    for (name, filter, expected) in cases {
+        let query = branch(filter);
+        assert_eq!(ids(&store, &query).await, expected, "{name}");
+        assert_eq!(
+            store.count_requests(&query).await.unwrap(),
+            expected.len() as u64,
+            "{name} count"
+        );
+    }
+    // An explicit `(?s)` is the caller's choice and still lets `.` match.
+    let dotall =
+        branch(json!({ "request_body": { "op": "regex_match", "value": "(?s)line1.line2" } }));
+    assert_eq!(ids(&store, &dotall).await, vec![c, d]);
+    let mut ws_cases = boundary_ws_cases();
+    let payload = |filter: Value| json!({ "payload": filter });
+    ws_cases.extend([
+        (
+            "ws k does not match KELVIN SIGN",
+            payload(contains("k")),
+            vec![],
+        ),
+        (
+            "ws KELVIN SIGN matches itself",
+            payload(contains("\u{212a}")),
+            vec![uuid_n(603)],
+        ),
+        (
+            "ws LONG S matches itself",
+            payload(contains("\u{17f}")),
+            vec![uuid_n(604)],
+        ),
+    ]);
+    for (name, filter, expected) in ws_cases {
+        let query = wq(json!({ "branches": [filter] }));
+        let found: Vec<Uuid> = store
+            .search_ws(&query)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(found, expected, "{name}");
+        assert_eq!(
+            store.count_ws(&query).await.unwrap(),
+            expected.len() as u64,
+            "{name} count"
+        );
+    }
 
     admin
         .query(&format!("DROP DATABASE {database}"))

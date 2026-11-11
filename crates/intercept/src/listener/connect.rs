@@ -541,8 +541,6 @@ fn build_pipeline_event(
     port: u16,
     session: &crate::state::LocalSession,
 ) -> PipelineEvent {
-    let request_body_size = ex.request_body.len() as u64;
-    let response_body_size = ex.response_body.len() as u64;
     PipelineEvent {
         event_id: ex.event_id,
         session_id,
@@ -555,13 +553,13 @@ fn build_pipeline_event(
         path: ex.path,
         request_headers: ex.request_headers,
         request_body: ex.request_body,
-        request_body_size,
+        request_body_size: ex.request_body_size,
         request_body_truncated: ex.request_body_truncated,
         response_status: ex.status as u32,
         response_status_text: String::new(),
         response_headers: ex.response_headers,
         response_body: ex.response_body,
-        response_body_size,
+        response_body_size: ex.response_body_size,
         response_body_truncated: ex.response_body_truncated,
         timing: PipelineTimingInfo {
             total_ms: ex.duration_ms,

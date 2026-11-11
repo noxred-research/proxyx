@@ -25,3 +25,7 @@ tokio = { version = "1", features = ["net", "io-util", "time"], optional = true 
 [dev-dependencies]
 # For the async_bench example (requires a runtime + timer).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[[example]]
+name = "async_bench"
+required-features = ["async"]

@@ -124,8 +124,13 @@ fn classify_tunnel_prefix(prefix: &[u8]) -> Option<TunnelProtocol> {
     Some(TunnelProtocol::Opaque)
 }
 
+/// Classify the tunnel from the client's first bytes. `upstream` is the
+/// already dialed target: when it speaks first (SMTP, SSH, MySQL banners) the
+/// protocol is neither HTTP nor TLS, so the tunnel is opaque at once instead
+/// of holding the banner back until the handshake timeout.
 async fn sniff_tunnel_protocol(
     stream: &mut TcpStream,
+    upstream: Option<&TcpStream>,
     handshake_timeout: Duration,
 ) -> Result<(TunnelProtocol, Vec<u8>)> {
     let mut prefix = Vec::with_capacity(16);
@@ -135,7 +140,21 @@ async fn sniff_tunnel_protocol(
                 return Ok::<TunnelProtocol, std::io::Error>(protocol);
             }
             let mut byte = [0u8; 1];
-            if stream.read(&mut byte).await? == 0 {
+            let mut peeked = [0u8; 1];
+            let read = async {
+                match upstream {
+                    // `peek` resolves on data, EOF or error, never spuriously.
+                    Some(upstream) => tokio::select! {
+                        read = stream.read(&mut byte) => Some(read),
+                        _ = upstream.peek(&mut peeked) => None,
+                    },
+                    None => Some(stream.read(&mut byte).await),
+                }
+            };
+            let Some(read) = read.await else {
+                return Ok(TunnelProtocol::Opaque);
+            };
+            if read? == 0 {
                 return Ok(TunnelProtocol::Opaque);
             }
             prefix.push(byte[0]);
@@ -345,7 +364,7 @@ async fn report_failure(
     let response = failure.response(tunnel.host, tunnel.port);
     let answer = async move {
         let (protocol, prefix) =
-            sniff_tunnel_protocol(&mut stream, ctx.network.socks_handshake_timeout()).await?;
+            sniff_tunnel_protocol(&mut stream, None, ctx.network.socks_handshake_timeout()).await?;
         let mut client = PrefixedStream::new(prefix, stream);
         match protocol {
             TunnelProtocol::Http => answer_request(&mut client, &response).await.map(Some),
@@ -426,9 +445,15 @@ pub(super) async fn handle_socks5(
         drop(password); // not used — session_id is in the username
 
         let username_str = String::from_utf8_lossy(&username);
-        let session_id: Uuid = username_str.parse().map_err(|_| {
-            anyhow::anyhow!("invalid session_id in SOCKS5 username: {}", username_str)
-        })?;
+        let session_id: Uuid = match username_str.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                // RFC 1929 requires a failure reply before closing, even when
+                // the username cannot represent a session credential.
+                stream.write_all(&[AUTH_VERSION, 0x01]).await?;
+                anyhow::bail!("invalid session_id in SOCKS5 username");
+            }
+        };
 
         // Accept auth at protocol level whatever the lookup says: a missing
         // session or an unavailable backend is reported in band after the
@@ -557,10 +582,16 @@ pub(super) async fn handle_socks5(
     // scheme, so sniff the first client bytes instead of guessing from the
     // port. This keeps plaintext HTTP on nonstandard ports and TLS on
     // nonstandard ports both correct. Blind tunnels never wait for client
-    // bytes, so server-speaks-first protocols keep working.
+    // bytes, and an intercepted tunnel whose target speaks first (a banner)
+    // is treated as opaque the moment the target sends, so server-speaks-first
+    // protocols keep working without waiting for the handshake timeout.
     if decision.mitm {
-        let (protocol, prefix) =
-            sniff_tunnel_protocol(&mut stream, ctx.network.socks_handshake_timeout()).await?;
+        let (protocol, prefix) = sniff_tunnel_protocol(
+            &mut stream,
+            Some(&upstream),
+            ctx.network.socks_handshake_timeout(),
+        )
+        .await?;
         let mut client = PrefixedStream::new(prefix, stream);
         match protocol {
             TunnelProtocol::Http => {
@@ -678,6 +709,50 @@ mod tests {
             classify_tunnel_prefix(b"GET /health HTTP/1.1\r\n"),
             Some(TunnelProtocol::Http)
         );
+    }
+
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn a_target_that_speaks_first_is_opaque_without_waiting_for_the_client() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_stream, _client_end) = tcp_pair().await;
+        let (upstream, mut target) = tcp_pair().await;
+        target.write_all(b"220 hello\r\n").await.unwrap();
+        let started = std::time::Instant::now();
+        let (protocol, prefix) = super::sniff_tunnel_protocol(
+            &mut client_stream,
+            Some(&upstream),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(protocol, TunnelProtocol::Opaque);
+        assert!(prefix.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_silent_target_still_lets_the_client_choose_the_protocol() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_stream, mut client_end) = tcp_pair().await;
+        let (upstream, _target) = tcp_pair().await;
+        client_end.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        let (protocol, prefix) = super::sniff_tunnel_protocol(
+            &mut client_stream,
+            Some(&upstream),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(protocol, TunnelProtocol::Http);
+        assert_eq!(prefix, b"GET ");
     }
 
     #[test]

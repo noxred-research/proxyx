@@ -33,28 +33,31 @@ described in [policies.md](policies.md); every configuration key is listed in
 | --- | --- | --- | --- | --- |
 | `connect` | `0.0.0.0:8080` | `connect_listen` (`PROXYX_POOL_CONNECT_LISTEN`) | HTTP CONNECT | org key `ak_...` |
 | `socks` | `0.0.0.0:1080` | `socks_listen` (`PROXYX_POOL_SOCKS_LISTEN`) | SOCKS5, username/password | org key `ak_...` |
-| `probe` | `0.0.0.0:8082` | `probe_listen` (`PROXYX_POOL_PROBE_LISTEN`) | HTTP CONNECT | signed probe token |
+| `probe` | `0.0.0.0:8082` | `probe_listen` (`PROXYX_POOL_PROBE_LISTEN`) | HTTP CONNECT and plain HTTP forwarding for probe pages | signed probe token |
 | control API | `0.0.0.0:8081` | `api_listen` (`PROXYX_POOL_API_LISTEN`) | HTTP/1.1 JSON, see [Control API](#control-api) | admin, prober or org credential |
 | ops | `0.0.0.0:8888` | `ops_listen` (`PROXYX_POOL_OPS_LISTEN`) | HTTP: `/healthz`, `/readyz`, `/metrics` | none |
 
 The `connect` and `socks` listeners are the public data plane. The `probe` listener exists for the
 prober's browsers only; it is described under [Authentication](#authentication). The ops server starts
 before Postgres and Redis are connected: `/healthz` answers `200` from the first moment, `/readyz`
-answers `503 starting` until the first configuration snapshot is loaded, then `200` while Redis
-answers (three failed checks in a row turn it `503 redis unavailable`), and `503 draining` from the
-stop request on. See [operations.md](operations.md) and [metrics/pool.md](metrics/pool.md).
+answers `503 starting` until the first configuration snapshot is loaded and every configured gateway
+listener (CONNECT, SOCKS5, probe and control API) has bound successfully. It then answers `200` while
+Redis answers (three failed checks in a row turn it `503 redis unavailable`), and `503 draining` from
+the stop request on. A listener bind failure stops the role without publishing readiness.
+See [operations.md](operations.md) and [metrics/pool.md](metrics/pool.md).
 
 ## Protocols
 
 The gateway tunnels TCP. It supports exactly two client protocols:
 
-- **HTTP CONNECT** (`connect` and `probe` listeners). Any other method, including a plain
-  `GET http://...` proxy request, is refused with `405 Method Not Allowed`.
+- **HTTP CONNECT** (`connect` and `probe` listeners). The public `connect` listener refuses any other
+  method, including `GET http://...`, with `405 Method Not Allowed`. The probe listener also forwards
+  plain HTTP requests for configured probe pages, as described below.
 - **SOCKS5 with username/password** (RFC 1928, RFC 1929), `CONNECT` command only. `BIND` and
   `UDP ASSOCIATE` are refused with reply `0x07`.
 
-There is no TLS on the listeners, no HTTP proxying of plain requests, no UDP, and no SOCKS4. The
-gateway does not look inside tunnel bytes.
+There is no TLS on the listeners, no public plain-HTTP forward proxy, no UDP, and no SOCKS4. The
+gateway does not look inside CONNECT or SOCKS tunnel bytes.
 
 ### HTTP CONNECT
 
@@ -79,6 +82,24 @@ Every refusal carries `Content-Length: 0` and `Connection: close`. For a refusal
 [cause code](#cause-codes), the reason phrase is the code, for example `HTTP/1.1 503 cache_empty`.
 Clients that print the proxy's status line therefore show the cause directly.
 
+### Plain HTTP probe pages
+
+The probe listener accepts absolute-form `http://host[:port]/path` requests so browser probes can load
+HTTP pages and assets. HTTPS still uses CONNECT. Authentication uses the same signed probe token,
+probe-target allowlist, destination checks, policies, leased upstreams and traffic accounting as CONNECT;
+the public listeners do not gain this feature.
+
+Each connection carries one HTTP exchange and closes afterward. The gateway sends origin-form requests,
+strips proxy credentials and hop-by-hop headers, and forwards only the declared request body, never a
+pipelined second request. `Host` must match the URL authority. Duplicate framing or authorization fields,
+both `Transfer-Encoding` and `Content-Length`, URL credentials and fragments are refused with `400`.
+Bodies may use a decimal `Content-Length` or `Transfer-Encoding: chunked`; other transfer codings are
+refused. Chunk lines are limited to 1 KiB; trailers are checked and discarded. Request and response
+heads retain the 8 KiB and 32-header limits. Protocol upgrades are not supported.
+
+The origin's final HTTP response carries the gateway's `X-ProxyX-Pool-Session` and `X-ProxyX-Exit-IP`
+headers. Origin-supplied correlation headers cannot override them.
+
 ### SOCKS5
 
 1. The client greeting must offer method `0x02` (username/password). Otherwise the gateway answers
@@ -91,8 +112,8 @@ Clients that print the proxy's status line therefore show the cause directly.
 4. Success is reply `0x00` with a zero bound address. A refusal uses the SOCKS5 reply column of the
    [cause table](#cause-codes).
 
-SOCKS5 has no place for response headers, so the `X-ProxyX-*` correlation headers are an HTTP CONNECT
-feature.
+SOCKS5 has no place for response headers. The `X-ProxyX-*` correlation headers are an HTTP CONNECT
+and plain HTTP probe feature.
 
 ### Pre-auth timeouts
 
@@ -408,6 +429,9 @@ when the credential has a username; only `200` is accepted, `407` is a credentia
 For scheme `https`, the gateway first establishes TLS to the provider proxy endpoint, validates its
 certificate chain and hostname, then sends HTTP CONNECT inside TLS. This encrypts provider credentials
 and the client-to-provider hop; it is not TLS interception.
+Admission checks and tunnel dialing both load native trust roots. A private-CA HTTPS proxy must be
+trusted by the host (or by an isolated process's native-root configuration, such as `SSL_CERT_FILE`);
+certificate-chain and hostname checks remain enabled.
 
 **Stage timeouts** of one attempt: DNS 1 s (skipped for an IP literal), TCP connect 2 s over all
 addresses, handshake 3 s. Each stage is recorded in `dial_duration_seconds{provider,stage}`.
@@ -466,7 +490,9 @@ never replaced by a shared IP.
 and warmer replica through Redis. Five provider failures within 60 s open it; while open, the walk
 skips the partition (`breaker_skips_total`) and answers `provider_unavailable` if nothing else serves.
 The first probe is allowed 5 s after opening and each failed probe doubles the wait up to 5 minutes (5,
-10, 20, 40, 80, 160, 300 s); three passes close it. A failure counts for the breaker when the provider
+10, 20, 40, 80, 160, 300 s); three passing provider operations close it. Both an on-demand session
+create and its subsequent dial can pass, so recovery need not take three separate client tunnels.
+A failure counts for the breaker when the provider
 could not be reached or rejected the login, once per tunnel that ends refused or served by another
 provider. A status or SOCKS reply is an answer, and a local resource limit (no free port or descriptor)
 or a customer upstream failing is not counted.
@@ -487,7 +513,7 @@ A keeper task per tunnel runs every 5 s, separately from the relay, so a slow Re
 - Pushes the tunnel's counters forward (a tunnel counts for 15 s unless touched), renews the lease when
   bytes moved, records the traffic for load spreading, and meters bytes against the provider's daily
   budget, the org's daily budget and, for a static IP, its monthly fair-use traffic (a warning at 80%,
-  and at 100% the IP takes no new lease until the month ends).
+  and at 100% the IP is used only as a last resort when no unit remains within the soft limits).
 - Keeps the session record resolvable for block signals (`X-ProxyX-Pool-Session`): it is stored before
   the `200`, refreshed every third of its 10-minute life while the tunnel is open, and lapses after.
 - Closes the tunnel at its next tick when an [org block](#post-v1org-blocks) covers its unit, on every
@@ -632,9 +658,9 @@ names the person but does not authenticate them. A malformed value is `400`.
 ### Conventions
 
 - **Bodies** are JSON objects with `Content-Type: application/json` (`application/*+json` is accepted).
-  A missing content type is `415`; a malformed body, a JSON array where an object is required, or an
-  unknown field on a strict body is `400`. `POST /v1/block-signals` and `PUT /v1/inventory/{provider}`
-  are the routes whose body shape differs, as noted below.
+  A missing or non-JSON content type is `415`; a malformed body, a JSON array where an object is
+  required, or an unknown field on a strict body is `400`. Creating an org key with no body needs no
+  content type. `POST /v1/block-signals` takes an array; the other body routes take objects.
 - **Timestamps** in responses are Unix seconds.
 - A body above 4 MiB is `413`. A request, including its storage calls, must finish within 15 s or the
   answer is `504 request timed out`. A client has 10 s to send a whole request head.
@@ -683,6 +709,9 @@ instead of `401`. A correct bearer token always passes. The counts are per pod, 
 | `PUT` | [`/v1/orgs/{org}/cache-policy`](#put-v1orgsorgcache-policy) | admin |
 | `POST` | [`/v1/orgs/{org}/keys`](#post-v1orgsorgkeys) | admin |
 | `DELETE` | [`/v1/orgs/{org}/keys`](#delete-v1orgsorgkeys) | admin |
+| `POST` | [`/v1/orgs/{org}/endpoints`](#post-v1orgsorgendpoints) | admin |
+| `GET` | [`/v1/orgs/{org}/sessions`](#get-v1orgsorgsessions) | admin |
+| `DELETE` | [`/v1/orgs/{org}/sessions/{sid}`](#delete-v1orgsorgsessionssid) | admin |
 | `GET` | [`/v1/orgs/{org}/upstream`](#get-v1orgsorgupstream) | admin |
 | `PUT` | [`/v1/orgs/{org}/upstream`](#put-v1orgsorgupstream) | admin |
 | `DELETE` | [`/v1/orgs/{org}/upstream`](#delete-v1orgsorgupstream) | admin |
@@ -1021,7 +1050,7 @@ Set the org's own upstream proxy. The unit starts as `candidate` and nothing lea
 
 | Field | Meaning |
 | --- | --- |
-| `scheme` | `http` (CONNECT) or `socks5`; `local` is refused with `400`. |
+| `scheme` | `http` (CONNECT), `https` (TLS-protected CONNECT) or `socks5`; `local` is refused with `400`. |
 | `host` | A plain DNS name or IP literal, without scheme, port, path or login. |
 | `port` | 1 to 65535. |
 | `region` | Where the upstream exits, as the org's policy regions name it. |

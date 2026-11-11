@@ -21,7 +21,7 @@ pub(crate) async fn upsert_view_job(
         .execute(&mut *tx)
         .await?;
     let row = sqlx::query_as(d::sql!(
-        "SELECT status, s3_key, error FROM traffic_view_jobs WHERE view_id = ?"
+        "SELECT status, s3_key, error, query_id FROM traffic_view_jobs WHERE view_id = ?"
     ))
     .bind(view_id)
     .fetch_one(&mut *tx)
@@ -95,6 +95,26 @@ pub(crate) async fn complete_view_job(pool: &d::Pool, view_id: Uuid, s3_key: &st
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub(crate) async fn fail_view_job(
+    pool: &d::Pool,
+    view_id: Uuid,
+    query_id: &str,
+    error: &str,
+) -> DbResult<bool> {
+    let failed = sqlx::query(d::sql!(concat!(
+        "UPDATE traffic_view_jobs SET status = 'failed', error = ?, updated_at = ",
+        d::now!(),
+        " WHERE view_id = ? AND query_id = ? AND status IN ('pending', 'running')"
+    )))
+    .bind(error)
+    .bind(view_id)
+    .bind(query_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(failed > 0)
 }
 
 pub(crate) async fn delete_view_job(pool: &d::Pool, view_id: Uuid) -> DbResult<()> {

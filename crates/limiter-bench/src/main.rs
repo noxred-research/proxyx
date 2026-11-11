@@ -15,6 +15,13 @@ const DEFAULT_ADDR: &str = "127.0.0.1:39091";
 const DEFAULT_OPS: usize = 1_000_000;
 const DEFAULT_CLIENTS: usize = 32;
 const DEFAULT_BATCH: usize = 32;
+/// Most connections (one thread each).
+const MAX_CLIENTS: usize = 4096;
+/// Most consumes in one frame: `MAX_BATCH` of the limiter protocol, above which the server
+/// refuses the frame.
+const MAX_BATCH: usize = 4096;
+const MAX_PIPELINE_DEPTH: usize = 1024;
+const MAX_OPS: usize = 1 << 40;
 
 // One shared working set of named buckets, addressed by handle. Power of two so
 // the pick masks are cheap.
@@ -63,18 +70,38 @@ impl Lcg {
     }
 }
 
+const USAGE: &str =
+    "usage: limiter-bench [ADDR [OPS [CLIENTS [BATCH [WORKLOAD [PIPELINE_DEPTH]]]]]]\n\
+  ADDR            limiter host:port (default 127.0.0.1:39091)\n\
+  OPS             total consumes per workload, CLIENTS to 2^40 (default 1000000)\n\
+  CLIENTS         connections, 1 to 4096 (default 32)\n\
+  BATCH           consumes per frame, 1 to 4096 (default 32)\n\
+  WORKLOAD        all, uniform, zipfian, concurrent or openloop_rate_limited (default all)\n\
+  PIPELINE_DEPTH  frames in flight per connection, 1 to 1024 (default 1)";
+
+/// A command-line error: say what was wrong and how to call the tool, exit 2.
+fn usage_error(message: &str) -> ! {
+    eprintln!("limiter-bench: {message}\n{USAGE}");
+    std::process::exit(2);
+}
+
 fn arg_string(index: usize, default: &str) -> String {
     env::args()
         .nth(index)
         .unwrap_or_else(|| default.to_string())
 }
 
-fn arg_usize(index: usize, default: usize) -> usize {
-    env::args()
-        .nth(index)
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
+/// A positive integer argument within `1..=max`; a missing one is `default`.
+fn arg_usize(index: usize, name: &str, default: usize, max: usize) -> usize {
+    let Some(text) = env::args().nth(index) else {
+        return default;
+    };
+    match text.parse::<usize>() {
+        Ok(value) if (1..=max).contains(&value) => value,
+        _ => usage_error(&format!(
+            "{name} must be an integer from 1 to {max}, got {text:?}"
+        )),
+    }
 }
 
 fn p99(latencies: &mut [(u128, usize)], operations: usize) -> u128 {
@@ -280,22 +307,25 @@ fn run_workload(
 }
 
 fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{USAGE}");
+        return;
+    }
+    if args.len() > 6 {
+        usage_error(&format!("expected at most 6 arguments, got {}", args.len()));
+    }
     let addr = arg_string(1, DEFAULT_ADDR);
-    let ops = arg_usize(2, DEFAULT_OPS);
-    let clients = arg_usize(3, DEFAULT_CLIENTS);
-    let batch = arg_usize(4, DEFAULT_BATCH);
+    let ops = arg_usize(2, "OPS", DEFAULT_OPS, MAX_OPS);
+    let clients = arg_usize(3, "CLIENTS", DEFAULT_CLIENTS, MAX_CLIENTS);
+    let batch = arg_usize(4, "BATCH", DEFAULT_BATCH, MAX_BATCH);
     let selection = arg_string(5, "all");
-    let pipeline_depth = arg_usize(6, 1);
-
-    // Persistent connection pool, established once before timing and reused
-    // across every selected workload (connect/handshake never lands in a
-    // measured window).
-    let mut conns: Vec<Connection> = (0..clients)
-        .map(|_| Connection::connect(&addr).expect("connect service"))
-        .collect();
-
-    // Working set created once on the first connection.
-    let handles = Arc::new(create_working_set(&mut conns[0]));
+    let pipeline_depth = arg_usize(6, "PIPELINE_DEPTH", 1, MAX_PIPELINE_DEPTH);
+    if ops < clients {
+        usage_error(&format!(
+            "OPS ({ops}) must be at least CLIENTS ({clients}): each client runs OPS / CLIENTS consumes"
+        ));
+    }
 
     let workloads: &[Workload] = &[
         (
@@ -323,27 +353,43 @@ fn main() {
             rate_limited_pick,
         ),
     ];
+    let selected = |(name, aliases, _, _): &&Workload| {
+        selection == *name || aliases.contains(&selection.as_str())
+    };
+    if !workloads.iter().any(|w| selected(&w)) {
+        usage_error(&format!("unknown workload {selection:?}"));
+    }
+
+    // Persistent connection pool, established once before timing and reused
+    // across every selected workload (connect/handshake never lands in a
+    // measured window).
+    let mut conns: Vec<Connection> = (0..clients)
+        .map(|_| {
+            Connection::connect(&addr).unwrap_or_else(|error| {
+                eprintln!("limiter-bench: cannot connect to {addr}: {error}");
+                std::process::exit(1);
+            })
+        })
+        .collect();
+
+    // Working set created once on the first connection.
+    let handles = Arc::new(create_working_set(&mut conns[0]));
 
     let mut rows = Vec::new();
-    for (name, aliases, amount, pick) in workloads {
-        if selection == *name || aliases.contains(&selection.as_str()) {
-            let (row, next) = run_workload(
-                name,
-                ops,
-                clients,
-                batch,
-                pipeline_depth,
-                *amount,
-                Arc::clone(&handles),
-                conns,
-                *pick,
-            );
-            rows.push(row);
-            conns = next;
-        }
-    }
-    if rows.is_empty() {
-        panic!("unknown workload selection: {selection}");
+    for (name, _, amount, pick) in workloads.iter().filter(selected) {
+        let (row, next) = run_workload(
+            name,
+            ops,
+            clients,
+            batch,
+            pipeline_depth,
+            *amount,
+            Arc::clone(&handles),
+            conns,
+            *pick,
+        );
+        rows.push(row);
+        conns = next;
     }
     drop(conns);
 

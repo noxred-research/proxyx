@@ -125,8 +125,10 @@ Status columns: **fail** stops the role from starting or working, **warn** is wo
 
 | Check | What it looks at | Status |
 |---|---|---|
-| `config.max_buckets`, `config.shards`, `config.reaper_ms` | The limiter silently uses its default for a value that is not a positive integer; the doctor says so. | warn |
-| `listen.limiter` | The listen address parses and can be bound. | fail |
+| `config.max_buckets`, `config.shards`, `config.reaper_ms`, `config.max_connections`, `config.idle_timeout_ms` | The limiter silently uses its default for a value that is not a positive integer; the doctor says so. | warn |
+| `config.tcp_keepalive_secs` | A non-negative integer; `0` disables keepalive. Invalid values use the default. | warn |
+| `listen.limiter`, `listen.metrics` | The data listener and optional `PROXYX_LIMITER_METRICS_ADDR` parse and can be bound; `--skip-listeners` skips binding, not address validation. | fail |
+| `listen.distinct` | Data and metrics listeners must not collide, even with `--skip-listeners`. | fail |
 | `system.open_files` | At least 1024 descriptors (one per client connection). | fail |
 
 ### Edge

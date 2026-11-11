@@ -60,7 +60,7 @@ python3 -m venv .venv && .venv/bin/pip install -e 'prober[dev]'
 .venv/bin/python -m pytest -q prober/tests && .venv/bin/ruff check prober
 ```
 
-If you touch `docker/`, run `docker compose -f docker/docker-compose.yml config` and build the image.
+If you touch `docker/`, run `docker compose -f docker/docker-compose.yml config` for every profile you changed and build the image. Run `bash -n` separately on each of `docker/dev-init.sh`, `docker/entrypoint.egress.sh` and `ci/bench-smoke.sh`, then run `shellcheck docker/dev-init.sh docker/entrypoint.egress.sh ci/bench-smoke.sh`.
 
 ## Coding standards
 

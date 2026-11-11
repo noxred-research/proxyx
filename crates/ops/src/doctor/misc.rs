@@ -1,5 +1,6 @@
 //! Edge, limiter and the session proxy.
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -56,31 +57,19 @@ pub(crate) async fn limiter(ctx: &Ctx) -> Vec<Check> {
         ("PROXYX_LIMITER_MAX_BUCKETS", "bucket capacity"),
         ("PROXYX_LIMITER_SHARDS", "shard count"),
         ("PROXYX_LIMITER_REAPER_MS", "reaper interval"),
+        ("PROXYX_LIMITER_MAX_CONNECTIONS", "connection cap"),
+        ("PROXYX_LIMITER_IDLE_TIMEOUT_MS", "idle timeout"),
+        (
+            "PROXYX_LIMITER_TCP_KEEPALIVE_SECS",
+            "TCP keepalive interval",
+        ),
     ] {
         out.push(limiter_var(var, what, std::env::var(var).ok().as_deref()));
     }
-    let addr = ctx
-        .limiter_addr
-        .clone()
-        .unwrap_or_else(|| proxyx_limiter_server::DEFAULT_LISTEN.to_owned());
-    match addr.parse::<std::net::SocketAddr>() {
-        Ok(parsed) if ctx.skip_listeners => {
-            out.push(Check::skip(
-                "listen.limiter",
-                format!("limiter listener {parsed}: not tried (--skip-listeners)"),
-            ));
-        }
-        Ok(parsed) => out.push(port_check("listen.limiter", "limiter listener", parsed)),
-        Err(error) => out.push(
-            Check::fail(
-                "listen.limiter",
-                format!("limiter address {addr:?} is not host:port: {error}"),
-            )
-            .hint(
-                "`proxyx limiter [ADDR]` takes an IP address and port, for example 0.0.0.0:39091",
-            ),
-        ),
-    }
+    out.extend(limiter_listeners(
+        ctx,
+        std::env::var("PROXYX_LIMITER_METRICS_ADDR").ok().as_deref(),
+    ));
     // One thread and one descriptor per client connection.
     out.push(files::fd_limit(
         1024,
@@ -89,15 +78,91 @@ pub(crate) async fn limiter(ctx: &Ctx) -> Vec<Check> {
     out
 }
 
+fn limiter_listeners(ctx: &Ctx, metrics_addr: Option<&str>) -> Vec<Check> {
+    let mut out = Vec::new();
+    let listener = |id: &str, label: &str, addr: SocketAddr| {
+        if ctx.skip_listeners {
+            Check::skip(id, format!("{label} {addr}: not tried (--skip-listeners)"))
+        } else {
+            port_check(id, label, addr)
+        }
+    };
+    let addr = ctx
+        .limiter_addr
+        .as_deref()
+        .unwrap_or(proxyx_limiter_server::DEFAULT_LISTEN);
+    let data_addr = match addr.parse::<SocketAddr>() {
+        Ok(parsed) => {
+            out.push(listener("listen.limiter", "limiter listener", parsed));
+            Some(parsed)
+        }
+        Err(error) => {
+            out.push(
+                Check::fail(
+                    "listen.limiter",
+                    format!("limiter address {addr:?} is not host:port: {error}"),
+                )
+                .hint(
+                    "`proxyx limiter [ADDR]` takes an IP address and port, for example 0.0.0.0:39091",
+                ),
+            );
+            None
+        }
+    };
+    let Some(metrics_addr) = metrics_addr.filter(|v| !v.trim().is_empty()) else {
+        out.push(Check::skip(
+            "listen.metrics",
+            "PROXYX_LIMITER_METRICS_ADDR is unset or empty: metrics listener disabled",
+        ));
+        return out;
+    };
+    match metrics_addr.parse::<SocketAddr>() {
+        Ok(parsed) => {
+            out.push(listener(
+                "listen.metrics",
+                "limiter metrics listener",
+                parsed,
+            ));
+            if let Some(data_addr) = data_addr {
+                let clash = parsed.port() != 0
+                    && parsed.port() == data_addr.port()
+                    && (parsed.ip() == data_addr.ip()
+                        || parsed.ip().is_unspecified()
+                        || data_addr.ip().is_unspecified());
+                out.push(if clash {
+                    Check::fail(
+                        "listen.distinct",
+                        format!("limiter listener {data_addr} and metrics listener {parsed} use the same port"),
+                    )
+                    .hint("give every listener its own port")
+                } else {
+                    Check::pass("listen.distinct", "the listeners use distinct ports")
+                });
+            }
+        }
+        Err(error) => out.push(
+            Check::fail(
+                "listen.metrics",
+                format!("PROXYX_LIMITER_METRICS_ADDR = {metrics_addr:?} is not host:port: {error}"),
+            )
+            .hint("set an IP address and port, for example 127.0.0.1:39092, or unset it"),
+        ),
+    }
+    out
+}
+
 fn limiter_var(var: &str, what: &str, value: Option<&str>) -> Check {
     let id = format!(
         "config.{}",
         var.trim_start_matches("PROXYX_LIMITER_").to_lowercase()
     );
+    let allows_zero = var == "PROXYX_LIMITER_TCP_KEEPALIVE_SECS";
     match value {
         None => Check::pass(id, format!("{var} is unset: the default {what} applies")),
         Some(v) => match v.parse::<u64>() {
-            Ok(n) if n > 0 => Check::pass(id, format!("{var} = {n}")),
+            Ok(n) if n > 0 || allows_zero => Check::pass(id, format!("{var} = {n}")),
+            _ if allows_zero => Check::warn(id, format!("{var} = {v:?} is not a non-negative integer: the limiter ignores it and uses the default {what}"))
+                .hint("set a non-negative whole number (zero disables keepalive), or unset it"),
             _ => Check::warn(id, format!("{var} = {v:?} is not a positive integer: the limiter ignores it and uses the default {what}"))
                 .hint("set a positive whole number, or unset it"),
         },
@@ -262,5 +327,114 @@ mod tests {
             limiter_var("PROXYX_LIMITER_MAX_BUCKETS", "x", None).id,
             "config.max_buckets"
         );
+    }
+
+    #[test]
+    fn limiter_connection_cap_and_idle_timeout_require_positive_integers() {
+        for (var, id) in [
+            ("PROXYX_LIMITER_MAX_CONNECTIONS", "config.max_connections"),
+            ("PROXYX_LIMITER_IDLE_TIMEOUT_MS", "config.idle_timeout_ms"),
+        ] {
+            for value in [None, Some("1"), Some("1234")] {
+                let check = limiter_var(var, "setting", value);
+                assert_eq!(check.id, id);
+                assert_eq!(check.status, Status::Pass, "{var} = {value:?}");
+            }
+            for bad in ["0", "-1", "many", "", "18446744073709551616"] {
+                let check = limiter_var(var, "setting", Some(bad));
+                assert_eq!(check.status, Status::Warn, "{var} = {bad:?}");
+                assert!(check.message.contains("uses the default"));
+            }
+        }
+    }
+
+    #[test]
+    fn limiter_keepalive_accepts_zero_and_warns_on_malformed_values() {
+        let var = "PROXYX_LIMITER_TCP_KEEPALIVE_SECS";
+        for value in [None, Some("0"), Some("60"), Some("18446744073709551615")] {
+            let check = limiter_var(var, "TCP keepalive interval", value);
+            assert_eq!(check.id, "config.tcp_keepalive_secs");
+            assert_eq!(check.status, Status::Pass, "{value:?}");
+        }
+        for bad in ["-1", "many", "", "18446744073709551616"] {
+            let check = limiter_var(var, "TCP keepalive interval", Some(bad));
+            assert_eq!(check.status, Status::Warn, "{bad:?}");
+            assert!(
+                check
+                    .message
+                    .contains("uses the default TCP keepalive interval")
+            );
+        }
+    }
+
+    #[test]
+    fn limiter_metrics_unset_or_empty_disables_the_listener() {
+        for value in [None, Some(""), Some(" \t")] {
+            let checks = limiter_listeners(&ctx(), value);
+            let metrics = checks
+                .iter()
+                .find(|c| c.id == "listen.metrics")
+                .expect("metrics check");
+            assert_eq!(metrics.status, Status::Skip, "{value:?}");
+            assert!(metrics.message.contains("disabled"));
+            assert!(!checks.iter().any(|c| c.id == "listen.distinct"));
+        }
+    }
+
+    #[test]
+    fn limiter_metrics_requires_a_socket_address_even_when_listeners_are_skipped() {
+        for bad in ["not-an-address", "localhost:39092", "127.0.0.1:65536"] {
+            let checks = limiter_listeners(&ctx(), Some(bad));
+            let metrics = checks
+                .iter()
+                .find(|c| c.id == "listen.metrics")
+                .expect("metrics check");
+            assert_eq!(metrics.status, Status::Fail, "{bad:?}");
+        }
+        for addr in ["127.0.0.1:39092", "[::1]:39092"] {
+            let checks = limiter_listeners(&ctx(), Some(addr));
+            for id in ["listen.limiter", "listen.metrics"] {
+                let check = checks.iter().find(|c| c.id == id).expect("listener check");
+                assert_eq!(check.status, Status::Skip, "{addr}");
+                assert!(check.message.contains("--skip-listeners"));
+            }
+        }
+    }
+
+    #[test]
+    fn limiter_metrics_checks_an_occupied_port() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve listener");
+        let addr = occupied.local_addr().expect("listener address").to_string();
+        let mut ctx = ctx();
+        ctx.skip_listeners = false;
+        ctx.limiter_addr = Some("127.0.0.1:0".to_owned());
+        let checks = limiter_listeners(&ctx, Some(&addr));
+        let metrics = checks
+            .iter()
+            .find(|c| c.id == "listen.metrics")
+            .expect("metrics check");
+        assert_eq!(metrics.status, Status::Fail);
+    }
+
+    #[test]
+    fn limiter_data_and_metrics_listener_collisions_fail_even_when_skipped() {
+        for (data, metrics, status) in [
+            ("127.0.0.1:39091", "127.0.0.1:39091", Status::Fail),
+            ("0.0.0.0:39091", "127.0.0.1:39091", Status::Fail),
+            ("127.0.0.1:39091", "0.0.0.0:39091", Status::Fail),
+            ("[::]:39091", "[::1]:39091", Status::Fail),
+            ("127.0.0.1:39091", "127.0.0.1:39092", Status::Pass),
+            ("127.0.0.1:39091", "127.0.0.2:39091", Status::Pass),
+            ("127.0.0.1:0", "127.0.0.1:0", Status::Pass),
+        ] {
+            let mut ctx = ctx();
+            ctx.limiter_addr = Some(data.to_owned());
+            let checks = limiter_listeners(&ctx, Some(metrics));
+            let distinct = checks
+                .iter()
+                .find(|c| c.id == "listen.distinct")
+                .expect("distinct check");
+            assert_eq!(distinct.status, status, "{data}, {metrics}");
+        }
     }
 }

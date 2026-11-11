@@ -437,15 +437,20 @@ def _last_posted(kind: str) -> float | None:
     )
 
 
+@pytest.mark.parametrize("document", [False, True])
 async def test_a_refused_probe_token_reports_nothing_and_backs_off(
-    tmp_path: Path,
+    tmp_path: Path, document: bool
 ) -> None:
     # A token the listener does not accept makes every CONNECT answer
     # 407. That says nothing about the route: posting it would drain a healthy
     # route class.
     settings = settings_for(tmp_path, max_concurrent_probes=1)
-    refused = ProxyCredentialsRejected(
-        "net::ERR_INVALID_AUTH_CREDENTIALS at https://ok.test/"
+    refused = (
+        page(status=407)
+        if document
+        else ProxyCredentialsRejected(
+            "net::ERR_INVALID_AUTH_CREDENTIALS at https://ok.test/"
+        )
     )
     driver = FakeDriver({OK_URL: refused})
     prober, api, browsers, _ = build(

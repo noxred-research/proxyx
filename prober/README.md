@@ -23,6 +23,23 @@ the measuring equipment (Chromium does not launch, no probe token, the listener
 refuses the token with `407`) is never reported: the prober pauses with
 exponential backoff and reruns the job.
 
+Chromium may expose a rejected proxy login either as a navigation error or as
+an HTTP `407` document. Both are equipment failures: the entire attempt is
+discarded, a fresh probe token is fetched after backoff, and no route result is
+posted. A temporarily missing, empty, unreadable, or invalid-UTF-8 control API
+token file also uses the bounded request retries. Polling resumes after the
+secret is restored or rotated; secret contents are never included in errors.
+
+For an HTTPS target, Chromium can hide a proxy authentication challenge until
+navigation times out. The driver then checks the same target authority with
+the original proxy credentials. This diagnostic uses the configured proxy
+transport (including TLS verification), has a one-second deadline and a
+4 KiB response-head limit, and always closes its connection. Only an explicit
+proxy `407` changes the timeout into an equipment failure. A successful
+CONNECT, DNS/connect failure, oversized or incomplete reply, `5xx`, or diagnostic
+timeout leaves the original route timeout unchanged. Successful navigations
+never perform this extra check.
+
 The wire contract is documented in `src/proxyx_prober/contract.py`. The
 control API side is `crates/pool-api/src/probe.rs`; the listener is described
 in `crates/gateway/src/lib.rs`. The metrics are listed under "Prober" in
@@ -91,6 +108,16 @@ ruff check . && ruff format --check .
 
 The tests use fakes for Chromium and the control API, so they need no browser
 download and no network.
+
+For a runtime check, install Chromium and run the installed `proxyx-prober`
+console script against an authenticated local proxy and fixture pages. Verify
+successful navigation timings, HTTP errors, block pages, and navigation
+timeouts. Inject `407`, unavailable probe tokens, and a missing Chromium
+executable separately: these must produce retry metrics without route results.
+Rotate the control API token file while the process runs, inspect `/metrics`,
+and send `SIGTERM` during an active navigation to check browser cleanup.
+Protocol stubs test failure handling, not gateway authentication or policy;
+exercise the real gateway probe listener and control API separately.
 
 ## License
 

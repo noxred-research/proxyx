@@ -87,7 +87,9 @@ fn init_logging(cfg: &Config) {
     use tracing_subscriber::EnvFilter;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log.level));
-    let b = tracing_subscriber::fmt().with_env_filter(filter);
+    let b = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     let _ = if cfg.log.json {
         b.json().try_init()
     } else {
