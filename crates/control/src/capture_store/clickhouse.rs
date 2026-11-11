@@ -195,7 +195,7 @@ impl CaptureStore for ClickHouseStore {
         let mut q = self
             .client
             .query(&sql)
-            .with_option("max_execution_time", "30");
+            .with_setting("max_execution_time", "30");
         for b in &binds {
             q = q.bind(b);
         }
@@ -505,8 +505,8 @@ impl ViewExporter for ClickHouseStore {
         let mut q = self
             .client
             .query(&insert_sql)
-            .with_option("query_id", qid)
-            .with_option("wait_end_of_query", "0");
+            .with_setting("query_id", qid)
+            .with_setting("wait_end_of_query", "0");
 
         for b in &binds {
             q = q.bind(b.as_str());

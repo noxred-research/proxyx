@@ -179,9 +179,7 @@ fn generated_trace_matches_reference() {
             now_ns.wrapping_add(seed % 2_000_000)
         };
 
-        let actual;
-        let expected;
-        if step % 29 == 0 {
+        let (actual, expected) = if step % 29 == 0 {
             let capacity = if step % 58 == 0 {
                 Some(500_000 + (seed % 4_000_000))
             } else {
@@ -192,13 +190,17 @@ fn generated_trace_matches_reference() {
             } else {
                 None
             };
-            actual = bucket.update(now_ns, capacity, refill_rate);
-            expected = reference.update(now_ns, capacity, refill_rate);
+            (
+                bucket.update(now_ns, capacity, refill_rate),
+                reference.update(now_ns, capacity, refill_rate),
+            )
         } else {
             let amount = 1 + (seed % 25_000);
-            actual = bucket.consume(amount, now_ns);
-            expected = reference.consume(amount, now_ns);
-        }
+            (
+                bucket.consume(amount, now_ns),
+                reference.consume(amount, now_ns),
+            )
+        };
         assert_eq!(actual, expected, "step {step}");
     }
 }

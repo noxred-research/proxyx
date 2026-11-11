@@ -28,9 +28,13 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{Sampler, SdkTracerProvider},
 };
-use sentry_tracing::EventFilter;
+use sentry_tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::filter::{LevelFilter, filter_fn};
+use tracing_subscriber::layer::{Layer, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt as _};
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 const DEFAULT_SAMPLE_RATIO: f64 = 0.1;
@@ -111,6 +115,25 @@ fn build_provider(service_name: &str) -> anyhow::Result<SdkTracerProvider> {
     Ok(provider)
 }
 
+/// Sentry layers: ERROR is an error event, WARN and INFO are breadcrumbs on
+/// later events, and spans down to INFO feed Sentry traces (sent only at a
+/// non-zero `traces_sample_rate`). The breadcrumb layer goes first so it
+/// never sees ERROR, which the error layer owns.
+fn sentry_layers<S>() -> Vec<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    vec![
+        SpanLayer::new().with_filter(LevelFilter::INFO).boxed(),
+        BreadcrumbLayer::new()
+            .with_filter(filter_fn(|meta| {
+                matches!(*meta.level(), Level::WARN | Level::INFO)
+            }))
+            .boxed(),
+        ErrorLayer::new().with_filter(LevelFilter::ERROR).boxed(),
+    ]
+}
+
 /// Initialise the tracing subscriber and, when `OTEL_ENABLED` is set,
 /// the OTLP trace pipeline.
 ///
@@ -130,11 +153,7 @@ pub fn init_with_default(service_name: &str, default_level: &str) -> Option<Otel
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    let sentry_layer = sentry_tracing::layer().event_filter(|meta| match *meta.level() {
-        tracing::Level::ERROR => EventFilter::Event,
-        tracing::Level::WARN | tracing::Level::INFO => EventFilter::Breadcrumb,
-        _ => EventFilter::Ignore,
-    });
+    let sentry_layer = sentry_layers();
 
     if !env_bool("OTEL_ENABLED", false) {
         tracing_subscriber::registry()

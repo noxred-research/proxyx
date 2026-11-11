@@ -31,7 +31,7 @@ database = "proxyx"
 user = "proxyx"
 password = "proxyx"
 
-# Used instead of [clickhouse] when backend = "opensearch" (OpenSearch 2.x or Elasticsearch 8).
+# Used instead of [clickhouse] when backend = "opensearch" (OpenSearch 2.x or 3.x, or Elasticsearch 8).
 # `proxyx migrate control` installs its index templates. Traffic view exports are not available
 # with this store.
 # [capture_store.opensearch]

@@ -11,7 +11,7 @@ An open-source Rust proxy platform for pools, sessions and traffic capture.
 
 Lease pooled residential, ISP, datacenter and mobile IPs through one gateway, and route, inspect and record the traffic of authorized sessions, on infrastructure you control.
 
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE) [![CI](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml) [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-informational)](CHANGELOG.md) [![Rust 1.97.1](https://img.shields.io/badge/rust-1.97.1-orange?logo=rust)](rust-toolchain.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md) [![Security policy](https://img.shields.io/badge/security-policy-informational?logo=github)](SECURITY.md)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE) [![CI](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml) [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-informational)](CHANGELOG.md) [![Rust 1.99.0](https://img.shields.io/badge/rust-1.99.0-orange?logo=rust)](rust-toolchain.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md) [![Security policy](https://img.shields.io/badge/security-policy-informational?logo=github)](SECURITY.md)
 
 [What it is](#what-is-proxyx) · [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Roles](#roles) · [Configuration](#configuration) · [crawlx](#use-with-crawlx) · [Observability](#observability) · [Responsible use](#responsible-use-and-security) · [Docs](#documentation)
 
@@ -93,7 +93,7 @@ The gateway and the session proxy are independent: the session proxy can reach t
 docker compose -f docker/docker-compose.yml up -d --build --wait
 ```
 
-This builds one image with both binaries and starts PostgreSQL 18, Valkey 8, ClickHouse, the gateway, the warmer, the control API, the ingester, the session proxy and the limiter, with migrations applied and secrets and a development CA generated into volumes. Everything listens on `127.0.0.1`. The compose file is for development, not for production.
+This builds one image with both binaries and starts PostgreSQL 18, Valkey 9, ClickHouse, the gateway, the warmer, the control API, the ingester, the session proxy and the limiter, with migrations applied and secrets and a development CA generated into volumes. Everything listens on `127.0.0.1`. The compose file is for development, not for production.
 
 Initialization creates secret files with a private umask and retains existing credentials. If CA generation was interrupted, initialization refuses an incomplete CA instead of silently replacing it: restore all four CA files from the same backup before restarting. Keep the generated CA out of personal and system trust stores.
 

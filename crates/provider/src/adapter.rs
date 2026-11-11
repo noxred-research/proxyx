@@ -117,7 +117,7 @@ impl Adapter {
                 cfg.kind
             )));
         }
-        validate_local(&cfg).map_err(&fail)?;
+        validate_local(&cfg).map_err(fail)?;
         let user = Template::parse(&cfg.user, true).map_err(|e| fail(format!("user: {e}")))?;
         let pass = Template::parse(&cfg.pass, true).map_err(|e| fail(format!("pass: {e}")))?;
         let host = cfg
@@ -132,9 +132,9 @@ impl Adapter {
             .iter()
             .map(|o| OptionRule::from_config(o, cfg.kind))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(&fail)?;
-        validate_options(&cfg, &options, &user, &pass, host.as_ref()).map_err(&fail)?;
-        validate_misc(&cfg).map_err(&fail)?;
+            .map_err(fail)?;
+        validate_options(&cfg, &options, &user, &pass, host.as_ref()).map_err(fail)?;
+        validate_misc(&cfg).map_err(fail)?;
 
         let read = |name: Option<&str>| name.map(|n| read_secret(&cfg.id, n, secrets)).transpose();
         let base_user = read(cfg.user_file.as_deref())?;

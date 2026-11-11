@@ -52,7 +52,7 @@ Environment variables use the same names with `__` nesting, for example `PROXYX_
 2. Start `proxyx control ingester` and `proxyx control api` with the same configuration. The ingester refuses to start when the templates are missing or from an older schema version, because a missing template would let OpenSearch guess the mappings.
 3. Re-run `migrate` after upgrading ProxyX if a release changes the schema version. A template change applies to indices created afterwards; existing indices keep the mapping they were created with.
 
-Supported servers: OpenSearch 2.x and Elasticsearch 8. The integration tests pass against OpenSearch 2.19.7 and Elasticsearch 8.17.0, and against a security-enabled OpenSearch over TLS with basic authentication and a custom CA. The store uses only the REST calls the two share: `_bulk`, composable index templates (`_index_template`), `_search` with `search_after`, `_count`, composite and metric aggregations, `ids` queries and the `wildcard` field type.
+Supported servers: OpenSearch 2.x and 3.x, and Elasticsearch 8. The integration tests pass against OpenSearch 2.19.7, OpenSearch 3.9.0 and Elasticsearch 8.17.0, and against a security-enabled OpenSearch over TLS with basic authentication and a custom CA. The store uses only the REST calls the two share: `_bulk`, composable index templates (`_index_template`), `_search` with `search_after`, `_count`, composite and metric aggregations, `ids` queries and the `wildcard` field type.
 
 ### Settings
 

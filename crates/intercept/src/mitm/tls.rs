@@ -576,8 +576,10 @@ mod client_hello_tests {
             }
             if kind == SUPPORTED_GROUPS {
                 wire.groups = hello[at + 6..at + 4 + len]
-                    .chunks_exact(2)
-                    .map(|group| u16::from_be_bytes([group[0], group[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|group| u16::from_be_bytes(*group))
                     .filter(|group| !is_grease(*group))
                     .collect();
             }

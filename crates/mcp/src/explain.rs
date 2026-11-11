@@ -477,8 +477,7 @@ pub fn explain_username(username: &str) -> Value {
         ));
     }
     let mut seen: Vec<&str> = Vec::new();
-    for pair in rest.chunks_exact(2) {
-        let (key, value) = (pair[0], pair[1]);
+    for &[key, value] in rest.as_chunks::<2>().0 {
         if !KEYS.contains(&key) {
             issues.push(issue(
                 "unknown_key",
@@ -530,7 +529,7 @@ pub fn explain_username(username: &str) -> Value {
     if seen.contains(&"city") && !seen.contains(&"cc") {
         issues.push(issue("city_needs_cc", "`city` requires `cc`"));
     }
-    if seen.contains(&"sid") && rest.chunks_exact(2).any(|p| p == ["rot", "each"]) {
+    if seen.contains(&"sid") && rest.as_chunks::<2>().0.contains(&["rot", "each"]) {
         issues.push(issue(
             "sid_with_rot_each",
             "`sid` cannot be combined with `rot-each`",

@@ -222,7 +222,7 @@ fn claim(budget: &Option<Arc<AtomicU64>>) -> bool {
     match budget {
         None => true,
         Some(left) => left
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
             .is_ok(),
     }
 }

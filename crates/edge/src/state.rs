@@ -466,7 +466,7 @@ impl State {
 
         Ok(Self {
             generation: NEXT_GENERATION
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .map_err(|_| anyhow::anyhow!("configuration generation exhausted"))?,

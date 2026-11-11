@@ -3,7 +3,7 @@
 # (the env file sets the two database URLs; see docs/databases.md):
 #   docker compose --env-file docker/db-mariadb.env -f docker/docker-compose.yml --profile mariadb up -d --build --wait
 #   docker compose --env-file docker/db-sqlite.env  -f docker/docker-compose.yml --profile sqlite  up -d --build --wait
-# `mariadb` adds a MariaDB 11 server with the two databases; `sqlite` keeps one file per plane on
+# `mariadb` adds a MariaDB 13 server with the two databases; `sqlite` keeps one file per plane on
 # the shared `sqlite-data` volume (one host only: every role runs here). The Postgres container
 # starts in every mode and is idle under these two; `docker compose stop postgres` frees it after
 # `up`.
@@ -104,7 +104,7 @@ services:
       timeout: 3s
       retries: 20
 
-  # Optional relational database (profile `mariadb`): MariaDB 11, development only. The root
+  # Optional relational database (profile `mariadb`): MariaDB 13, development only. The root
   # password is proxyx; the roles use the user proxyx / proxyx on `proxyx_pool` and `proxyx_control`.
   mariadb:
     profiles: ["mariadb"]

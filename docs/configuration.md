@@ -180,7 +180,7 @@ Per-org request rate limits. See [session-proxy.md](session-proxy.md#rate-limiti
 
 ### `[capture_store.opensearch]`
 
-Required when `capture_store.backend = "opensearch"`. OpenSearch 2.x or Elasticsearch 8. The full description, the schema and the query differences are in [capture-stores.md](capture-stores.md).
+Required when `capture_store.backend = "opensearch"`. OpenSearch 2.x or 3.x, or Elasticsearch 8. The full description, the schema and the query differences are in [capture-stores.md](capture-stores.md).
 
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|

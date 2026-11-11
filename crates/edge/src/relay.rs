@@ -139,7 +139,6 @@ pub async fn relay<C: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite 
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::AsyncReadExt as _;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;

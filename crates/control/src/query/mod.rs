@@ -824,10 +824,10 @@ pub(crate) async fn search_with_boundaries(
 
     let mut q = client
         .query(&sql)
-        .with_option("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
-        .with_option("max_memory_usage", QUERY_MAX_MEMORY_USAGE_BYTES)
-        .with_option("optimize_read_in_order", "1")
-        .with_option("max_threads", query.max_threads());
+        .with_setting("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
+        .with_setting("max_memory_usage", QUERY_MAX_MEMORY_USAGE_BYTES)
+        .with_setting("optimize_read_in_order", "1")
+        .with_setting("max_threads", query.max_threads());
     for b in &binds {
         q = q.bind(b);
     }
@@ -915,8 +915,8 @@ pub(crate) async fn count_with_boundaries(
 
     let mut q = client
         .query(&sql)
-        .with_option("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
-        .with_option("max_threads", query.max_threads());
+        .with_setting("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
+        .with_setting("max_threads", query.max_threads());
     for b in &binds {
         q = q.bind(b);
     }

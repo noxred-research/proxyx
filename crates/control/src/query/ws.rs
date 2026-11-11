@@ -264,8 +264,8 @@ pub async fn search(
 
     let mut q = client
         .query(&sql)
-        .with_option("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
-        .with_option("max_memory_usage", QUERY_MAX_MEMORY_USAGE_BYTES);
+        .with_setting("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS)
+        .with_setting("max_memory_usage", QUERY_MAX_MEMORY_USAGE_BYTES);
     for b in &binds {
         q = q.bind(b);
     }
@@ -330,7 +330,7 @@ pub async fn count(client: &clickhouse::Client, query: &WsTrafficQuery) -> Resul
 
     let mut q = client
         .query(&sql)
-        .with_option("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS);
+        .with_setting("max_execution_time", QUERY_MAX_EXECUTION_TIME_SECS);
     for b in &binds {
         q = q.bind(b);
     }

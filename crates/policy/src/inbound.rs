@@ -68,8 +68,7 @@ impl InboundOptions {
 
         let mut out = Self::default();
         let (mut cc, mut city) = (None, None);
-        for pair in parts.chunks_exact(2) {
-            let (key, value) = (pair[0], pair[1]);
+        for &[key, value] in parts.as_chunks::<2>().0 {
             if !is_value(value) {
                 return Err(Cause::OptionDenied);
             }

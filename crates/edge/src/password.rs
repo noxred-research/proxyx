@@ -378,23 +378,22 @@ static MD5_K: LazyLock<[u32; 64]> = LazyLock::new(|| {
 
 fn md5(data: &[u8]) -> [u8; 16] {
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    let mut chunks = data.chunks_exact(64);
-    for chunk in &mut chunks {
+    let (blocks, rem) = data.as_chunks::<64>();
+    for chunk in blocks {
         md5_block(&mut state, chunk);
     }
-    let rem = chunks.remainder();
     let mut tail = [0u8; 128];
     tail[..rem.len()].copy_from_slice(rem);
     tail[rem.len()] = 0x80;
     let tail_len = if rem.len() < 56 { 64 } else { 128 };
     let bits = (data.len() as u64).wrapping_mul(8);
     tail[tail_len - 8..tail_len].copy_from_slice(&bits.to_le_bytes());
-    for chunk in tail[..tail_len].chunks_exact(64) {
+    for chunk in tail[..tail_len].as_chunks::<64>().0 {
         md5_block(&mut state, chunk);
     }
     let mut out = [0u8; 16];
-    for (dst, word) in out.chunks_exact_mut(4).zip(state) {
-        dst.copy_from_slice(&word.to_le_bytes());
+    for (dst, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        *dst = word.to_le_bytes();
     }
     out
 }
@@ -402,8 +401,8 @@ fn md5(data: &[u8]) -> [u8; 16] {
 fn md5_block(state: &mut [u32; 4], chunk: &[u8]) {
     let k = &*MD5_K;
     let mut m = [0u32; 16];
-    for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
-        *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (word, bytes) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     let [mut a, mut b, mut c, mut d] = *state;
     for i in 0..64 {

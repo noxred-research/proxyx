@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! docker run -d --name proxyx-ch -p 45594:8123 -e CLICKHOUSE_USER=proxyx \
-//!     -e CLICKHOUSE_PASSWORD=proxyx clickhouse/clickhouse-server:26.3
+//!     -e CLICKHOUSE_PASSWORD=proxyx clickhouse/clickhouse-server:26.10
 //! export PROXYX_TEST_CLICKHOUSE_URL=http://127.0.0.1:45594
 //! export PROXYX_TEST_CLICKHOUSE_USER=proxyx PROXYX_TEST_CLICKHOUSE_PASSWORD=proxyx
 //! export PROXYX_CONTROL_CLICKHOUSE__LOCAL_SINGLE_NODE=1

@@ -119,6 +119,8 @@ First public development line, version 0.1.0.
 
 - Upgrade the OpenTelemetry family to 0.33 with tracing-opentelemetry 0.34, SQLx to 0.9, HMAC/SHA digests to the digest 0.11 family, and jemallocator to 0.7, preserving trace propagation, database backend support, and signing output.
 
+- Upgrade Sentry and sentry-tracing to 0.49, the ClickHouse client to 0.15, x509-parser to 0.18, base64 to 0.23 and brotli to 9, and the Rust toolchain and builder image to 1.99.0 (`rust-toolchain.toml` and the Dockerfile pin the same version). The Sentry tracing integration installs the span, breadcrumb and error layers instead of the deprecated combined layer, with unchanged behavior: ERROR records are error events, WARN and INFO records are breadcrumbs, `sample_rate` and `traces_sample_rate` apply as before, and traces stay off at `0.0`. ClickHouse queries set per-query settings with `with_setting`. The development Compose stack runs MariaDB 13, Valkey 9, ClickHouse 26.10, OpenSearch 3 and Kafka 4.3.1.
+
 - Edge request and response header limits now reject complete oversized heads regardless of buffered read segmentation, while retaining exact-limit heads and pipelined bodies. HTTP parent reuse includes every affinity attribute and configuration generation, preventing stale source-address reuse across clients or reloads.
 
 - The Kafka consumer's security protocol follows the configured sections, like the producer: `ssl` with `[kafka.tls]`, `sasl_plaintext` with `[kafka.sasl]` alone, `sasl_ssl` with both. Earlier builds used `sasl_ssl` whenever SASL was set, which a producer without TLS could never talk to.

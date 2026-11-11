@@ -355,7 +355,7 @@ pub(crate) async fn fetch_page_bodies(
     //.
     let rows = client
         .query(&sql)
-        .with_option("max_threads", "1")
+        .with_setting("max_threads", "1")
         .fetch_all::<BodyRow>()
         .await
         .context("traffic body-fetch query failed")?;

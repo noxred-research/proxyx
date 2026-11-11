@@ -3,7 +3,6 @@
 //! and keep the guard until exit.
 
 use std::borrow::Cow;
-use std::sync::Arc;
 
 use sentry::ClientInitGuard;
 use sentry::protocol::{Event, Value};
@@ -121,19 +120,19 @@ pub fn init(config: &SentryConfig, service_name: &str) -> Option<ClientInitGuard
         .clone()
         .or_else(|| option_env!("CARGO_PKG_VERSION").map(String::from));
 
-    let guard = sentry::init((
-        dsn.expose(),
-        sentry::ClientOptions {
-            release: release.map(Into::into),
-            environment: Some(environment.into()),
-            sample_rate: config.sample_rate,
-            traces_sample_rate: config.traces_sample_rate,
-            attach_stacktrace: true,
-            send_default_pii: false,
-            before_send: Some(Arc::new(scrub)),
-            ..Default::default()
-        },
-    ));
+    let mut options = sentry::ClientOptions::new()
+        .environment(environment)
+        .maybe_release(release)
+        .sample_rate(config.sample_rate)
+        .attach_stacktrace(true)
+        .send_default_pii(false)
+        .before_send(scrub);
+    // Left unset, traces stay disabled; an explicit 0.0 would still build
+    // unsampled transactions for every span.
+    if config.traces_sample_rate > 0.0 {
+        options = options.traces_sample_rate(config.traces_sample_rate);
+    }
+    let guard = sentry::init((dsn.expose(), options));
 
     sentry::configure_scope(|scope| {
         scope.set_tag("service", service_name);

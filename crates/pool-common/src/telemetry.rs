@@ -34,10 +34,14 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{Sampler, SdkTracerProvider},
 };
-use sentry_tracing::EventFilter;
+use sentry_tracing::{BreadcrumbLayer, ErrorLayer, SpanLayer};
+use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use tracing_subscriber::filter::{LevelFilter, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::layer::{Layer, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt as _};
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:4317";
 const DEFAULT_SAMPLE_RATIO: f64 = 0.1;
@@ -211,6 +215,25 @@ fn build_provider(service_name: &str) -> anyhow::Result<SdkTracerProvider> {
         .build())
 }
 
+/// Sentry layers: ERROR is an error event, WARN and INFO are breadcrumbs on
+/// later events, and spans down to INFO feed Sentry traces (sent only at a
+/// non-zero `traces_sample_rate`). The breadcrumb layer goes first so it
+/// never sees ERROR, which the error layer owns.
+fn sentry_layers<S>() -> Vec<Box<dyn Layer<S> + Send + Sync>>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    vec![
+        SpanLayer::new().with_filter(LevelFilter::INFO).boxed(),
+        BreadcrumbLayer::new()
+            .with_filter(filter_fn(|meta| {
+                matches!(*meta.level(), Level::WARN | Level::INFO)
+            }))
+            .boxed(),
+        ErrorLayer::new().with_filter(LevelFilter::ERROR).boxed(),
+    ]
+}
+
 /// Install the global tracing subscriber: `RUST_LOG` filter, Sentry layer
 /// (ERROR is an event, WARN and INFO are breadcrumbs), the OTLP layer when
 /// `OTEL_ENABLED` is set, and the fmt layer (JSON when `json`). Call once
@@ -220,11 +243,7 @@ fn build_provider(service_name: &str) -> anyhow::Result<SdkTracerProvider> {
 /// When a global subscriber is already set.
 pub fn init(service_name: &str, json: bool) -> Option<OtelGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let sentry_layer = sentry_tracing::layer().event_filter(|meta| match *meta.level() {
-        tracing::Level::ERROR => EventFilter::Event,
-        tracing::Level::WARN | tracing::Level::INFO => EventFilter::Breadcrumb,
-        _ => EventFilter::Ignore,
-    });
+    let sentry_layer = sentry_layers();
     let registry = tracing_subscriber::registry()
         .with(env_filter)
         .with(sentry_layer);

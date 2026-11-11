@@ -5,7 +5,7 @@ ProxyX keeps its durable relational state in one of three databases. The scheme 
 | Backend | URL | Versions | Multi-node |
 |---|---|---|---|
 | PostgreSQL | `postgres://user:password@host:5432/database` | 13 or newer (18 tested) | yes |
-| MariaDB | `mariadb://user:password@host:3306/database` or `mysql://...` | 10.6 or newer (11.8 tested) | yes |
+| MariaDB | `mariadb://user:password@host:3306/database` or `mysql://...` | 10.6 or newer (11.8 and 13.0 tested) | yes |
 | SQLite | `sqlite:///var/lib/proxyx/pool.db?mode=rwc` | 3.40 or newer (3.46 bundled) | no: one host |
 
 MySQL itself is not supported: the schema uses `IF NOT EXISTS` on columns and indexes and the sequence and `SKIP LOCKED` behavior of MariaDB, and `proxyx doctor` fails a `mysql://` URL that does not answer as MariaDB.
@@ -89,7 +89,7 @@ What differs is dialect, not meaning: the same logical schema and the same repos
 `docker/docker-compose.yml` runs PostgreSQL by default. Two profiles, each with an env file that sets the two database URLs, swap it out:
 
 ```
-# MariaDB 11 for both planes
+# MariaDB 13 for both planes
 docker compose --env-file docker/db-mariadb.env -f docker/docker-compose.yml --profile mariadb up -d --build --wait
 # SQLite: one file per plane on the shared `sqlite-data` volume (single host)
 docker compose --env-file docker/db-sqlite.env -f docker/docker-compose.yml --profile sqlite up -d --build --wait

@@ -598,11 +598,15 @@ mod tests {
             "ClickHouse is unreachable"
         );
 
+        // The ClickHouse client adds its own spans below the flush span.
         let spans = spans.take();
-        assert_eq!(spans.len(), 1);
-        let span = &spans[0];
+        let roots: Vec<_> = spans
+            .iter()
+            .filter(|span| span.parent_span_id == opentelemetry::trace::SpanId::INVALID)
+            .collect();
+        assert_eq!(roots.len(), 1, "one root span per non-empty batch");
+        let span = roots[0];
         assert_eq!(span.name, "clickhouse.flush");
-        assert_eq!(span.parent_span_id, opentelemetry::trace::SpanId::INVALID);
         assert_eq!(
             crate::test_trace::attr(span, "db.collection.name").as_deref(),
             Some("test")
