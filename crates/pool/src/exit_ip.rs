@@ -6,9 +6,9 @@
 //! of `kind=url`.
 //!
 //! The exit country that the warmer checks against a static IP's region comes
-//! from the `cloudflare` (`loc=`), `ipinfo` and `ifconfig_co` services. The
-//! provider's own echo (`echo_url`, such as `https://ip.oxylabs.io`) and
-//! `ipify` return the IP only, so a list without one of the three is refused:
+//! from the `trace_lines` (`loc=`), `ip_country_json` and `ip_country_iso_json` kinds. The
+//! provider's own echo (`echo_url`) and the `ip_json` kind return the IP only, so a list
+//! without one of the three is refused:
 //! every exit would fail its region check.
 
 use anyhow::Context as _;
@@ -31,8 +31,8 @@ pub fn config(raw: Option<&str>) -> anyhow::Result<ExitIpConfig> {
         .context("failed to parse exit_ip_services")?;
     anyhow::ensure!(
         cfg.services.iter().any(|s| reports_country(s.kind)),
-        "exit_ip_services needs one of cloudflare, ipinfo or ifconfig_co: only they report \
-         the exit country that is checked against the region"
+        "exit_ip_services needs one of trace_lines, ip_country_json or ip_country_iso_json: \
+         only they report the exit country that is checked against the region"
     );
     Ok(cfg)
 }
@@ -40,7 +40,7 @@ pub fn config(raw: Option<&str>) -> anyhow::Result<ExitIpConfig> {
 fn reports_country(kind: ServiceKind) -> bool {
     matches!(
         kind,
-        ServiceKind::Cloudflare | ServiceKind::Ipinfo | ServiceKind::IfconfigCo
+        ServiceKind::TraceLines | ServiceKind::IpCountryJson | ServiceKind::IpCountryIsoJson
     )
 }
 
@@ -49,10 +49,10 @@ fn service(item: &str) -> anyhow::Result<CheckService> {
         .split_once('=')
         .with_context(|| format!("{item:?} is not kind=url"))?;
     let kind = match kind {
-        "ipify" => ServiceKind::Ipify,
-        "cloudflare" => ServiceKind::Cloudflare,
-        "ipinfo" => ServiceKind::Ipinfo,
-        "ifconfig_co" => ServiceKind::IfconfigCo,
+        "ip_json" => ServiceKind::IpJson,
+        "trace_lines" => ServiceKind::TraceLines,
+        "ip_country_json" => ServiceKind::IpCountryJson,
+        "ip_country_iso_json" => ServiceKind::IpCountryIsoJson,
         other => anyhow::bail!("unknown service kind {other:?}"),
     };
     anyhow::ensure!(
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn a_list_replaces_the_default_in_order_and_keeps_query_strings() {
         let cfg = config(Some(
-            "ipify=http://stub:1/ipify?format=json, cloudflare=http://stub:1/trace",
+            "ip_json=http://stub:1/ip?format=json, trace_lines=http://stub:1/trace",
         ))
         .expect("list");
         let got: Vec<_> = cfg
@@ -90,8 +90,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                (ServiceKind::Ipify, "http://stub:1/ipify?format=json"),
-                (ServiceKind::Cloudflare, "http://stub:1/trace"),
+                (ServiceKind::IpJson, "http://stub:1/ip?format=json"),
+                (ServiceKind::TraceLines, "http://stub:1/trace"),
             ]
         );
         assert_eq!(cfg.min_agree, ExitIpConfig::default().min_agree);
@@ -101,10 +101,10 @@ mod tests {
     fn bad_items_are_startup_errors() {
         for bad in [
             "",
-            "ipify",
+            "ip_json",
             "nosuch=http://x/",
-            "ipify=ftp://x/",
-            "ipify=http://x/,",
+            "ip_json=ftp://x/",
+            "ip_json=http://x/,",
         ] {
             assert!(config(Some(bad)).is_err(), "{bad:?} must be refused");
         }
@@ -112,14 +112,15 @@ mod tests {
 
     #[test]
     fn a_list_without_a_country_source_is_refused() {
-        // ipify and the provider echo (`https://ip.oxylabs.io`) give the IP only:
+        // ip_json and the provider echo give the IP only:
         // every exit would fail its region check and be quarantined.
-        let err = config(Some("ipify=https://api.ipify.org?format=json")).expect_err("no country");
-        assert!(format!("{err:#}").contains("cloudflare"), "{err:#}");
+        let err =
+            config(Some("ip_json=https://ip.example.test/?format=json")).expect_err("no country");
+        assert!(format!("{err:#}").contains("trace_lines"), "{err:#}");
         for ok in [
-            "ipify=http://x/,cloudflare=https://www.cloudflare.com/cdn-cgi/trace",
-            "ipinfo=http://x/",
-            "ifconfig_co=http://x/",
+            "ip_json=http://x/,trace_lines=https://trace.example.test/trace",
+            "ip_country_json=http://x/",
+            "ip_country_iso_json=http://x/",
         ] {
             config(Some(ok)).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
         }

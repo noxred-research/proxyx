@@ -213,7 +213,7 @@ mod tests {
 
     use super::*;
     use crate::probe::{ProbeConfig, Sample};
-    use crate::testutil::{self, Resp, Stub, ipqs, ipqs_slot, upstream};
+    use crate::testutil::{self, Resp, Stub, fraud_score, fraud_score_slot, upstream};
 
     fn sample(outcome: Outcome, ttfb_ms: Option<u64>) -> Sample {
         Sample {
@@ -309,7 +309,7 @@ mod tests {
     }
 
     fn reputation(scorer: &Stub) -> Reputation {
-        testutil::reputation(vec![ipqs_slot(scorer, 100)]).0
+        testutil::reputation(vec![fraud_score_slot(scorer, 100)]).0
     }
 
     fn ip() -> IpAddr {
@@ -355,16 +355,16 @@ mod tests {
     async fn risk_over_max_risk_is_refused_and_at_max_risk_is_admitted() {
         let up = site(200);
         let p = policy("allow");
-        let over = run(&reputation(&ipqs(61)), &up, &[], &p, None).await;
+        let over = run(&reputation(&fraud_score(61)), &up, &[], &p, None).await;
         assert_eq!(refused(over), Some(Refusal::Reputation));
-        let at = run(&reputation(&ipqs(60)), &up, &[], &p, None).await;
+        let at = run(&reputation(&fraud_score(60)), &up, &[], &p, None).await;
         assert!(at.is_ok(), "{at:?}");
     }
 
     #[tokio::test]
     async fn a_blocked_probe_is_refused_as_block_and_a_clean_one_is_admitted() {
         let p = policy("allow");
-        let rep = reputation(&ipqs(10));
+        let rep = reputation(&fraud_score(10));
         let r = run(&rep, &site(403), &targets(), &p, None).await;
         assert_eq!(refused(r), Some(Refusal::Block));
         let r = run(&rep, &site(200), &targets(), &p, None)
@@ -376,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn a_target_answering_404_500_or_503_is_a_quality_refusal_not_a_pass() {
         let p = policy("allow");
-        let rep = reputation(&ipqs(10));
+        let rep = reputation(&fraud_score(10));
         for status in [404, 500, 503] {
             let up = Stub::spawn(move |_| Resp::status(status, "unavailable"));
             let r = run(&rep, &up, &targets(), &p, None).await;
@@ -395,7 +395,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             Resp::ok("fine")
         });
-        let r = run(&reputation(&ipqs(10)), &up, &targets(), &p, None).await;
+        let r = run(&reputation(&fraud_score(10)), &up, &targets(), &p, None).await;
         assert_eq!(refused(r), Some(Refusal::Slow));
         assert_eq!(Refusal::Slow.label(), "quality", "the metric label stays");
     }
@@ -415,7 +415,7 @@ mod tests {
     async fn a_probe_past_the_deadline_is_skipped_and_the_session_is_admitted() {
         let until = Instant::now() + Duration::from_millis(300);
         let r = run(
-            &reputation(&ipqs(10)),
+            &reputation(&fraud_score(10)),
             &Stub::hanging(),
             &targets(),
             &policy("deny"),

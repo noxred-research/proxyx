@@ -284,7 +284,7 @@ async fn prune_history_deletes_old_rows_and_keeps_the_rest() -> TestResult {
     let recent = OffsetDateTime::now_utc() - time::Duration::days(1);
     for at in [old, recent] {
         raw.execute(
-            "INSERT INTO ip_scores (ip, source, risk, checked_at) VALUES (?, 'ipqs', 10, ?)",
+            "INSERT INTO ip_scores (ip, source, risk, checked_at) VALUES (?, 'fraud_score', 10, ?)",
             &[ip.as_str().into(), at.into()],
         )
         .await?;

@@ -17,7 +17,7 @@
                     "regexp": {
                       "host": {
                         "case_insensitive": true,
-                        "value": ".*[Ssſ]tripe.*"
+                        "value": ".*[Ssſ]payco.*"
                       }
                     }
                   },

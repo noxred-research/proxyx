@@ -1,15 +1,15 @@
-# SOAX residential (docs read 2026-10-15, https://developers.soax.com/proxies/residential):
+# Residential, the account's package key as password (provider documentation read 2026-10-15):
 #   username: country-{cc}[-city-{city}]-session-{id}-rotate-timed_{seconds}
 #   password: the package key. Session id: letters, digits, `_`, 32 characters at most.
 # No strict mode is documented, so a strict lease is refused.
 
 [[adapter]]
-id = "soax_res"
+id = "res_package_key"
 kind = "rotating"
 subtype = "residential"
-host = "proxy.soax.com"
+host = "package.example.net"
 port = 1337
-pass_file = "soax_package_key"
+pass_file = "res_package_key_pass"
 user = "{opts}"
 pass = "{base_pass}"
 

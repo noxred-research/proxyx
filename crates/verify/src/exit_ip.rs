@@ -23,14 +23,14 @@ const MAX_REPLY_BYTES: usize = 16 * 1024;
 /// The echo services ProxyX knows how to read. The name is the metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ServiceKind {
-    /// `api.ipify.org?format=json`: IPv4 only host, no country.
-    Ipify,
-    /// `cdn-cgi/trace`: `ip=` and `loc=` lines.
-    Cloudflare,
-    /// `ipinfo.io/json`: `ip` and `country`.
-    Ipinfo,
-    /// `ifconfig.co/json`: `ip` and `country_iso`.
-    IfconfigCo,
+    /// JSON with an `ip` field and no country (`{"ip": "..."}`).
+    IpJson,
+    /// Plain text lines: `ip=` and `loc=` (the country).
+    TraceLines,
+    /// JSON with `ip` and `country`.
+    IpCountryJson,
+    /// JSON with `ip` and `country_iso`.
+    IpCountryIsoJson,
     /// The provider's own echo endpoint: the IP as plain text, no country.
     ProviderEcho,
 }
@@ -38,10 +38,10 @@ pub enum ServiceKind {
 impl ServiceKind {
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Ipify => "ipify",
-            Self::Cloudflare => "cloudflare",
-            Self::Ipinfo => "ipinfo",
-            Self::IfconfigCo => "ifconfig_co",
+            Self::IpJson => "ip_json",
+            Self::TraceLines => "trace_lines",
+            Self::IpCountryJson => "ip_country_json",
+            Self::IpCountryIsoJson => "ip_country_iso_json",
             Self::ProviderEcho => "provider_echo",
         }
     }
@@ -72,13 +72,14 @@ impl Default for ExitIpConfig {
         };
         Self {
             services: vec![
-                svc(ServiceKind::Ipify, "https://api.ipify.org?format=json"),
+                // wire-compat: the public echo services behind the default list
+                svc(ServiceKind::IpJson, "https://api.ipify.org?format=json"),
                 svc(
-                    ServiceKind::Cloudflare,
-                    "https://www.cloudflare.com/cdn-cgi/trace",
+                    ServiceKind::TraceLines,
+                    "https://www.cloudflare.com/cdn-cgi/trace", // wire-compat
                 ),
-                svc(ServiceKind::Ipinfo, "https://ipinfo.io/json"),
-                svc(ServiceKind::IfconfigCo, "https://ifconfig.co/json"),
+                svc(ServiceKind::IpCountryJson, "https://ipinfo.io/json"), // wire-compat
+                svc(ServiceKind::IpCountryIsoJson, "https://ifconfig.co/json"), // wire-compat
             ],
             min_agree: 2,
             timeout: Duration::from_secs(5),
@@ -338,11 +339,11 @@ struct JsonReply {
 fn parse_reply(kind: ServiceKind, body: &[u8]) -> Result<ExitIp, ServiceError> {
     let text = std::str::from_utf8(body).map_err(|_| ServiceError::Parse)?;
     let (ip, country) = match kind {
-        ServiceKind::Ipify | ServiceKind::Ipinfo | ServiceKind::IfconfigCo => {
+        ServiceKind::IpJson | ServiceKind::IpCountryJson | ServiceKind::IpCountryIsoJson => {
             let reply: JsonReply = serde_json::from_str(text).map_err(|_| ServiceError::Parse)?;
             (reply.ip, reply.country.or(reply.country_iso))
         }
-        ServiceKind::Cloudflare => {
+        ServiceKind::TraceLines => {
             let field = |key: &str| {
                 text.lines()
                     .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
@@ -435,9 +436,9 @@ mod tests {
     fn replies_parse_per_service() {
         let r = |kind, body: &str| parse_reply(kind, body.as_bytes());
         let country = |kind, body: &str| r(kind, body).expect("call succeeds").country;
-        assert_eq!(country(ServiceKind::Ipify, r#"{"ip":"9.9.9.9"}"#), None);
+        assert_eq!(country(ServiceKind::IpJson, r#"{"ip":"9.9.9.9"}"#), None);
         let cf = r(
-            ServiceKind::Cloudflare,
+            ServiceKind::TraceLines,
             "fl=1\nip=9.9.9.9\nloc=FR\nhttp=http/2\n",
         )
         .expect("call succeeds");
@@ -447,12 +448,12 @@ mod tests {
         );
         // `ip=` must not match a longer key such as `ipv=`.
         assert!(matches!(
-            r(ServiceKind::Cloudflare, "ipv=1\n"),
+            r(ServiceKind::TraceLines, "ipv=1\n"),
             Err(ServiceError::Parse)
         ));
         assert_eq!(
             country(
-                ServiceKind::Ipinfo,
+                ServiceKind::IpCountryJson,
                 r#"{"ip":"9.9.9.9","country":"DE","city":"Berlin"}"#
             )
             .as_deref(),
@@ -460,7 +461,7 @@ mod tests {
         );
         assert_eq!(
             country(
-                ServiceKind::IfconfigCo,
+                ServiceKind::IpCountryIsoJson,
                 r#"{"ip":"9.9.9.9","country_iso":"GB"}"#
             )
             .as_deref(),
@@ -477,13 +478,13 @@ mod tests {
             Err(ServiceError::NotIpv4)
         ));
         assert!(matches!(
-            r(ServiceKind::Ipinfo, "not json"),
+            r(ServiceKind::IpCountryJson, "not json"),
             Err(ServiceError::Parse)
         ));
         // A malformed country is dropped, not trusted.
         assert_eq!(
             country(
-                ServiceKind::Ipinfo,
+                ServiceKind::IpCountryJson,
                 r#"{"ip":"9.9.9.9","country":"France"}"#
             ),
             None
@@ -510,12 +511,12 @@ mod tests {
         (ExitIpChecker::new(cfg, Arc::clone(&metrics)), metrics)
     }
 
-    /// The services behind a stub proxy: ipify, Cloudflare and ipinfo.
+    /// The services behind a stub proxy: one of each of three response formats.
     fn checker() -> (ExitIpChecker, Arc<Metrics>) {
         checker_with(config(vec![
-            svc(ServiceKind::Ipify, "ipify.test"),
-            svc(ServiceKind::Cloudflare, "cf.test"),
-            svc(ServiceKind::Ipinfo, "ipinfo.test"),
+            svc(ServiceKind::IpJson, "ip-json.test"),
+            svc(ServiceKind::TraceLines, "trace.test"),
+            svc(ServiceKind::IpCountryJson, "ip-country.test"),
         ]))
     }
 
@@ -541,8 +542,8 @@ mod tests {
             return Resp::status(500, "boom");
         }
         match host {
-            "ipify.test" => Resp::ok(format!(r#"{{"ip":"{ip}"}}"#)),
-            "cf.test" => Resp::ok(format!("ip={ip}\nloc={}\n", country.to_ascii_uppercase())),
+            "ip-json.test" => Resp::ok(format!(r#"{{"ip":"{ip}"}}"#)),
+            "trace.test" => Resp::ok(format!("ip={ip}\nloc={}\n", country.to_ascii_uppercase())),
             _ => Resp::ok(format!(r#"{{"ip":"{ip}","country":"{country}"}}"#)),
         }
     }
@@ -552,9 +553,9 @@ mod tests {
         Stub::spawn(move |req| {
             let host = req.host();
             let (ip, country) = match host.as_str() {
-                "ipify.test" => replies[0],
-                "cf.test" => replies[1],
-                "ipinfo.test" => replies[2],
+                "ip-json.test" => replies[0],
+                "trace.test" => replies[1],
+                "ip-country.test" => replies[2],
                 _ => return Resp::status(404, ""),
             };
             answer(&host, ip, country)
@@ -609,9 +610,9 @@ mod tests {
         let (checker, metrics) = checker();
         let exit = check_ok(&checker, &stub, &ExitQuery::default()).await;
         assert_eq!(exit.ip, Ipv4Addr::new(5, 6, 7, 8));
-        assert_eq!(failures(&metrics, "cloudflare"), 1);
+        assert_eq!(failures(&metrics, "trace_lines"), 1);
         assert_eq!(
-            failures(&metrics, "ipify") + failures(&metrics, "ipinfo"),
+            failures(&metrics, "ip_json") + failures(&metrics, "ip_country_json"),
             0
         );
     }
@@ -640,7 +641,7 @@ mod tests {
         );
         assert!(err.is_outage());
         assert_eq!(
-            failures(&metrics, "cloudflare") + failures(&metrics, "ipinfo"),
+            failures(&metrics, "trace_lines") + failures(&metrics, "ip_country_json"),
             2
         );
     }
@@ -706,19 +707,21 @@ mod tests {
 
     #[tokio::test]
     async fn country_must_match_by_majority_and_city_is_advice() {
-        // Cloudflare, ipinfo and ifconfig.co all report a country.
+        // The trace, `ip_country_json` and `ip_country_iso_json` kinds all report a country.
         let countries = |cf: &'static str, info: &'static str, ifc: &'static str| {
             Stub::spawn(move |req| match req.host().as_str() {
-                "cf.test" => Resp::ok(format!("ip=5.6.7.8\nloc={}\n", cf.to_ascii_uppercase())),
-                "ipinfo.test" => Resp::ok(format!(r#"{{"ip":"5.6.7.8","country":"{info}"}}"#)),
-                "ifconfig.test" => Resp::ok(format!(r#"{{"ip":"5.6.7.8","country_iso":"{ifc}"}}"#)),
+                "trace.test" => Resp::ok(format!("ip=5.6.7.8\nloc={}\n", cf.to_ascii_uppercase())),
+                "ip-country.test" => Resp::ok(format!(r#"{{"ip":"5.6.7.8","country":"{info}"}}"#)),
+                "ip-country-iso.test" => {
+                    Resp::ok(format!(r#"{{"ip":"5.6.7.8","country_iso":"{ifc}"}}"#))
+                }
                 _ => Resp::status(404, ""),
             })
         };
         let (checker, _) = checker_with(config(vec![
-            svc(ServiceKind::Cloudflare, "cf.test"),
-            svc(ServiceKind::Ipinfo, "ipinfo.test"),
-            svc(ServiceKind::IfconfigCo, "ifconfig.test"),
+            svc(ServiceKind::TraceLines, "trace.test"),
+            svc(ServiceKind::IpCountryJson, "ip-country.test"),
+            svc(ServiceKind::IpCountryIsoJson, "ip-country-iso.test"),
         ]));
         let fr: Region = "fr".parse().expect("valid test value");
         let q = ExitQuery {
@@ -751,15 +754,15 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_country_cannot_confirm_a_region() {
-        // ipify and the provider echo report no country at all.
+        // `ip_json` and the provider echo report no country at all.
         let stub = Stub::spawn(|req| {
-            Resp::ok(if req.host() == "ipify.test" {
+            Resp::ok(if req.host() == "ip-json.test" {
                 r#"{"ip":"5.6.7.8"}"#
             } else {
                 "5.6.7.8"
             })
         });
-        let (checker, _) = checker_with(config(vec![svc(ServiceKind::Ipify, "ipify.test")]));
+        let (checker, _) = checker_with(config(vec![svc(ServiceKind::IpJson, "ip-json.test")]));
         let fr: Region = "fr".parse().expect("valid test value");
         let q = ExitQuery {
             region: Some(&fr),
@@ -806,14 +809,14 @@ mod tests {
     async fn provider_echo_votes_as_one_more_service() {
         // The two public services disagree; the provider echo breaks the tie.
         let stub = Stub::spawn(|req| match req.host().as_str() {
-            "ipify.test" => Resp::ok(r#"{"ip":"1.1.1.1"}"#),
-            "cf.test" => Resp::ok("ip=2.2.2.2\nloc=FR\n"),
+            "ip-json.test" => Resp::ok(r#"{"ip":"1.1.1.1"}"#),
+            "trace.test" => Resp::ok("ip=2.2.2.2\nloc=FR\n"),
             "echo.test" => Resp::ok("2.2.2.2\n"),
             _ => Resp::status(404, ""),
         });
         let (checker, _) = checker_with(config(vec![
-            svc(ServiceKind::Ipify, "ipify.test"),
-            svc(ServiceKind::Cloudflare, "cf.test"),
+            svc(ServiceKind::IpJson, "ip-json.test"),
+            svc(ServiceKind::TraceLines, "trace.test"),
         ]));
         let q = ExitQuery {
             echo_url: Some("http://echo.test/ip"),
@@ -828,13 +831,15 @@ mod tests {
         let stub = Stub::spawn_socks5(|req| {
             // The name reaches the proxy unresolved (socks5h), as the Host header.
             match req.host().as_str() {
-                "ipify.test" | "ipinfo.test" => Resp::ok(r#"{"ip":"5.6.7.8","country":"fr"}"#),
+                "ip-json.test" | "ip-country.test" => {
+                    Resp::ok(r#"{"ip":"5.6.7.8","country":"fr"}"#)
+                }
                 _ => Resp::status(404, ""),
             }
         });
         let (checker, metrics) = checker_with(config(vec![
-            svc(ServiceKind::Ipify, "ipify.test"),
-            svc(ServiceKind::Ipinfo, "ipinfo.test"),
+            svc(ServiceKind::IpJson, "ip-json.test"),
+            svc(ServiceKind::IpCountryJson, "ip-country.test"),
         ]));
         let mut up = upstream(&stub);
         up.scheme = common::types::UpstreamScheme::Socks5;
@@ -851,14 +856,14 @@ mod tests {
             .await
             .expect_err("call fails");
         assert!(matches!(err, ExitIpError::Unreachable), "{err}");
-        assert_eq!(failures(&metrics, "ipify"), 1);
-        assert_eq!(failures(&metrics, "ipinfo"), 1);
+        assert_eq!(failures(&metrics, "ip_json"), 1);
+        assert_eq!(failures(&metrics, "ip_country_json"), 1);
     }
 
     #[tokio::test]
     async fn a_proxy_that_never_answers_is_an_outage_after_the_timeout() {
         let up = upstream(&Stub::hanging());
-        let mut cfg = config(vec![svc(ServiceKind::Ipify, "ipify.test")]);
+        let mut cfg = config(vec![svc(ServiceKind::IpJson, "ip-json.test")]);
         cfg.timeout = Duration::from_millis(200);
         let (checker, _) = checker_with(cfg);
         let err = tokio::time::timeout(
@@ -896,8 +901,8 @@ mod tests {
     async fn a_local_unit_verifies_the_address_it_binds() {
         let echo = peer_echo().to_string();
         let (checker, _) = checker_with(config(vec![
-            svc(ServiceKind::Ipify, &echo),
-            svc(ServiceKind::Ipinfo, &echo),
+            svc(ServiceKind::IpJson, &echo),
+            svc(ServiceKind::IpCountryJson, &echo),
         ]));
         let ip = |s: &str| Some(s.parse::<IpAddr>().expect("valid test value"));
         let up = local_upstream("127.0.0.2");

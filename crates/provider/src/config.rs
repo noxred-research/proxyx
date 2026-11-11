@@ -142,7 +142,7 @@ pub enum Charset {
     Alnum,
     /// Letters, digits and `_`.
     Word,
-    /// ASCII letters and `_`, as required by Webshare city targeting.
+    /// ASCII letters and `_`, as required by some providers' city targeting.
     AlphaUnderscore,
     /// Hex digits, `.` and `:` (an IP literal).
     Ip,
@@ -201,7 +201,7 @@ pub struct OptionConfig {
     /// value and no `{v}`.
     pub frag: String,
     /// `sid` only: written instead of `frag` when the lease is strict
-    /// (Oxylabs `sessid_oneip`, Decodo `session_iplock`).
+    /// (the `sessid_oneip` and `session_iplock` forms).
     pub strict_frag: Option<String>,
     /// Default per option: country `alpha`, city `word`, sid `alnum`, ip `ip`.
     pub charset: Option<Charset>,

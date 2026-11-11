@@ -229,13 +229,13 @@ mod tests {
 
     use super::*;
     use crate::score::Flags;
-    use crate::testutil::{Resp, Stub, failures, ipqs, ipqs_slot, reputation};
+    use crate::testutil::{Resp, Stub, failures, fraud_score, fraud_score_slot, reputation};
 
     fn score(risk: u8, tor: bool, proxy: bool) -> Score {
         Score {
             risk,
             flags: Flags { tor, proxy },
-            source: ScorerKind::Ipqs,
+            source: ScorerKind::FraudScore,
         }
     }
 
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn the_worst_scorer_decides() {
         let abuse = Score {
-            source: ScorerKind::AbuseIpdb,
+            source: ScorerKind::AbuseConfidence,
             ..score(90, false, false)
         };
         assert_eq!(
@@ -270,7 +270,7 @@ mod tests {
             Verdict::Drain
         );
         let tor = Score {
-            source: ScorerKind::Scamalytics,
+            source: ScorerKind::ProxyRisk,
             ..score(0, true, false)
         };
         assert_eq!(
@@ -311,8 +311,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_score_avoids_the_call_until_six_hours_pass() {
-        let stub = ipqs(80);
-        let (rep, _) = reputation(vec![ipqs_slot(&stub, 100)]);
+        let stub = fraud_score(80);
+        let (rep, _) = reputation(vec![fraud_score_slot(&stub, 100)]);
         let t0 = 1_000_000;
         let first = rep.assess_at(ip(1), Allow, at(t0)).await;
         assert_eq!((first.verdict, stub.hits()), (Verdict::Drain, 1));
@@ -332,8 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_daily_budget_stops_lookups_and_resets_on_the_next_utc_day() {
-        let stub = ipqs(10);
-        let (rep, metrics) = reputation(vec![ipqs_slot(&stub, 2)]);
+        let stub = fraud_score(10);
+        let (rep, metrics) = reputation(vec![fraud_score_slot(&stub, 2)]);
         let day = 20_000 * DAY_SECS;
         for last in [1, 2] {
             let a = rep.assess_at(ip(last), Allow, at(day + 100)).await;
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(stub.hits(), 2);
         assert!(third.scores.is_empty());
         // Budget exhaustion is not a service failure.
-        assert_eq!(failures(&metrics, "ipqs"), 0);
+        assert_eq!(failures(&metrics, "fraud_score"), 0);
         // A cached score is still served when the budget is gone.
         let again = rep.assess_at(ip(1), Allow, at(day + 300)).await;
         assert!(!again.scores.is_empty());
@@ -356,8 +356,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_zero_budget_disables_the_scorer() {
-        let stub = ipqs(10);
-        let (rep, _) = reputation(vec![ipqs_slot(&stub, 0)]);
+        let stub = fraud_score(10);
+        let (rep, _) = reputation(vec![fraud_score_slot(&stub, 0)]);
         assert!(
             rep.assess_at(ip(1), Allow, at(1_000))
                 .await
@@ -371,7 +371,7 @@ mod tests {
     async fn on_score_unavailable_of_each_call_decides_when_every_scorer_is_down() {
         let down = Stub::spawn(|_| Resp::status(500, ""));
         // One Reputation, two policies: the value comes with the call.
-        let (rep, metrics) = reputation(vec![ipqs_slot(&down, 100)]);
+        let (rep, metrics) = reputation(vec![fraud_score_slot(&down, 100)]);
         for (policy, verdict) in [(Allow, Verdict::Keep), (Deny, Verdict::Drain)] {
             let a = rep.assess_at(ip(1), policy, at(1_000)).await;
             assert_eq!(
@@ -380,21 +380,21 @@ mod tests {
                 "{policy:?}"
             );
         }
-        assert_eq!(failures(&metrics, "ipqs"), 2);
+        assert_eq!(failures(&metrics, "fraud_score"), 2);
     }
 
     #[tokio::test]
     async fn on_score_unavailable_is_not_used_when_a_score_exists() {
-        let stub = ipqs(10);
-        let (rep, _) = reputation(vec![ipqs_slot(&stub, 10)]);
+        let stub = fraud_score(10);
+        let (rep, _) = reputation(vec![fraud_score_slot(&stub, 10)]);
         let a = rep.assess_at(ip(1), Deny, at(1_000)).await;
         assert_eq!((a.verdict, a.scores.is_empty()), (Verdict::Keep, false));
     }
 
     #[tokio::test]
     async fn the_policy_max_risk_is_the_drain_boundary_of_each_assessment() {
-        let stub = ipqs(60);
-        let (rep, _) = reputation(vec![ipqs_slot(&stub, 100)]);
+        let stub = fraud_score(60);
+        let (rep, _) = reputation(vec![fraud_score_slot(&stub, 100)]);
         let rep = &rep;
         let verdict = |rotate_at| async move {
             rep.assess_with(ip(1), Allow, rotate_at, at(1_000))
@@ -410,8 +410,11 @@ mod tests {
     #[tokio::test]
     async fn one_scorer_down_leaves_the_others_to_decide() {
         let down = Stub::spawn(|_| Resp::status(500, ""));
-        let good = ipqs(60);
-        let (rep, _) = reputation(vec![ipqs_slot(&down, 10), ipqs_slot(&good, 10)]);
+        let good = fraud_score(60);
+        let (rep, _) = reputation(vec![
+            fraud_score_slot(&down, 10),
+            fraud_score_slot(&good, 10),
+        ]);
         let a = rep.assess_at(ip(1), Allow, at(1_000)).await;
         assert_eq!((a.verdict, a.scores.len()), (Verdict::Recheck, 1));
     }
@@ -422,7 +425,7 @@ mod tests {
             timeout: Duration::from_millis(200),
             ..ReputationConfig::default()
         };
-        let slots = vec![ipqs_slot(&Stub::hanging(), 10)];
+        let slots = vec![fraud_score_slot(&Stub::hanging(), 10)];
         let rep =
             Reputation::new(cfg, slots, Arc::new(Metrics::new("test"))).expect("call succeeds");
         let a = tokio::time::timeout(

@@ -291,10 +291,10 @@ Schema 1; fields can be added, not removed.
   "summary": { "ok": 9, "warn": 1, "crit": 0 },
   "sections": [
     { "name": "capacity", "findings": [
-      { "level": "ok", "subject": "iproyal_res@fr (rotating)",
+      { "level": "ok", "subject": "res_pass_suffix@fr (rotating)",
         "message": "12 ready, min_ready 10, low watermark 5" } ] },
     { "name": "breakers", "findings": [
-      { "level": "warn", "subject": "iproyal_res",
+      { "level": "warn", "subject": "res_pass_suffix",
         "message": "breaker open: the provider failed repeatedly and is skipped" } ] }
   ]
 }

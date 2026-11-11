@@ -48,7 +48,7 @@ A small in-memory rate-limit service completes the set. A background warmer and 
 | **Control plane** | Session lifecycle with reference counting, org management, API keys, a typed query DSL over captures and WebSocket messages, GraphQL, Parquet exports with signed download URLs |
 | **Edge proxy** | `proxyx edge`: a database-less HTTP, CONNECT and SOCKS4/5 proxy over a host's own IP addresses with egress pools (round robin, random, least connections, sticky sessions), login options, ordered default-deny rules, bandwidth and connection limits, parent proxies with circuit breakers and health checks, and a `local` provider scheme so the pool gateway can lease the same addresses; see [edge-proxy.md](docs/edge-proxy.md) |
 | **Rate-limit service** | An in-memory token-bucket daemon with a binary TCP protocol, used by the session proxy as an alternative to Redis |
-| **AI/LLM-native** | An MCP server (`proxyx mcp`, stdio and streamable HTTP) lets AI agents monitor health, capacity, breakers and refusals, explain failures, search captured traffic, and, only when an operator enables capabilities, manage sessions, blocks, limits and policies through validated, approvable, audited changes; optional OpenAI-compatible LLM tools for traffic summaries, block-page classification and policy drafts. See [docs/ai.md](docs/ai.md) |
+| **AI/LLM-native** | An MCP server (`proxyx mcp`, stdio and streamable HTTP) lets AI agents monitor health, capacity, breakers and refusals, explain failures, search captured traffic, and, only when an operator enables capabilities, manage sessions, blocks, limits and policies through validated, approvable, audited changes; optional LLM tools for any chat-completions compatible endpoint for traffic summaries, block-page classification and policy drafts. See [docs/ai.md](docs/ai.md) |
 | **Observability** | Prometheus metrics for every role, `/healthz` and `/readyz`, OpenTelemetry traces, optional Sentry, [runbooks](docs/runbooks/README.md) for every alert |
 
 ## Architecture
@@ -147,8 +147,8 @@ Then use the key as the proxy password. The username selects options; the region
 
 ```
 KEY=ak_...
-curl -x "http://px-cc-fr:$KEY@localhost:8080" https://api.ipify.org
-curl -x "socks5h://px-cc-fr:$KEY@localhost:1080" https://api.ipify.org
+curl -x "http://px-cc-fr:$KEY@localhost:8080" https://echo.example.test/
+curl -x "socks5h://px-cc-fr:$KEY@localhost:1080" https://echo.example.test/
 ```
 
 With a provider adapter and inventory in place instead of a customer upstream, the same username selects pool units: `px-kind-rotating-cc-fr-sid-scan42` pins a rotating session to the sticky key `scan42`. The full grammar, the refusal codes and the control API are in [gateway](docs/gateway.md); adapters and inventory are in [providers](docs/providers.md).
@@ -210,8 +210,8 @@ The sticky key keeps a scan on one exit IP; a different `sid` gets another. Both
 
 ## Observability
 
-- Every role serves Prometheus metrics at `/metrics` (the gateway and warmer on the ops port 8888, the session proxy on its admin port, the control plane on its API and ingester health ports). The metrics are catalogued in [`docs/metrics/pool.md`](docs/metrics/pool.md) and [`docs/metrics/session-proxy.md`](docs/metrics/session-proxy.md).
-- The gateway and warmer answer `/healthz` (the process is up) and `/readyz` (dependencies are connected and the first snapshot is loaded; `503 draining` after a stop request). The session proxy answers `/health`, and the control plane `/health/live`, `/health/ready` and `/health`.
+- Every role serves Prometheus metrics at `/metrics` (the gateway and warmer on the ops port 8888, the session proxy on its admin port, the control plane on its API and ingester health ports, the edge proxy on `server.ops_listen`, the limiter on `PROXYX_LIMITER_METRICS_ADDR`). The metrics are catalogued in [`docs/metrics/`](docs/metrics/pool.md) ([pool](docs/metrics/pool.md), [session proxy](docs/metrics/session-proxy.md), [edge](docs/metrics/edge.md), [limiter](docs/metrics/limiter.md)), and [monitoring](docs/monitoring.md) covers the shipped alert rules and dashboard.
+- The gateway and warmer answer `/healthz` (the process is up) and `/readyz` (dependencies are connected, the first snapshot is loaded and every listener is bound; `503 draining` after a stop request). The session proxy and the control plane answer `/health/live` and `/health/ready`.
 - Logs are structured with `tracing`; set `RUST_LOG` for the filter and `json_logs` (pool) or `PROXYX_LOG_JSON` (session proxy and control plane) for JSON. `OTEL_ENABLED=true` exports OTLP traces, and a Sentry DSN turns on error reporting.
 - [Runbooks](docs/runbooks/README.md) describe diagnosis and mitigation for each pool alert.
 
@@ -240,16 +240,48 @@ The gateway enforces a deny-first destination rule (private, loopback, link-loca
 | [capture-pipeline.md](docs/capture-pipeline.md) | Broker, ClickHouse schema, delivery semantics |
 | [capture-stores.md](docs/capture-stores.md) | ClickHouse versus OpenSearch / Elasticsearch: setup, schema, query differences, retention |
 | [databases.md](docs/databases.md) | PostgreSQL, MariaDB and SQLite: URLs, choosing, migrations, per-backend differences and limits |
-| [operations.md](docs/operations.md) | Deploy order, migrations, health, drain, scaling |
-| [runbooks/](docs/runbooks/README.md) | Alert runbooks |
+| [edge-proxy.md](docs/edge-proxy.md) | The self-hosted multi-IP forward proxy: listeners, egress pools, users, rules, limits, parents, logs |
+| [mcp.md](docs/mcp.md), [ai.md](docs/ai.md) | MCP server, tool catalog, approval and audit; AI/LLM-assisted operations and responsible use |
+| [operations.md](docs/operations.md) | Deploy order, migrations, health, drain, scaling, backups, Compose profiles, VPN egress sidecar |
+| [doctor.md](docs/doctor.md) | `proxyx doctor` and `proxyx assess pool` self-checks |
+| [monitoring.md](docs/monitoring.md), [runbooks/](docs/runbooks/README.md) | Alert rules, dashboard and the runbook for each alert |
 | [metrics/](docs/metrics/pool.md) | Metric catalogues |
+| [benchmarks.md](docs/benchmarks.md) | Microbenchmarks and the load tool |
+
+The full index is [docs/README.md](docs/README.md).
 
 The Python [prober](prober/README.md) is an optional sidecar that measures candidate IPs with a real browser through the gateway's probe listener.
 
+## Getting help
+
+- **Documentation:** [docs/README.md](docs/README.md); operators start with [operations](docs/operations.md) and the [runbooks](docs/runbooks/README.md).
+- **Bugs and feature requests:** open an issue with the matching form. Include the version or commit and a minimal reproduction, and remove credentials, keys and captured traffic first.
+- **Questions:** use the question form after searching the docs and closed issues.
+- **Security:** report vulnerabilities privately as described in [SECURITY.md](SECURITY.md), never in a public issue.
+- **Conduct concerns:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). Do not report vulnerabilities in public issues; see [SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks, coding standards and review flow, and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Support the project
+
+If ProxyX saves you time, a star helps others find it.
+
+[![Star ProxyX on GitHub](https://img.shields.io/badge/star-proxyx-yellow?logo=github&style=social)](https://github.com/noxred-research/proxyx)
 
 ## License
 
 ProxyX is licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). If you run a modified version as a network service, the license requires you to offer its source to the users of that service. Third-party material is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+ProxyX is built and intended for authorized security research and testing only (see [Responsible use and security](#responsible-use-and-security)); this is a project policy and does not change the license.
+
+### Project owners
+
+ProxyX is owned and maintained by:
+
+- [Noxtica](https://noxtica.com)
+- [NoxRed Security Research](https://noxred.ai)
+- [ProxyX](https://proxyx.dev)
+- [Kaan Keskin](https://www.linkedin.com/in/keskinkaan/)
+- [Onur Yalcin](https://www.linkedin.com/in/imonuryalcin/)

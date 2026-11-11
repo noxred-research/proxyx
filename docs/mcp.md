@@ -37,7 +37,7 @@ The server is a client of the control surfaces ProxyX already has: the pool gate
 
 | Transport | Start | Authentication | Use |
 |---|---|---|---|
-| stdio | `proxyx mcp --config mcp.toml` | none: the client launched the process | Claude Desktop, Claude Code, editors; the process runs as the user and reads the credential files that user can read |
+| stdio | `proxyx mcp --config mcp.toml` | none: the client launched the process | a desktop MCP client, a coding agent or an editor; the process runs as the user and reads the credential files that user can read |
 | Streamable HTTP | `proxyx mcp --config mcp.toml --transport http` | bearer token (`http.token_file`), always required | a shared or remote endpoint; one URL, `POST` only |
 
 stdio carries newline-delimited JSON-RPC 2.0 on stdin and stdout and nothing else; logs go to stderr. The process exits when stdin closes, after answering what it already received.
@@ -50,16 +50,7 @@ Both transports speak revision 2026-07-28 (stateless: every request carries its 
 
 ## Client setup
 
-### Claude Code
-
-```sh
-claude mcp add proxyx -- proxyx mcp --config /etc/proxyx/mcp.toml
-# or over HTTP
-claude mcp add --transport http proxyx http://127.0.0.1:8765/mcp \
-  --header "Authorization: Bearer $(cat /etc/proxyx/secrets/mcp-token)"
-```
-
-### Claude Desktop (and other clients with a JSON config)
+### A client that launches a stdio server (JSON config)
 
 ```json
 {
@@ -290,7 +281,7 @@ One JSON object per line, appended to `audit.path` (default `state_dir/audit.jso
 
 ```json
 {"seq":7,"ts":"2026-11-10T10:21:04Z","prev":"3c1f...","hash":"a91b...","phase":"result",
- "caller":{"transport":"stdio","client_name":"claude-code","client_version":"2.1"},
+ "caller":{"transport":"stdio","client_name":"example-client","client_version":"2.1"},
  "tool":"create_org_block","arguments":{"org":"acme","scope":"provider","value":"p2","reason":"abuse report 1234"},
  "outcome":"ok","detail":"","change_id":null,"duration_ms":41,"engagement":"SOW-2026-114"}
 ```
@@ -301,9 +292,9 @@ Independent MCP processes may share the audit path. Each append holds an operati
 
 ## LLM-assisted tools
 
-Without `[llm]` the tools that can work without a model do (rules and statistics) and `suggest_policy` is not listed. With it, the server calls any OpenAI-compatible `chat/completions` endpoint (OpenAI, an Anthropic-compatible gateway, Ollama, vLLM): temperature 0, `response_format` `json_schema` (falling back to `json_object` for servers that refuse it), a timeout, a response size cap, no redirects, the key only in the bearer header, nothing logged. Every answer is validated against a strict schema before it is used; one that does not match is an `llm_error`, not a guess. Captured content is wrapped in `<untrusted_data>` tags and the system prompt tells the model to treat it as data. See [ai.md](ai.md#llm-assisted-operations).
+Without `[llm]` the tools that can work without a model do (rules and statistics) and `suggest_policy` is not listed. With it, the server calls any chat-completions compatible `chat/completions` endpoint (a hosted service, a gateway or a local inference server): temperature 0, `response_format` `json_schema` (falling back to `json_object` for servers that refuse it), a timeout, a response size cap, no redirects, the key only in the bearer header, nothing logged. Every answer is validated against a strict schema before it is used; one that does not match is an `llm_error`, not a guess. Captured content is wrapped in `<untrusted_data>` tags and the system prompt tells the model to treat it as data. See [ai.md](ai.md#llm-assisted-operations).
 
-**Private CA and transport limits.** For a vLLM, Ollama or gateway behind a reverse proxy with a private CA, set `llm.ca_file` to a PEM file holding the CA certificate (one or several certificates); the certificates are trusted in addition to the public roots, and `llm.ca_file` is the supported way to trust a private CA. The server checks the certificate chain and the host name, so a certificate issued for another name is refused. A failed handshake is reported as a TLS failure (`the LLM endpoint is unreachable: TLS handshake failed ...`), not as a connection failure. `llm.timeout_secs` bounds the whole call including a response that arrives slowly (`timed out`), the connect has its own 5 second limit, and a response above 2 MiB, with or without a `Content-Length`, is refused as too large. A redirect is never followed, so neither the bearer key nor the prompt reaches another origin: a `3xx` answer is an `llm_error` carrying the status.
+**Private CA and transport limits.** For a local inference server or gateway behind a reverse proxy with a private CA, set `llm.ca_file` to a PEM file holding the CA certificate (one or several certificates); the certificates are trusted in addition to the public roots, and `llm.ca_file` is the supported way to trust a private CA. The server checks the certificate chain and the host name, so a certificate issued for another name is refused. A failed handshake is reported as a TLS failure (`the LLM endpoint is unreachable: TLS handshake failed ...`), not as a connection failure. `llm.timeout_secs` bounds the whole call including a response that arrives slowly (`timed out`), the connect has its own 5 second limit, and a response above 2 MiB, with or without a `Content-Length`, is refused as too large. A redirect is never followed, so neither the bearer key nor the prompt reaches another origin: a `3xx` answer is an `llm_error` carrying the status.
 
 ## Protocol details
 

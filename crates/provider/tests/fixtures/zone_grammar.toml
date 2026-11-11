@@ -1,0 +1,42 @@
+# Zone grammar (provider documentation read 2026-10-15):
+#   {customer}-zone-{zone}[-country-{cc}][-session-{id}][-const]   static: -ip-{ip}
+# The gateway host and port are the provider's public super proxy.
+
+[[adapter]]
+id = "res_zone_full"
+kind = "rotating"
+subtype = "residential"
+host = "zone-gw.example.net"
+port = 33335
+user_file = "res_zone_full_user"
+pass_file = "res_zone_full_pass"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+max_len = 32
+
+[[adapter.option]]
+name = "strict"
+to = "user"
+frag = "-const"
+
+[[adapter]]
+id = "isp_zone_ip"
+kind = "static"
+subtype = "isp"
+host = "zone-gw.example.net"
+port = 33335
+user_file = "isp_zone_ip_user"
+pass_file = "isp_zone_ip_pass"
+
+[[adapter.option]]
+name = "ip"
+to = "user"
+frag = "-ip-{v}"

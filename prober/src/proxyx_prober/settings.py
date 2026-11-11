@@ -32,7 +32,7 @@ class ProberSettings(BaseSettings):
     #: its setup wait must stay under that. Past it the job is rerun with a new
     #: token and nothing is reported for the attempt.
     browser_ttl_s: int = Field(default=900, ge=60, le=1200)
-    #: Longest wait for Chromium to launch. Past it the browser counts as failing.
+    #: Longest wait for the browser to launch. Past it the browser counts as failing.
     browser_setup_timeout_s: float = Field(default=60.0, gt=0)
     #: A job still not finished this long after it was queued is dropped.
     job_max_age_s: float = Field(default=900.0, gt=0)

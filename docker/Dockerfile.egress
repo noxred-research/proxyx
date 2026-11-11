@@ -13,9 +13,10 @@
 # set it when the container starts: add `--sysctl net.ipv4.conf.all.src_valid_mark=1`
 # (Compose: `sysctls: ["net.ipv4.conf.all.src_valid_mark=1"]`).
 
-FROM tailscale/tailscale:stable AS tailscale
+# Base images are pinned by manifest-list digest; Dependabot proposes digest updates.
+FROM tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c AS tailscale
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates iproute2 iptables iputils-ping microsocks openresolv openvpn procps wireguard-tools \

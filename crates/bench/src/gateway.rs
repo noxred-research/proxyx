@@ -191,7 +191,7 @@ pub fn pool_config(dir: &Path, database_url: &str, redis_url: &str, addrs: &Addr
         secrets = path("secrets"),
         admin = path("secrets/admin-token"),
         probe_key = path("secrets/probe-key"),
-        exit = q(&format!("ipinfo=http://{dead_exit_check}/json")),
+        exit = q(&format!("ip_country_json=http://{dead_exit_check}/json")),
     )
 }
 
@@ -500,7 +500,7 @@ mod tests {
         );
         assert_eq!(
             t["exit_ip_services"].as_str(),
-            Some("ipinfo=http://127.0.0.1:6/json")
+            Some("ip_country_json=http://127.0.0.1:6/json")
         );
     }
 }

@@ -357,7 +357,7 @@ mod tests {
             "redis.default.svc.cluster.local",
             "Kubernetes.Default.Svc.Cluster.Local.",
             "printer.local",
-            "metadata.google.internal",
+            "metadata.google.internal", // wire-compat: cloud metadata host
             "db.localdomain",
             "nas.lan",
             "router.home.arpa",

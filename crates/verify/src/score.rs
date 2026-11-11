@@ -1,4 +1,4 @@
-//! Reputation scorers: IPQS, AbuseIPDB and Scamalytics.
+//! Reputation scorers: a fraud score, an abuse-report confidence and a proxy-risk score.
 //!
 //! A scorer receives the exit IP and the API key only (lookup rule): no
 //! target, org or client data. The reply is reduced to
@@ -13,19 +13,19 @@ use serde::Deserialize;
 use crate::http::read_capped;
 
 const MAX_REPLY_BYTES: usize = 64 * 1024;
-/// Look-back window of the AbuseIPDB check.
-const ABUSEIPDB_MAX_AGE_DAYS: &str = "90";
+/// Look-back window of the abuse-confidence check.
+const ABUSE_CONFIDENCE_MAX_AGE_DAYS: &str = "90";
 
 /// Which service produced a score. The name is the `service` metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScorerKind {
-    Ipqs,
-    AbuseIpdb,
-    Scamalytics,
+    FraudScore,
+    AbuseConfidence,
+    ProxyRisk,
 }
 
 impl ScorerKind {
-    const ALL: [Self; 3] = [Self::Ipqs, Self::AbuseIpdb, Self::Scamalytics];
+    const ALL: [Self; 3] = [Self::FraudScore, Self::AbuseConfidence, Self::ProxyRisk];
 
     /// The kind whose [`name`](Self::name) is `name`.
     pub fn from_name(name: &str) -> Option<Self> {
@@ -34,9 +34,9 @@ impl ScorerKind {
 
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Ipqs => "ipqs",
-            Self::AbuseIpdb => "abuseipdb",
-            Self::Scamalytics => "scamalytics",
+            Self::FraudScore => "fraud_score",
+            Self::AbuseConfidence => "abuse_confidence",
+            Self::ProxyRisk => "proxy_risk",
         }
     }
 }
@@ -73,7 +73,7 @@ pub enum ScoreError {
 }
 
 /// Where a scorer lives and how it authenticates. `base_url` is the origin
-/// (`https://ipqualityscore.com`); tests point it at a local stub.
+/// (the provider origin, see `fraud_score_base_url`); tests point it at a local stub.
 #[derive(Debug, Clone)]
 pub struct ScorerAccount {
     pub base_url: String,
@@ -83,11 +83,11 @@ pub struct ScorerAccount {
 #[derive(Debug, Clone)]
 pub enum Scorer {
     /// `GET {base}/api/json/ip/{key}/{ip}`
-    Ipqs(ScorerAccount),
+    FraudScore(ScorerAccount),
     /// `GET {base}/api/v2/check?ipAddress={ip}&maxAgeInDays=90`, header `Key`
-    AbuseIpdb(ScorerAccount),
+    AbuseConfidence(ScorerAccount),
     /// `GET {base}/v3/{customer}?key={key}&ip={ip}`
-    Scamalytics {
+    ProxyRisk {
         account: ScorerAccount,
         customer: String,
     },
@@ -96,9 +96,9 @@ pub enum Scorer {
 impl Scorer {
     pub fn kind(&self) -> ScorerKind {
         match self {
-            Self::Ipqs(_) => ScorerKind::Ipqs,
-            Self::AbuseIpdb(_) => ScorerKind::AbuseIpdb,
-            Self::Scamalytics { .. } => ScorerKind::Scamalytics,
+            Self::FraudScore(_) => ScorerKind::FraudScore,
+            Self::AbuseConfidence(_) => ScorerKind::AbuseConfidence,
+            Self::ProxyRisk { .. } => ScorerKind::ProxyRisk,
         }
     }
 
@@ -106,9 +106,9 @@ impl Scorer {
     pub async fn score(&self, http: &Client, ip: IpAddr) -> Result<Score, ScoreError> {
         let body = self.fetch(http, ip).await?;
         let (risk, flags) = match self {
-            Self::Ipqs(_) => ipqs(&body)?,
-            Self::AbuseIpdb(_) => abuseipdb(&body)?,
-            Self::Scamalytics { .. } => scamalytics(&body)?,
+            Self::FraudScore(_) => fraud_score(&body)?,
+            Self::AbuseConfidence(_) => abuse_confidence(&body)?,
+            Self::ProxyRisk { .. } => proxy_risk(&body)?,
         };
         Ok(Score {
             risk,
@@ -119,7 +119,7 @@ impl Scorer {
 
     fn request(&self, http: &Client, ip: IpAddr) -> Result<RequestBuilder, ScoreError> {
         match self {
-            Self::Ipqs(acct) => {
+            Self::FraudScore(acct) => {
                 let ip = ip.to_string();
                 let url = endpoint(
                     &acct.base_url,
@@ -127,17 +127,17 @@ impl Scorer {
                 )?;
                 Ok(http.get(url))
             }
-            Self::AbuseIpdb(acct) => {
+            Self::AbuseConfidence(acct) => {
                 let mut url = endpoint(&acct.base_url, &["api", "v2", "check"])?;
                 url.query_pairs_mut()
                     .append_pair("ipAddress", &ip.to_string())
-                    .append_pair("maxAgeInDays", ABUSEIPDB_MAX_AGE_DAYS);
+                    .append_pair("maxAgeInDays", ABUSE_CONFIDENCE_MAX_AGE_DAYS);
                 Ok(http
                     .get(url)
                     .header("Key", acct.key.expose())
                     .header(ACCEPT, "application/json"))
             }
-            Self::Scamalytics { account, customer } => {
+            Self::ProxyRisk { account, customer } => {
                 let mut url = endpoint(&account.base_url, &["v3", customer])?;
                 url.query_pairs_mut()
                     .append_pair("key", account.key.expose())
@@ -186,7 +186,7 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, ScoreError> {
 }
 
 #[derive(Deserialize)]
-struct IpqsReply {
+struct FraudScoreReply {
     success: bool,
     message: Option<String>,
     fraud_score: Option<f64>,
@@ -195,8 +195,8 @@ struct IpqsReply {
     active_tor: Option<bool>,
 }
 
-fn ipqs(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
-    let r: IpqsReply = decode(body)?;
+fn fraud_score(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
+    let r: FraudScoreReply = decode(body)?;
     if !r.success {
         return Err(ScoreError::Rejected(r.message.unwrap_or_default()));
     }
@@ -219,7 +219,7 @@ struct AbuseData {
     is_tor: Option<bool>,
 }
 
-fn abuseipdb(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
+fn abuse_confidence(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
     let r: AbuseReply = decode(body)?;
     let flags = Flags {
         tor: r.data.is_tor.unwrap_or(false),
@@ -229,51 +229,55 @@ fn abuseipdb(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
 }
 
 #[derive(Deserialize)]
-struct ScamReply {
-    scamalytics: ScamCore,
-    external_datasources: Option<ScamSources>,
+struct ProxyRiskReply {
+    #[serde(rename = "scamalytics")] // wire-compat: reply key of the proxy-risk service
+    core: ProxyRiskCore,
+    external_datasources: Option<ExternalSources>,
 }
 
 #[derive(Deserialize)]
-struct ScamCore {
+struct ProxyRiskCore {
     status: String,
-    scamalytics_score: Option<f64>,
-    scamalytics_proxy: Option<ScamProxy>,
+    #[serde(rename = "scamalytics_score")] // wire-compat: reply key of the proxy-risk service
+    score: Option<f64>,
+    #[serde(rename = "scamalytics_proxy")] // wire-compat: reply key of the proxy-risk service
+    proxy: Option<ProxyFlags>,
 }
 
 #[derive(Deserialize)]
-struct ScamProxy {
+struct ProxyFlags {
     is_datacenter: Option<bool>,
     is_vpn: Option<bool>,
     is_resproxy: Option<bool>,
 }
 
 #[derive(Deserialize)]
-struct ScamSources {
-    x4bnet: Option<ScamX4b>,
+struct ExternalSources {
+    #[serde(rename = "x4bnet")] // wire-compat: reply key of the proxy-risk service
+    tor_list: Option<TorList>,
 }
 
 #[derive(Deserialize)]
-struct ScamX4b {
+struct TorList {
     is_tor: Option<bool>,
 }
 
-fn scamalytics(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
-    let r: ScamReply = decode(body)?;
-    if r.scamalytics.status != "ok" {
-        return Err(ScoreError::Rejected(r.scamalytics.status));
+fn proxy_risk(body: &[u8]) -> Result<(u8, Flags), ScoreError> {
+    let r: ProxyRiskReply = decode(body)?;
+    if r.core.status != "ok" {
+        return Err(ScoreError::Rejected(r.core.status));
     }
-    let proxy = r.scamalytics.scamalytics_proxy.is_some_and(|p| {
+    let proxy = r.core.proxy.is_some_and(|p| {
         p.is_vpn.unwrap_or(false)
             || p.is_datacenter.unwrap_or(false)
             || p.is_resproxy.unwrap_or(false)
     });
     let tor = r
         .external_datasources
-        .and_then(|s| s.x4bnet)
+        .and_then(|s| s.tor_list)
         .and_then(|x| x.is_tor)
         .unwrap_or(false);
-    let score = r.scamalytics.scamalytics_score.ok_or(ScoreError::Parse)?;
+    let score = r.core.score.ok_or(ScoreError::Parse)?;
     Ok((risk(score)?, Flags { tor, proxy }))
 }
 
@@ -288,8 +292,8 @@ mod tests {
         "5.6.7.8".parse().expect("valid test value")
     }
 
-    fn scamalytics_scorer(stub: &Stub) -> Scorer {
-        Scorer::Scamalytics {
+    fn proxy_risk_scorer(stub: &Stub) -> Scorer {
+        Scorer::ProxyRisk {
             account: account(stub, KEY),
             customer: "acme".into(),
         }
@@ -305,16 +309,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipqs_reads_fraud_score_and_tor_and_sends_only_ip_and_key() {
+    async fn fraud_score_reads_fraud_score_and_tor_and_sends_only_ip_and_key() {
         let stub = answering(
             200,
             r#"{"success":true,"message":"Success","fraud_score":87.6,"proxy":true,"vpn":true,"tor":false,"active_tor":true,"country_code":"FR"}"#,
         );
-        let score = lookup(&Scorer::Ipqs(account(&stub, KEY)))
+        let score = lookup(&Scorer::FraudScore(account(&stub, KEY)))
             .await
             .expect("call succeeds");
         assert_eq!(score.risk, 88);
-        assert_eq!(score.source, ScorerKind::Ipqs);
+        assert_eq!(score.source, ScorerKind::FraudScore);
         assert_eq!((score.flags.tor, score.flags.proxy), (true, true));
         let req = &stub.requests()[0];
         // The key is a path segment (percent-encoded); nothing else is sent.
@@ -334,12 +338,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipqs_failure_replies_are_errors() {
+    async fn fraud_score_failure_replies_are_errors() {
         let stub = answering(
             200,
             r#"{"success":false,"message":"Invalid or unauthorized key."}"#,
         );
-        let err = lookup(&Scorer::Ipqs(account(&stub, KEY)))
+        let err = lookup(&Scorer::FraudScore(account(&stub, KEY)))
             .await
             .expect_err("call fails");
         assert!(
@@ -348,21 +352,24 @@ mod tests {
         );
         let stub = answering(200, r#"{"success":true}"#);
         assert!(matches!(
-            lookup(&Scorer::Ipqs(account(&stub, KEY))).await,
+            lookup(&Scorer::FraudScore(account(&stub, KEY))).await,
             Err(ScoreError::Parse)
         ));
     }
 
     #[tokio::test]
-    async fn abuseipdb_reads_confidence_score_and_tor_with_key_in_header() {
+    async fn abuse_confidence_reads_confidence_score_and_tor_with_key_in_header() {
         let stub = answering(
             200,
             r#"{"data":{"ipAddress":"5.6.7.8","isPublic":true,"abuseConfidenceScore":100,"isTor":true,"usageType":"Fixed Line ISP"}}"#,
         );
-        let score = lookup(&Scorer::AbuseIpdb(account(&stub, KEY)))
+        let score = lookup(&Scorer::AbuseConfidence(account(&stub, KEY)))
             .await
             .expect("call succeeds");
-        assert_eq!((score.risk, score.source), (100, ScorerKind::AbuseIpdb));
+        assert_eq!(
+            (score.risk, score.source),
+            (100, ScorerKind::AbuseConfidence)
+        );
         assert_eq!((score.flags.tor, score.flags.proxy), (true, false));
         let req = &stub.requests()[0];
         assert_eq!(
@@ -377,46 +384,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abuseipdb_rate_limit_is_a_status_error() {
+    async fn abuse_confidence_rate_limit_is_a_status_error() {
         let stub = answering(
             429,
             r#"{"errors":[{"detail":"Daily rate limit exceeded."}]}"#,
         );
-        let err = lookup(&Scorer::AbuseIpdb(account(&stub, KEY)))
+        let err = lookup(&Scorer::AbuseConfidence(account(&stub, KEY)))
             .await
             .expect_err("call fails");
         assert!(matches!(err, ScoreError::Status(429)), "{err}");
     }
 
     #[tokio::test]
-    async fn scamalytics_reads_score_tor_and_proxy_flags() {
-        let stub = answering(
-            200,
-            r#"{"scamalytics":{"status":"ok","mode":"live","ip":"5.6.7.8","scamalytics_score":42,"scamalytics_risk":"low",
-                    "scamalytics_proxy":{"is_datacenter":false,"is_vpn":false,"is_resproxy":true}},
-                   "external_datasources":{"x4bnet":{"is_vpn":false,"is_tor":true}}}"#,
-        );
-        let score = lookup(&scamalytics_scorer(&stub))
+    async fn proxy_risk_reads_score_tor_and_proxy_flags() {
+        // wire-compat: a recorded reply of the proxy-risk service
+        let reply = r#"{"scamalytics":{"status":"ok","mode":"live","ip":"5.6.7.8","scamalytics_score":42,"scamalytics_risk":"low","scamalytics_proxy":{"is_datacenter":false,"is_vpn":false,"is_resproxy":true}},"external_datasources":{"x4bnet":{"is_vpn":false,"is_tor":true}}}"#;
+        let stub = answering(200, reply);
+        let score = lookup(&proxy_risk_scorer(&stub))
             .await
             .expect("call succeeds");
-        assert_eq!((score.risk, score.source), (42, ScorerKind::Scamalytics));
+        assert_eq!((score.risk, score.source), (42, ScorerKind::ProxyRisk));
         assert_eq!((score.flags.tor, score.flags.proxy), (true, true));
         assert_eq!(stub.requests()[0].path(), "/v3/acme?key=k+e%2Fy&ip=5.6.7.8");
     }
 
     #[tokio::test]
-    async fn scamalytics_tolerates_essential_tier_nulls_and_rejects_errors() {
-        let stub = answering(
-            200,
-            r#"{"scamalytics":{"status":"ok","scamalytics_score":0,"scamalytics_proxy":{"is_datacenter":false,"is_vpn":false,"is_resproxy":null}},"external_datasources":{"x4bnet":{"is_tor":false}}}"#,
-        );
-        let score = lookup(&scamalytics_scorer(&stub))
+    async fn proxy_risk_tolerates_essential_tier_nulls_and_rejects_errors() {
+        // wire-compat: recorded replies of the proxy-risk service
+        let nulls = r#"{"scamalytics":{"status":"ok","scamalytics_score":0,"scamalytics_proxy":{"is_datacenter":false,"is_vpn":false,"is_resproxy":null}},"external_datasources":{"x4bnet":{"is_tor":false}}}"#;
+        let stub = answering(200, nulls);
+        let score = lookup(&proxy_risk_scorer(&stub))
             .await
             .expect("call succeeds");
         assert_eq!((score.risk, score.flags), (0, Flags::default()));
+        // wire-compat: a recorded error reply of the proxy-risk service
         let stub = answering(200, r#"{"scamalytics":{"status":"error"}}"#);
         assert!(
-            matches!(lookup(&scamalytics_scorer(&stub)).await, Err(ScoreError::Rejected(s)) if s == "error")
+            matches!(lookup(&proxy_risk_scorer(&stub)).await, Err(ScoreError::Rejected(s)) if s == "error")
         );
     }
 
@@ -438,9 +442,9 @@ mod tests {
             key: Secret::new("topsecretkey"),
         };
         for scorer in [
-            Scorer::Ipqs(acct.clone()),
-            Scorer::AbuseIpdb(acct.clone()),
-            Scorer::Scamalytics {
+            Scorer::FraudScore(acct.clone()),
+            Scorer::AbuseConfidence(acct.clone()),
+            Scorer::ProxyRisk {
                 account: acct,
                 customer: "acme".into(),
             },

@@ -1,4 +1,4 @@
-//! LLM-assisted tools against a fake OpenAI-compatible server.
+//! LLM-assisted tools against a fake chat-completions compatible server.
 
 mod common;
 

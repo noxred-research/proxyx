@@ -187,9 +187,9 @@ All families are defined in `crates/pool-common/src/metrics.rs` (`Metrics::new(s
 
 ### `proxyx_pool_check_failures_total`
 - **Type:** counter
-- **Labels:** `check` (ipify, cloudflare, ipinfo, ifconfig_co, provider_echo, ipqs, abuseipdb, scamalytics)
+- **Labels:** `check` (ip_json, trace_lines, ip_country_json, ip_country_iso_json, provider_echo, fraud_score, abuse_confidence, proxy_risk)
 - **Source:** event, `crates/verify` (`exit_ip.rs`, `reputation.rs`) when a check call fails
-- **Meaning:** Failed calls to IP-check and reputation services. The label is `check`, not `service`, because every series already carries the constant `service` label. A reputation scorer is on when its key file exists in the secrets directory (`ipqs_api_key`, `abuseipdb_api_key`, `scamalytics_api_key`); `scamalytics` also needs the setting `scamalytics_customer` (`PROXYX_POOL_SCAMALYTICS_CUSTOMER`, its account name) and fails the start without it. Put its key file in the secrets directory to turn it on. `PROXYX_POOL_SCAMALYTICS_BASE_URL` (default `https://api12.scamalytics.com`, the EU node) points it elsewhere, like the other two origins.
+- **Meaning:** Failed calls to IP-check and reputation services. The label is `check`, not `service`, because every series already carries the constant `service` label. A reputation scorer is on when its key file exists in the secrets directory (`fraud_score_api_key`, `abuse_confidence_api_key`, `proxy_risk_api_key`); `proxy_risk` also needs the setting `proxy_risk_customer` (`PROXYX_POOL_PROXY_RISK_CUSTOMER`, its account name) and fails the start without it. Put its key file in the secrets directory to turn it on. `PROXYX_POOL_PROXY_RISK_BASE_URL` (default: the service's EU node) points it elsewhere, like the other two origins.
 - **Query:** `sum by (check) (rate(proxyx_pool_check_failures_total[15m]))`
 
 ## Warmer (provider cost and health)
@@ -257,7 +257,7 @@ All families are defined in `crates/pool-common/src/metrics.rs` (`Metrics::new(s
 
 ## Prober (Python process `proxyx-prober`)
 
-Defined in `prober/src/proxyx_prober/metrics.py` with `prometheus_client` and served on `/metrics` of the prober's metrics port (8081 by default). The standalone prober runs local Chromium through Playwright. The `service` label is the prober's `SERVICE_NAME`. These families are not in the Rust registry, so the registry/doc test stops at this heading.
+Defined in `prober/src/proxyx_prober/metrics.py` with `prometheus_client` and served on `/metrics` of the prober's metrics port (8081 by default). The standalone prober runs a local headless browser through a browser-automation library. The `service` label is the prober's `SERVICE_NAME`. These families are not in the Rust registry, so the registry/doc test stops at this heading.
 
 | Name | Type | Labels | Meaning |
 |---|---|---|---|

@@ -152,7 +152,7 @@ fn bind() -> (TcpListener, SocketAddr) {
 
 /// An HTTP server on 127.0.0.1 that answers every request with the IP it saw
 /// the client connect from, as `{"ip":"<peer>","country":"fr"}` (the shape of
-/// the ipinfo and ipify services). Must run inside a Tokio runtime.
+/// the IP-echo services). Must run inside a Tokio runtime.
 pub fn peer_echo() -> SocketAddr {
     let (listener, addr) = bind();
     tokio::spawn(async move {
@@ -205,8 +205,8 @@ pub fn upstream(stub: &Stub) -> UpstreamEndpoint {
     }
 }
 
-/// An IPQS stub scoring every IP `fraud_score`.
-pub fn ipqs(fraud_score: u32) -> Stub {
+/// A fraud-score stub scoring every IP `fraud_score`.
+pub fn fraud_score(fraud_score: u32) -> Stub {
     Stub::spawn(move |_| {
         Resp::ok(format!(
             r#"{{"success":true,"fraud_score":{fraud_score},"tor":false}}"#
@@ -221,9 +221,9 @@ pub fn account(stub: &Stub, key: &str) -> ScorerAccount {
     }
 }
 
-pub fn ipqs_slot(stub: &Stub, daily_budget: u32) -> ScorerSlot {
+pub fn fraud_score_slot(stub: &Stub, daily_budget: u32) -> ScorerSlot {
     ScorerSlot {
-        scorer: Scorer::Ipqs(account(stub, "key")),
+        scorer: Scorer::FraudScore(account(stub, "key")),
         daily_budget,
     }
 }

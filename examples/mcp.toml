@@ -101,11 +101,11 @@ history = 120
 # password_file = "/etc/proxyx/secrets/customer-egress-password"
 
 # --- Optional LLM for summarize_traffic, classify_block_page and suggest_policy ------------------------
-# Any OpenAI-compatible chat completions endpoint: OpenAI, an Anthropic-compatible gateway, Ollama, vLLM.
+# Any chat-completions compatible endpoint: a hosted service, a gateway or a local inference server.
 # Without this section those tools run on rules and statistics only (or are not listed).
 # [llm]
 # endpoint = "http://127.0.0.1:11434/v1"        # base URL or the full .../chat/completions URL
-# model = "llama3.1"
+# model = "my-model"
 # api_key_file = "/etc/proxyx/secrets/llm-key"  # omit for a local server without a key
 # ca_file = "/etc/proxyx/secrets/llm-ca.pem"   # PEM of the private CA that signed an https endpoint's certificate
 # timeout_secs = 60

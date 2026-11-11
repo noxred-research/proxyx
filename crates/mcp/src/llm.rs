@@ -1,7 +1,7 @@
-//! An OpenAI-compatible chat completions client for the optional LLM-assisted tools.
+//! A chat-completions compatible client for the optional LLM-assisted tools.
 //!
-//! Works against OpenAI, Anthropic-compatible gateways, Ollama, vLLM and anything else that
-//! serves `POST .../chat/completions`. A call asks for JSON that matches a schema
+//! Works against hosted services, gateways and local inference servers that
+//! serve `POST .../chat/completions`. A call asks for JSON that matches a schema
 //! (`response_format: json_schema`, falling back to `json_object` for servers that refuse
 //! it), at temperature 0, and the answer is validated against the same schema before it is
 //! returned. The key goes only in the bearer header, redirects are not followed, the response

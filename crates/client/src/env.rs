@@ -80,11 +80,11 @@ impl std::fmt::Debug for ProxyEnv {
     }
 }
 
-/// Chromium arguments that select the proxy: `--proxy-server=<url>`.
+/// Chrome-family browser arguments that select the proxy: `--proxy-server=<url>`.
 ///
-/// The URL is passed as given, userinfo included. Chromium ignores credentials in
-/// `--proxy-server` and does not authenticate SOCKS5, so a driver such as Playwright takes the
-/// server, username and password separately instead.
+/// The URL is passed as given, userinfo included. These browsers ignore credentials in
+/// `--proxy-server` and do not authenticate SOCKS5, so a browser-automation driver that takes
+/// the server, username and password separately is the reliable route.
 pub fn browser_args(proxy_url: &str) -> Vec<String> {
     vec![format!("--proxy-server={proxy_url}")]
 }

@@ -1,5 +1,5 @@
-"""The real page driver: a local Chromium, launched with Playwright, that
-reaches the web through ProxyX's probe listener."""
+"""The real page driver: a local headless browser, driven through an automation
+library, that reaches the web through ProxyX's probe listener."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from urllib.parse import urlsplit
 
-from playwright.async_api import Browser, Response, async_playwright
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Browser, Response
+from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeoutError
+from playwright.async_api import async_playwright as start_automation
 
 from .detect import BODY_LIMIT
 from .measure import (
@@ -37,7 +38,7 @@ _NAVIGATION_ENTRY_JS = (
 )
 
 
-class PlaywrightDriver:
+class BrowserDriver:
     """Loads each URL in a fresh, isolated browser context."""
 
     def __init__(self, browser: Browser, login: ProxyLogin) -> None:
@@ -53,8 +54,8 @@ class PlaywrightDriver:
                     response: Response | None = await page.goto(
                         url, wait_until="load", timeout=timeout_s * 1000
                     )
-                except PlaywrightTimeoutError as exc:
-                    # Chromium can hide a CONNECT 407 behind an auth prompt
+                except BrowserTimeoutError as exc:
+                    # The browser can hide a CONNECT 407 behind an auth prompt
                     # until navigation times out. Confirm only explicit 407;
                     # an unavailable diagnostic never changes route quality.
                     if await _proxy_credentials_rejected(self._login, url):
@@ -78,7 +79,7 @@ class PlaywrightDriver:
                 )
             finally:
                 await context.close()
-        except PlaywrightError as exc:
+        except BrowserError as exc:
             # Opening the context, reading the page and closing the context can
             # fail too; a dead browser is this machine's fault, anything else
             # is this page's.
@@ -142,32 +143,33 @@ async def _proxy_credentials_rejected(login: ProxyLogin, url: str) -> bool:
 
 
 @asynccontextmanager
-async def playwright_driver(login: ProxyLogin) -> AsyncIterator[PageDriver]:
-    """Launch a headless Chromium whose traffic goes through *login*.
+async def browser_driver(login: ProxyLogin) -> AsyncIterator[PageDriver]:
+    """Launch a headless browser whose traffic goes through *login*.
 
     A failed launch is a browser-side failure, not a route result.
     """
 
     async with AsyncExitStack() as stack:
         try:
-            playwright = await stack.enter_async_context(async_playwright())
-            browser = await playwright.chromium.launch(
+            automation = await stack.enter_async_context(start_automation())
+            # wire-compat: the automation library names its browser engines
+            browser = await automation.chromium.launch(
                 proxy={
                     "server": login.server,
                     "username": login.username,
                     "password": login.password,
                 }
             )
-        except (PlaywrightError, OSError) as exc:
+        except (BrowserError, OSError) as exc:
             raise BrowserUnavailable(f"browser launch failed: {exc}") from exc
         stack.push_async_callback(_close, browser)
-        yield PlaywrightDriver(browser, login)
+        yield BrowserDriver(browser, login)
 
 
 async def _close(browser: Browser) -> None:
-    """Close Chromium. The measurements are already taken, so a failure only logs."""
+    """Close the browser. The measurements are already taken, so a failure only logs."""
 
     try:
         await browser.close()
-    except (PlaywrightError, OSError) as exc:
+    except (BrowserError, OSError) as exc:
         log.warning("browser close failed: %s", type(exc).__name__)

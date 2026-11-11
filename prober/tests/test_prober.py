@@ -29,13 +29,13 @@ from proxyx_prober.settings import ProberSettings
 
 OK_URL = "https://ok.test/"
 BLOCKED_URL = "https://blocked.test/"
-SORRY_URL = "https://www.google.fr/"
+SORRY_URL = "https://www.example.fr/"
 
 
 def route_class(name: str = "fr-web", targets: list[str] | None = None) -> RouteClass:
     return RouteClass(
         route_class=name,
-        provider="oxylabs_isp",
+        provider="isp_static_port",
         regions=[
             RegionTargets(region="fr/paris", country="fr", targets=targets or [OK_URL])
         ],
@@ -46,7 +46,7 @@ def sample(job_id: str = "job1", sid: str | None = "cand_1") -> SampleJob:
     return SampleJob(
         job_id=job_id,
         route_class="fr-web",
-        provider="oxylabs_isp",
+        provider="isp_static_port",
         region="fr/paris",
         country="fr",
         sid=sid,
@@ -94,7 +94,7 @@ async def test_canary_posts_results_through_the_probe_listener(tmp_path: Path) -
     driver = FakeDriver(
         {
             BLOCKED_URL: page(status=403, body="Forbidden"),
-            SORRY_URL: page(url="https://www.google.fr/sorry/index?continue=x"),
+            SORRY_URL: page(url="https://www.example.fr/sorry/index?continue=x"),
         }
     )
     targets = ProbeTargets(
@@ -117,14 +117,14 @@ async def test_canary_posts_results_through_the_probe_listener(tmp_path: Path) -
         assert by_target[(OK_URL, run)].outcome is Outcome.OK
         assert by_target[(BLOCKED_URL, run)].outcome is Outcome.BLOCKED
         assert by_target[(BLOCKED_URL, run)].block_reason == "http_403"
-        assert by_target[(SORRY_URL, run)].block_reason == "google_sorry"
+        assert by_target[(SORRY_URL, run)].block_reason == "sorry_redirect"
     assert by_target[(OK_URL, 1)].load_ms == 900.0
 
     (login,) = browsers.logins
     assert login.server == settings.proxy_url
     assert login.password == f"{PROBE_TOKEN}-1"
     match = re.fullmatch(
-        r"px-prov-oxylabs_isp-cc-fr-sid-([a-z0-9]{16})", login.username
+        r"px-prov-isp_static_port-cc-fr-sid-([a-z0-9]{16})", login.username
     )
     assert match is not None
     assert posted.session == match.group(1)
@@ -239,7 +239,7 @@ def test_one_job_per_region_and_samples_are_always_listed(tmp_path: Path) -> Non
     prober, *_ = build(settings_for(tmp_path), ProbeTargets())
     two_regions = RouteClass(
         route_class="eu",
-        provider="oxylabs_isp",
+        provider="isp_static_port",
         regions=[
             RegionTargets(region="fr", country="fr", targets=[OK_URL]),
             RegionTargets(region="de", country="de", targets=[OK_URL]),

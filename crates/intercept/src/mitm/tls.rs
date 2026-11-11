@@ -49,7 +49,7 @@ impl TlsProfile {
 
     /// Select a TLS profile from the client's User-Agent string.
     ///
-    /// Chrome/Chromium → Chrome133.
+    /// Chrome-family agents → Chrome133.
     /// Firefox → version-split: Firefox/N where N >= 128 → Firefox135, else Firefox120.
     ///   If no parseable version, defaults to Firefox135 (assume current).
     /// Safari (not Chrome) → Safari18.
@@ -59,6 +59,7 @@ impl TlsProfile {
             return TlsProfile::Chrome133;
         };
         let ua_lower = ua.to_ascii_lowercase();
+        // wire-compat: User-Agent token of Chrome-family browsers
         if ua_lower.contains("chrome") || ua_lower.contains("chromium") {
             TlsProfile::Chrome133
         } else if ua_lower.contains("firefox") {
@@ -130,8 +131,8 @@ impl TlsProfile {
         match self {
             // Chrome 133: X25519MLKEM768 first (post-quantum hybrid, default
             // since Chrome 131 with ML-KEM codepoint 0x11EC), then classical.
-            // No P-521: utls HelloChrome_133 and shipping Chrome/Chromium
-            // advertise exactly x25519, P-256, P-384 after the hybrid.
+            // No P-521: reference captures of Chrome 133 and shipping Chrome-family
+            // browsers advertise exactly x25519, P-256, P-384 after the hybrid.
             TlsProfile::Chrome133 => "X25519MLKEM768:X25519:P-256:P-384",
             // Firefox < 128: no post-quantum group.
             TlsProfile::Firefox120 => "X25519:P-256:P-384:P-521",
@@ -196,8 +197,8 @@ impl TlsProfile {
 
     /// Whether to send a `status_request` (OCSP stapling) extension.
     ///
-    /// Present in the captured utls HelloChrome_133 / HelloFirefox_120 parrots and
-    /// in locally installed Chrome, Chromium and Firefox. No Safari 18 reference
+    /// Present in the captured Chrome 133 / Firefox 120 reference handshakes and
+    /// in locally installed Chrome-family browsers and Firefox. No Safari 18 reference
     /// could be captured, so that profile is left unchanged.
     fn requests_ocsp_stapling(self) -> bool {
         !matches!(self, TlsProfile::Safari18)

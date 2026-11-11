@@ -114,15 +114,15 @@ let child = tokio::process::Command::new("python3").arg("crawl.py").envs(env.ite
 // or choose where the bundle goes (you own the file)
 let env = session.proxy_env_at(std::path::Path::new("/run/crawl/ca.pem")).await?;
 
-// Chromium: ["--proxy-server=http://<session id>:password@host:8443"]
+// Chrome-family browsers: ["--proxy-server=http://<session id>:password@host:8443"]
 let args = session.browser_args();
 
 // a reqwest client that uses the proxy and trusts the session CA
 let http = session.http_client()?;
 ```
 
-Chromium ignores credentials in `--proxy-server` and does not authenticate SOCKS5. Drivers that take the server, username
-and password separately (Playwright, for example) are the reliable route; read them from `proxy_url()`.
+Chrome-family browsers ignore credentials in `--proxy-server` and do not authenticate SOCKS5. Browser-automation drivers that
+take the server, username and password separately are the reliable route; read them from `proxy_url()`.
 
 `env::ca_bundle_pem`, `env::write_ca_bundle` and `env::TempCaBundle` work without a session. `system_roots_pem()` fails
 when the OS store holds no certificate, so a bundle never silently lacks the public roots.

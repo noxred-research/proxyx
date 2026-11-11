@@ -12,7 +12,7 @@ scope = "global"
 # Kinds in preference order. An org policy may change the order.
 kinds = ["static", "rotating"]
 # Provider order. Unset (the default): every configured provider.
-# providers = ["oxylabs_isp"]
+# providers = ["isp_static_port"]
 # Regions in fallback order. Required; there is no default.
 regions = ["fr", "de"]
 # Only "shared" is accepted. For a unit that one org alone may use, set a customer upstream.

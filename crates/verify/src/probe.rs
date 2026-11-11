@@ -15,12 +15,12 @@ use crate::replace::ProbeRound;
 /// 403 and 503 answers: a normal page may legitimately embed a captcha.
 const CHALLENGE_MARKERS: &[&str] = &[
     "captcha",
-    "cf-chl",
+    "cf-chl", // detection-data
     "challenge-platform",
     "just a moment",
     "attention required",
     "unusual traffic",
-    "datadome",
+    "datadome", // detection-data
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -29,7 +29,7 @@ pub struct ProbeConfig {
     pub samples: usize,
     /// Bytes of body read per GET.
     pub max_body: usize,
-    /// Redirects followed per GET. Google's `/sorry/` redirect is a block
+    /// Redirects followed per GET. A search engine's `/sorry/` redirect is a block
     /// whenever it is reached.
     pub max_redirects: usize,
     /// Time limit of one request (each redirect hop is one), tunnel setup
@@ -211,6 +211,7 @@ async fn sample(client: &Client, cfg: &ProbeConfig, target: &Url) -> Sample {
             url = next;
             continue;
         }
+        // detection-data: the challenge header of a CDN
         let challenged = resp.headers().contains_key("cf-mitigated");
         let body = match read_capped(&mut resp, cfg.max_body).await {
             Ok(body) => body,
@@ -242,13 +243,13 @@ fn redirect_target(resp: &Response, from: &Url) -> Option<Url> {
     from.join(location).ok()
 }
 
-/// Google's block interstitial lives under `/sorry/`.
+/// The block interstitial of a search engine lives under `/sorry/`.
 fn is_sorry(url: &Url) -> bool {
     url.path().starts_with("/sorry/")
 }
 
 /// Block type of a final answer. `challenged`: the answer carries a
-/// challenge header (`cf-mitigated`) or sits on a `/sorry/` page.
+/// CDN challenge header or sits on a `/sorry/` page.
 fn classify(status: u16, challenged: bool, body: &[u8]) -> Option<SignalType> {
     if challenged {
         return Some(SignalType::Challenge);
@@ -298,7 +299,7 @@ mod tests {
     fn classification_boundaries() {
         let c = classify;
         assert_eq!(
-            c(200, false, b"<div class='g-recaptcha'>"),
+            c(200, false, b"<div class='captcha-widget'>"),
             None,
             "captcha text on a 200 is not a block"
         );
@@ -314,6 +315,7 @@ mod tests {
             Some(SignalType::Challenge)
         );
         assert_eq!(
+            // detection-data: a CDN challenge script path
             c(503, false, b"<script src='/cdn-cgi/challenge-platform/'>"),
             Some(SignalType::Challenge)
         );
@@ -400,9 +402,12 @@ mod tests {
                 403,
                 "<h1>Verify you are human</h1><div class=\"h-captcha\"></div>",
             ),
+            // detection-data: the challenge header of a CDN
             "cf.test" => Resp::status(403, "blocked").header("cf-mitigated", "challenge"),
-            "sorry.test" => Resp::status(302, "")
-                .header("Location", "https://www.google.com/sorry/index?continue=x"),
+            "sorry.test" => Resp::status(302, "").header(
+                "Location",
+                "https://search.example.test/sorry/index?continue=x",
+            ),
             "fine.test" => Resp::ok("hello"),
             _ => Resp::status(404, ""),
         });
@@ -426,7 +431,11 @@ mod tests {
         );
         assert_eq!((report.round().blocked, report.round().total), (5, 6));
         // The sorry redirect is detected at the redirect: the interstitial is never fetched.
-        assert!(stub.requests().iter().all(|r| r.host() != "www.google.com"));
+        assert!(
+            stub.requests()
+                .iter()
+                .all(|r| r.host() != "search.example.test")
+        );
     }
 
     #[tokio::test]

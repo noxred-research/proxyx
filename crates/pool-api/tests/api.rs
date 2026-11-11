@@ -168,7 +168,7 @@ async fn inventory_put_list_retire_and_replacement_report() -> TestResult {
         "test",
     )
     .await?;
-    for (source, risk) in [("ipqs", 90u8), ("abuseipdb", 80)] {
+    for (source, risk) in [("fraud_score", 90u8), ("abuse_confidence", 80)] {
         h.db.record_score(&store::ScoreRow {
             ip: kept,
             source: source.into(),

@@ -232,15 +232,19 @@ async fn a_good_keepalive_resets_the_failure_count() -> TestResult {
 async fn keepalive_only_touches_the_echo_endpoint() -> TestResult {
     let mut h = harness!(start(10));
     one_session(&mut h).await?;
-    let (echo, probe, ipify) = (
+    let (echo, probe, ip_json) = (
         h.fake.hits("/echo"),
         h.fake.hits("/probe/ok"),
-        h.fake.hits("/ipify"),
+        h.fake.hits("/ip_json"),
     );
     step(&mut h).await?;
     assert!(h.fake.hits("/echo") > echo, "the neutral request went out");
     assert_eq!(h.fake.hits("/probe/ok"), probe, "never a target");
-    assert_eq!(h.fake.hits("/ipify"), ipify, "not the public quorum either");
+    assert_eq!(
+        h.fake.hits("/ip_json"),
+        ip_json,
+        "not the public quorum either"
+    );
     Ok(())
 }
 
@@ -273,7 +277,7 @@ async fn a_gateway_identity_keeps_its_auth_through_keepalive_and_ip_recheck() ->
             )
             .await?;
     assert_eq!(exit.ip, addr(91));
-    assert_eq!(h.fake.auth_user("/ipify").as_deref(), Some(user));
+    assert_eq!(h.fake.auth_user("/ip_json").as_deref(), Some(user));
 
     // Persist exactly the identity and job the gateway hands to the warmer.
     let now = OffsetDateTime::now_utc();
@@ -305,15 +309,15 @@ async fn a_gateway_identity_keeps_its_auth_through_keepalive_and_ip_recheck() ->
     assert!(ready(&h, &p, &kept).await?);
 
     // An IP change runs the full quorum through the same persisted recipe.
-    let checks = h.fake.hits("/ipify");
+    let checks = h.fake.hits("/ip_json");
     h.fake.set_user_ip(user, addr(92));
     let moved = next(&mut h).await?;
     assert_eq!(moved.session, session);
     assert_eq!(moved.ip, addr(92));
     assert_eq!((fails(&moved), changes(&moved)), (0, 1));
-    assert!(h.fake.hits("/ipify") > checks);
+    assert!(h.fake.hits("/ip_json") > checks);
     assert_eq!(h.fake.auth_user("/echo").as_deref(), Some(user));
-    assert_eq!(h.fake.auth_user("/ipify").as_deref(), Some(user));
+    assert_eq!(h.fake.auth_user("/ip_json").as_deref(), Some(user));
     assert!(ready(&h, &p, &moved).await?);
     Ok(())
 }
@@ -637,7 +641,7 @@ async fn per_request_adapters_never_warm_and_old_jobs_drain_without_checks() -> 
     assert!(crate::state::rotating_partitions(&h.w.loaded()).is_empty());
     h.reconcile().await;
     assert!(h.due_jobs().await?.is_empty());
-    assert_eq!(h.fake.hits("/ipify"), 0);
+    assert_eq!(h.fake.hits("/ip_json"), 0);
 
     let now = unix_now();
     let job = SessionJob {
@@ -666,7 +670,7 @@ async fn per_request_adapters_never_warm_and_old_jobs_drain_without_checks() -> 
     assert!(!ready(&h, &p, &job).await?);
     assert_eq!(evictions(&h, "session_mode"), 1);
     assert_eq!(h.fake.hits("/echo"), 0);
-    assert_eq!(h.fake.hits("/ipify"), 0);
+    assert_eq!(h.fake.hits("/ip_json"), 0);
     assert_eq!(h.fake.hits("/probe/ok"), 0);
     assert!(step(&mut h).await?.is_none());
     assert_eq!(claim(&h, job.ip).await?, ExitIpClaim::Claimed);

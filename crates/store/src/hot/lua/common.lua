@@ -1,5 +1,5 @@
 -- Helpers every script gets in front of its own text. Keys of one partition
--- all contain the hash tag T (for example "{oxylabs_isp:fr}"):
+-- all contain the hash tag T (for example "{isp_static_port:fr}"):
 --   ready:T            set of leasable unit ids
 --   unit:T:id          hash: ip, expires_at, last_org, last_used, held_until; tier is
 --                      'degraded' for a slow unit (absent or 'normal': normal tier);

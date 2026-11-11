@@ -26,7 +26,7 @@ a wrong type or bad syntax is an error. Durations are an integer of seconds or a
 [[policy]]
 name = "fr-web"                  # unique across all files
 scope = "route_class"            # global (default) | route_class | org
-match = "oxylabs_isp"            # provider id (route_class) or org id (org); absent for global
+match = "isp_static_port"            # provider id (route_class) or org id (org); absent for global
 kinds = ["static", "rotating"]   # preference order
 regions = ["fr/paris", "fr"]     # fallback order; required after merging
 min_ready = 10
@@ -356,7 +356,7 @@ policy for one org:
 [[policy]]
 name = "isp-fr"
 scope = "route_class"
-match = "oxylabs_isp"
+match = "isp_static_port"
 regions = ["fr/paris", "fr"]
 max_tunnels_per_org = 100
 

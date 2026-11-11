@@ -1,8 +1,9 @@
 name: codeql
 
-# Rust and Actions analysis uploads to code scanning only after this repository is public.
-# Keep CodeQL default setup disabled when enabling this advanced setup, to avoid duplicate
-# analyses. Rust's no-build analysis still runs build scripts and compiles macro code.
+# Rust, Python (the prober) and Actions analysis uploads to code scanning only after this
+# repository is public. Keep CodeQL default setup disabled when enabling this advanced setup,
+# to avoid duplicate analyses. Rust's no-build analysis still runs build scripts and compiles
+# macro code. The analyzed paths are set in .github/codeql/codeql-config.yml.
 #
 # Every job needs authorize. Ownership comes from the default branch's CODEOWNERS `*` rule,
 # not the event checkout. Actor and rerun actor must be owners; PRs also need an owner author
@@ -98,14 +99,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [rust, actions]
+        language: [rust, python, actions]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Native dependencies for Rust build scripts
         if: matrix.language == 'rust'
-        run: sudo apt-get update && sudo apt-get install -y cmake clang protobuf-compiler libssl-dev libsasl2-dev pkg-config
+        run: ci/install-build-deps.sh
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10
         if: matrix.language == 'rust'
         with:
@@ -115,6 +116,7 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
+          config-file: ./.github/codeql/codeql-config.yml
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}

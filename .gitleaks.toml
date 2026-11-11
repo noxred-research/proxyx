@@ -24,8 +24,9 @@ regexes = [
   '''^dGhlIHNhbXBsZSBub25jZQ==$''',
   # docs/gateway.md curl example: placeholder password, optionally preceded by username.
   '''(?:^|:)ak_YOUR_KEY'?$''',
-  # docs/gateway.md and docs/providers.md: credential file name using an RFC 5737 address.
-  '''^oxylabs_isp_203-0-113-50$''',
+  # docs/gateway.md and docs/providers.md: credential file name `<adapter id>_<RFC 5737 address>`.
+  # The prefix is generic so the historical commits, which used an earlier adapter id, stay clean.
+  '''^[a-z]+(?:_[a-z]+)*_203-0-113-50$''',
   # crates/bench/src/gateway.rs: repetitive benchmark-only org key.
   '''^ak_benchbenchbenchbenchbenchbenchbenchbench000$''',
   # crates/mcp/src/redact.rs: all-A key used to assert secret redaction.

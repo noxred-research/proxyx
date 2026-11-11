@@ -303,7 +303,7 @@ async fn stub_target() -> SocketAddr {
     .await
 }
 
-/// An IPQS scorer that gives every IP the risk `risk`.
+/// A fraud-score scorer that gives every IP the risk `risk`.
 async fn stub_scorer(risk: u32) -> SocketAddr {
     serve(move |mut s| async move {
         if read_head(&mut s).await.is_some() {
@@ -610,7 +610,7 @@ async fn start(env: &Env, setup: &Setup, inventory: Vec<InventoryRow>) -> Result
     };
     if setup.check {
         cfg.services.push(CheckService {
-            kind: ServiceKind::Ipify,
+            kind: ServiceKind::IpJson,
             url: "http://check.test/ip".into(),
         });
     }
@@ -618,7 +618,7 @@ async fn start(env: &Env, setup: &Setup, inventory: Vec<InventoryRow>) -> Result
     let mut slots = vec![];
     if let Some(risk) = setup.scorer_risk {
         slots.push(ScorerSlot {
-            scorer: Scorer::Ipqs(ScorerAccount {
+            scorer: Scorer::FraudScore(ScorerAccount {
                 base_url: format!("http://{}", stub_scorer(risk).await),
                 key: Secret::new("key"),
             }),

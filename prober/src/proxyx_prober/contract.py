@@ -8,17 +8,17 @@ Both calls carry ``Authorization: Bearer <prober token>``.
       "route_classes": [
         {
           "route_class": "fr-web",
-          "provider": "oxylabs_isp",
+          "provider": "isp_static_port",
           "regions": [
             {"region": "fr/paris", "country": "fr",
-             "targets": ["https://www.google.fr/", "https://www.lemonde.fr/"]}
+             "targets": ["https://www.example.fr/", "https://news.example.fr/"]}
           ]
         }
       ],
       "samples": [
-        {"job_id": "0b9f...", "route_class": "fr-web", "provider": "oxylabs_isp",
+        {"job_id": "0b9f...", "route_class": "fr-web", "provider": "isp_static_port",
          "region": "fr/paris", "country": "fr", "sid": "cand1234abcd",
-         "targets": ["https://www.google.fr/"]}
+         "targets": ["https://www.example.fr/"]}
       ]
     }
 

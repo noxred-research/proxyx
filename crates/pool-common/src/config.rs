@@ -24,6 +24,11 @@ use crate::types::OrgId;
 
 const DEFAULT_FILE: &str = "/etc/proxyx/pool.toml";
 
+// Default origins of the reputation services the pool can ask.
+const FRAUD_SCORE_ORIGIN: &str = "https://ipqualityscore.com"; // wire-compat
+const ABUSE_CONFIDENCE_ORIGIN: &str = "https://api.abuseipdb.com"; // wire-compat
+const PROXY_RISK_ORIGIN: &str = "https://api12.scamalytics.com"; // wire-compat
+
 /// How long a tunnel may keep running on a unit that was drained (rotating
 /// session removed from the ready set, static IP out of leasing, org block in
 /// scope). The gateway closes the tunnel and the warmer cuts the unit's
@@ -162,25 +167,25 @@ pub struct Settings {
     pub first_byte_timeout: Duration,
     /// Replaces the public exit-IP check services with a comma list of
     /// `kind=url`, for a benchmark or an isolated environment with a stub
-    /// provider. The list needs `cloudflare`, `ipinfo` or `ifconfig_co`: only
-    /// they report the exit country. Unset uses the public list. Env:
+    /// provider. The list needs `trace_lines`, `ip_country_json` or
+    /// `ip_country_iso_json`: only they report the exit country. Unset uses the public list. Env:
     /// `PROXYX_POOL_EXIT_IP_SERVICES`.
     pub exit_ip_services: Option<String>,
-    /// Origin of the IPQS reputation API. Only a benchmark or an isolated
-    /// environment with a stand-in changes it. Env: `PROXYX_POOL_IPQS_BASE_URL`
-    /// (default: `https://ipqualityscore.com`).
-    pub ipqs_base_url: String,
-    /// Origin of the AbuseIPDB reputation API, like `ipqs_base_url`. Env:
-    /// `PROXYX_POOL_ABUSEIPDB_BASE_URL` (default: `https://api.abuseipdb.com`).
-    pub abuseipdb_base_url: String,
-    /// Origin of the Scamalytics reputation API, like `ipqs_base_url` (the
-    /// EU node; the US node is `https://api11.scamalytics.com`). Env:
-    /// `PROXYX_POOL_SCAMALYTICS_BASE_URL` (default: `https://api12.scamalytics.com`).
-    pub scamalytics_base_url: String,
-    /// Scamalytics account name: the path segment of every lookup. Needed
-    /// when the `scamalytics_api_key` secret exists, and startup fails
-    /// without it. Env: `PROXYX_POOL_SCAMALYTICS_CUSTOMER` (default: unset).
-    pub scamalytics_customer: Option<String>,
+    /// Origin of the fraud-score reputation API. Only a benchmark or an isolated
+    /// environment with a stand-in changes it. Env: `PROXYX_POOL_FRAUD_SCORE_BASE_URL`
+    /// (default: the service's public origin).
+    pub fraud_score_base_url: String,
+    /// Origin of the abuse-confidence reputation API, like `fraud_score_base_url`. Env:
+    /// `PROXYX_POOL_ABUSE_CONFIDENCE_BASE_URL` (default: the service's public origin).
+    pub abuse_confidence_base_url: String,
+    /// Origin of the proxy-risk reputation API, like `fraud_score_base_url` (the
+    /// default is the service's EU node; the service also runs a US node). Env:
+    /// `PROXYX_POOL_PROXY_RISK_BASE_URL` (default: the service's public origin).
+    pub proxy_risk_base_url: String,
+    /// Proxy-risk account name: the path segment of every lookup. Needed
+    /// when the `proxy_risk_api_key` secret exists, and startup fails
+    /// without it. Env: `PROXYX_POOL_PROXY_RISK_CUSTOMER` (default: unset).
+    pub proxy_risk_customer: Option<String>,
     /// Emit JSON logs (Loki parses them), plain text when false. Env:
     /// `PROXYX_POOL_JSON_LOGS` (default: `true`).
     pub json_logs: bool,
@@ -217,10 +222,10 @@ impl Default for Settings {
             handshake_timeout: Duration::from_secs(10),
             first_byte_timeout: Duration::from_secs(3),
             exit_ip_services: None,
-            ipqs_base_url: "https://ipqualityscore.com".to_owned(),
-            scamalytics_base_url: "https://api12.scamalytics.com".to_owned(),
-            scamalytics_customer: None,
-            abuseipdb_base_url: "https://api.abuseipdb.com".to_owned(),
+            fraud_score_base_url: FRAUD_SCORE_ORIGIN.to_owned(),
+            proxy_risk_base_url: PROXY_RISK_ORIGIN.to_owned(),
+            proxy_risk_customer: None,
+            abuse_confidence_base_url: ABUSE_CONFIDENCE_ORIGIN.to_owned(),
             json_logs: true,
             sentry: SentryConfig::default(),
         }
@@ -311,9 +316,9 @@ impl Settings {
             .parse::<OrgId>()
             .context("probe_org is not a valid org id")?;
         for (name, url) in [
-            ("ipqs_base_url", &self.ipqs_base_url),
-            ("abuseipdb_base_url", &self.abuseipdb_base_url),
-            ("scamalytics_base_url", &self.scamalytics_base_url),
+            ("fraud_score_base_url", &self.fraud_score_base_url),
+            ("abuse_confidence_base_url", &self.abuse_confidence_base_url),
+            ("proxy_risk_base_url", &self.proxy_risk_base_url),
         ] {
             anyhow::ensure!(
                 url.strip_prefix("https://")
@@ -596,50 +601,48 @@ mod tests {
 
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail fixes the closure's error type
-    fn scorer_origins_default_to_the_vendors_and_must_be_http_origins() {
+    fn scorer_origins_default_to_the_public_services_and_must_be_http_origins() {
         figment::Jail::expect_with(|jail| {
             let defaults = Settings::default();
-            assert_eq!(defaults.ipqs_base_url, "https://ipqualityscore.com");
-            assert_eq!(defaults.abuseipdb_base_url, "https://api.abuseipdb.com");
-            assert_eq!(
-                defaults.scamalytics_base_url,
-                "https://api12.scamalytics.com"
-            );
-            assert_eq!(defaults.scamalytics_customer, None);
+            // the public origins of the three reputation services
+            assert_eq!(defaults.fraud_score_base_url, FRAUD_SCORE_ORIGIN);
+            assert_eq!(defaults.abuse_confidence_base_url, ABUSE_CONFIDENCE_ORIGIN);
+            assert_eq!(defaults.proxy_risk_base_url, PROXY_RISK_ORIGIN);
+            assert_eq!(defaults.proxy_risk_customer, None);
 
             jail.create_file(
                 "stub.toml",
-                "ipqs_base_url = \"http://127.0.0.1:9\"\nabuseipdb_base_url = \"http://stub.test\"\n\
-                 scamalytics_base_url = \"http://scam.test\"\nscamalytics_customer = \"acme\"",
+                "fraud_score_base_url = \"http://127.0.0.1:9\"\nabuse_confidence_base_url = \"http://stub.test\"\n\
+                 proxy_risk_base_url = \"http://scam.test\"\nproxy_risk_customer = \"acme\"",
             )?;
             let ok = Settings::load(Some(Path::new("stub.toml"))).expect("stand-in origins");
-            assert_eq!(ok.ipqs_base_url, "http://127.0.0.1:9");
-            assert_eq!(ok.abuseipdb_base_url, "http://stub.test");
-            assert_eq!(ok.scamalytics_base_url, "http://scam.test");
-            assert_eq!(ok.scamalytics_customer.as_deref(), Some("acme"));
+            assert_eq!(ok.fraud_score_base_url, "http://127.0.0.1:9");
+            assert_eq!(ok.abuse_confidence_base_url, "http://stub.test");
+            assert_eq!(ok.proxy_risk_base_url, "http://scam.test");
+            assert_eq!(ok.proxy_risk_customer.as_deref(), Some("acme"));
 
             assert_refused(
                 jail,
                 &[
                     (
                         "scheme.toml",
-                        "ipqs_base_url = \"ftp://x\"",
-                        "ipqs_base_url",
+                        "fraud_score_base_url = \"ftp://x\"",
+                        "fraud_score_base_url",
                     ),
                     (
                         "empty.toml",
-                        "abuseipdb_base_url = \"https://\"",
-                        "abuseipdb_base_url",
+                        "abuse_confidence_base_url = \"https://\"",
+                        "abuse_confidence_base_url",
                     ),
                     (
                         "bare.toml",
-                        "ipqs_base_url = \"ipqualityscore.com\"",
-                        "ipqs_base_url",
+                        "fraud_score_base_url = \"example.com\"",
+                        "fraud_score_base_url",
                     ),
                     (
                         "scam.toml",
-                        "scamalytics_base_url = \"scamalytics.com\"",
-                        "scamalytics_base_url",
+                        "proxy_risk_base_url = \"example.com\"",
+                        "proxy_risk_base_url",
                     ),
                 ],
             );

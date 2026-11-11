@@ -17,23 +17,23 @@ fn root() -> PathBuf {
 
 fn secrets(name: &str) -> anyhow::Result<Secret> {
     let value = match name {
-        "oxylabs_isp_user" => "acme",
-        "oxylabs_isp_pass" => "pw-isp",
-        "oxylabs_res_user" => "resu",
-        "oxylabs_res_pass" => "resp",
-        "iproyal_res_user" => "ipu",
-        "iproyal_res_pass" => "ipp",
-        "webshare_res_user" => "webuser",
-        "webshare_res_pass" => "webpass",
-        "brightdata_zone_user" => "brd-customer-example-zone-residential",
-        "brightdata_zone_pass" => "zonepass",
-        "bd_res_user" => "brd-customer-hl_abc-zone-res1",
-        "bd_res_pass" => "bdrp",
-        "bd_isp_user" => "brd-customer-hl_abc-zone-isp1",
-        "bd_isp_pass" => "bdip",
-        "decodo_user" => "dec",
-        "decodo_pass" => "decp",
-        "soax_package_key" => "pkgkey",
+        "isp_static_port_user" => "acme",
+        "isp_static_port_pass" => "pw-isp",
+        "res_user_suffix_user" => "resu",
+        "res_user_suffix_pass" => "resp",
+        "res_pass_suffix_user" => "ipu",
+        "res_pass_suffix_pass" => "ipp",
+        "res_numeric_session_user" => "webuser",
+        "res_numeric_session_pass" => "webpass",
+        "res_zone_user" => "acct-example-zone-residential",
+        "res_zone_pass" => "zonepass",
+        "res_zone_full_user" => "acct-hl_abc-zone-res1",
+        "res_zone_full_pass" => "bdrp",
+        "isp_zone_ip_user" => "acct-hl_abc-zone-isp1",
+        "isp_zone_ip_pass" => "bdip",
+        "res_user_prefix_user" => "dec",
+        "res_user_prefix_pass" => "decp",
+        "res_package_key_pass" => "pkgkey",
         _ => anyhow::bail!("no secret {name}"),
     };
     Ok(Secret::new(value))
@@ -173,73 +173,85 @@ fn shipped_adapters_load() {
     assert_eq!(
         ids,
         [
-            "brightdata_zone",
             "customer",
             "customer_https",
             "customer_socks5",
-            "iproyal_res",
+            "isp_static_port",
             "local",
-            "oxylabs_isp",
-            "oxylabs_res",
-            "vpn-pool",
-            "webshare_rotating_http",
-            "webshare_rotating_socks5",
-            "webshare_sticky_http",
-            "webshare_sticky_socks5"
+            "res_numeric_rotating_http",
+            "res_numeric_rotating_socks5",
+            "res_numeric_sticky_http",
+            "res_numeric_sticky_socks5",
+            "res_pass_suffix",
+            "res_user_suffix",
+            "res_zone",
+            "vpn-pool"
         ]
     );
 }
 
 #[test]
-fn oxylabs_isp_uses_the_port_of_each_inventory_entry() {
-    let a = shipped_adapter("oxylabs_isp");
+fn isp_static_port_uses_the_port_of_each_inventory_entry() {
+    let a = shipped_adapter("isp_static_port");
     for port in [8001, 8003, 8010] {
-        let e = entry("oxylabs_isp", Subtype::Isp, "isp.oxylabs.io", port, "nl");
+        let e = entry(
+            "isp_static_port",
+            Subtype::Isp,
+            "isp.oxylabs.io", // wire-compat: shipped gateway host
+            port,
+            "nl",
+        );
         let spec = static_spec(&e);
-        assert_endpoint(&a, &spec, "acme", "pw-isp", "isp.oxylabs.io", port);
+        assert_endpoint(&a, &spec, "acme", "pw-isp", "isp.oxylabs.io", port); // wire-compat: shipped gateway host
         let up = a.recipe(&spec).expect("recipe");
         assert_eq!(up.scheme, UpstreamScheme::Http);
-        assert_eq!(up.provider, id("oxylabs_isp"));
+        assert_eq!(up.provider, id("isp_static_port"));
     }
 }
 
 #[test]
-fn oxylabs_isp_entry_credentials_replace_the_base_credentials() {
-    let e = entry("oxylabs_isp", Subtype::Isp, "isp.oxylabs.io", 8002, "nl");
+fn isp_static_port_entry_credentials_replace_the_base_credentials() {
+    let e = entry(
+        "isp_static_port",
+        Subtype::Isp,
+        "isp.oxylabs.io", // wire-compat: shipped gateway host
+        8002,
+        "nl",
+    );
     let spec = login_spec(&e, "other", "otherpw");
     assert_endpoint(
-        &shipped_adapter("oxylabs_isp"),
+        &shipped_adapter("isp_static_port"),
         &spec,
         "other",
         "otherpw",
-        "isp.oxylabs.io",
+        "isp.oxylabs.io", // wire-compat: shipped gateway host
         8002,
     );
 }
 
 #[test]
-fn oxylabs_port_8000_takes_the_country() {
+fn isp_rotating_pool_takes_the_country() {
     let e = entry(
-        "oxylabs_isp_pool",
+        "isp_rotating_pool",
         Subtype::Isp,
-        "disp.oxylabs.io",
+        "rotating.isp.example.net",
         8001,
         "de",
     );
     let spec = static_spec(&e);
     assert_endpoint(
-        &fixture_adapter("oxylabs_isp_pool"),
+        &fixture_adapter("isp_rotating_pool"),
         &spec,
         "user-acme-country-DE",
         "pw-isp",
-        "disp.oxylabs.io",
+        "rotating.isp.example.net",
         8000,
     );
 }
 
 #[test]
-fn oxylabs_residential_golden() {
-    let a = shipped_adapter("oxylabs_res");
+fn res_user_suffix_golden() {
+    let a = shipped_adapter("res_user_suffix");
     let fr = region("fr");
     let sid = "abcd1234abcd1234";
     assert_endpoint(
@@ -247,7 +259,7 @@ fn oxylabs_residential_golden() {
         &rotating(sid, 30, &fr, false),
         "customer-resu-cc-FR-sessid-abcd1234abcd1234-sesstime-30",
         "resp",
-        "pr.oxylabs.io",
+        "pr.oxylabs.io", // wire-compat: shipped gateway host
         7777,
     );
     // strict swaps the session key, never adds a second one
@@ -264,26 +276,26 @@ fn oxylabs_residential_golden() {
 }
 
 #[test]
-fn oxylabs_residential_allows_only_80_and_443() {
-    let a = shipped_adapter("oxylabs_res");
+fn res_user_suffix_allows_only_80_and_443() {
+    let a = shipped_adapter("res_user_suffix");
     assert!(a.port_allowed(80));
     assert!(a.port_allowed(443));
     assert!(!a.port_allowed(8080));
     assert!(!a.port_allowed(22));
     // no list: every port
-    assert!(shipped_adapter("oxylabs_isp").port_allowed(8080));
+    assert!(shipped_adapter("isp_static_port").port_allowed(8080));
 }
 
 #[test]
-fn iproyal_puts_the_options_in_the_password() {
-    let a = shipped_adapter("iproyal_res");
+fn res_pass_suffix_puts_the_options_in_the_password() {
+    let a = shipped_adapter("res_pass_suffix");
     let br = region("br");
     assert_endpoint(
         &a,
         &rotating("sgn34f3e", 10, &br, false),
         "ipu",
         "ipp_country-br_session-sgn34f3e_lifetime-600s",
-        "geo.iproyal.com",
+        "geo.iproyal.com", // wire-compat: shipped gateway host
         12321,
     );
     assert_eq!(
@@ -294,51 +306,51 @@ fn iproyal_puts_the_options_in_the_password() {
 }
 
 #[test]
-fn bright_data_golden() {
-    let res = fixture_adapter("brightdata_res");
+fn res_zone_full_golden() {
+    let res = fixture_adapter("res_zone_full");
     let us = region("us");
     assert_endpoint(
         &res,
         &rotating("scan42", 10, &us, false),
-        "brd-customer-hl_abc-zone-res1-country-us-session-scan42",
+        "acct-hl_abc-zone-res1-country-us-session-scan42",
         "bdrp",
-        "brd.superproxy.io",
+        "zone-gw.example.net",
         33335,
     );
     assert_eq!(
         render(&res, &rotating("scan42", 10, &us, true)).0,
-        "brd-customer-hl_abc-zone-res1-country-us-session-scan42-const"
+        "acct-hl_abc-zone-res1-country-us-session-scan42-const"
     );
 
-    let mut e = entry("brightdata_isp", Subtype::Isp, "203.0.113.7", 24000, "us");
+    let mut e = entry("isp_zone_ip", Subtype::Isp, "203.0.113.7", 24000, "us");
     e.ip = "203.0.113.7".parse().expect("ip");
     assert_endpoint(
-        &fixture_adapter("brightdata_isp"),
+        &fixture_adapter("isp_zone_ip"),
         &static_spec(&e),
-        "brd-customer-hl_abc-zone-isp1-ip-203.0.113.7",
+        "acct-hl_abc-zone-isp1-ip-203.0.113.7",
         "bdip",
-        "brd.superproxy.io",
+        "zone-gw.example.net",
         33335,
     );
 }
 
 #[test]
-fn bright_data_session_id_with_a_dash_is_refused() {
+fn res_zone_full_session_id_with_a_dash_is_refused() {
     let us = region("us");
-    let a = fixture_adapter("brightdata_res");
+    let a = fixture_adapter("res_zone_full");
     assert_eq!(refused(&a, &rotating("scan-42", 10, &us, false)), "sid");
 }
 
 #[test]
-fn decodo_golden() {
-    let a = fixture_adapter("decodo_res");
+fn user_prefix_duration_golden() {
+    let a = fixture_adapter("res_user_prefix");
     let au = region("us/austin");
     assert_endpoint(
         &a,
         &rotating("random123", 60, &au, false),
         "user-dec-country-us-city-austin-session-random123-sessionduration-60",
         "decp",
-        "gate.decodo.com",
+        "gw.example.net",
         7000,
     );
     assert_eq!(
@@ -348,19 +360,19 @@ fn decodo_golden() {
 }
 
 #[test]
-fn soax_golden_and_no_strict_mode() {
-    let a = fixture_adapter("soax_res");
+fn package_key_golden_and_no_strict_mode() {
+    let a = fixture_adapter("res_package_key");
     let fr = region("fr");
     assert_endpoint(
         &a,
         &rotating("job_1", 30, &fr, false),
         "country-fr-session-job_1-rotate-timed_1800",
         "pkgkey",
-        "proxy.soax.com",
+        "package.example.net",
         1337,
     );
     assert!(is_mismatch(&a, &rotating("job_1", 30, &fr, true)));
-    // 33 characters: over the SOAX limit of 32
+    // 33 characters: over the session id limit of 32
     assert_eq!(
         refused(&a, &rotating(&"a".repeat(33), 30, &fr, false)),
         "sid"
@@ -607,8 +619,8 @@ fn local_adapter_files_that_describe_a_proxy_are_refused_at_load() {
     for (extra, key) in [
         ("host = \"127.0.0.2\"\n", "host"),
         ("port = 1080\n", "port"),
-        ("user_file = \"decodo_user\"\n", "user_file"),
-        ("pass_file = \"decodo_pass\"\n", "pass_file"),
+        ("user_file = \"res_user_prefix_user\"\n", "user_file"),
+        ("pass_file = \"res_user_prefix_pass\"\n", "pass_file"),
         ("public_only = true\n", "public_only"),
         (
             "[[adapter.option]]\nname = \"country\"\nto = \"user\"\nfrag = \"-c-{v}\"\n",
@@ -636,7 +648,7 @@ fn local_adapter_files_that_describe_a_proxy_are_refused_at_load() {
 
 #[test]
 fn refuses_values_outside_charset_and_length() {
-    let a = shipped_adapter("oxylabs_res");
+    let a = shipped_adapter("res_user_suffix");
     let fr = region("fr");
     // dot, dash, space, injection, non-ASCII: refused, never escaped
     for bad in [
@@ -659,7 +671,7 @@ fn refuses_values_outside_charset_and_length() {
     }
     assert!(a.recipe(&rotating(&"a".repeat(16), 10, &fr, false)).is_ok());
 
-    let ip = shipped_adapter("iproyal_res");
+    let ip = shipped_adapter("res_pass_suffix");
     let br = region("br");
     for bad in ["abcdefghi", "abcdefg_"] {
         assert_eq!(refused(&ip, &rotating(bad, 10, &br, false)), "sid", "{bad}");
@@ -668,7 +680,7 @@ fn refuses_values_outside_charset_and_length() {
 
 #[test]
 fn refuses_durations_above_the_provider_maximum() {
-    let a = shipped_adapter("oxylabs_res");
+    let a = shipped_adapter("res_user_suffix");
     let fr = region("fr");
     let sid = "abcd1234abcd1234";
     assert!(a.recipe(&rotating(sid, 30, &fr, false)).is_ok());
@@ -679,7 +691,7 @@ fn refuses_durations_above_the_provider_maximum() {
 #[test]
 fn refuses_a_city_the_provider_cannot_express() {
     let paris = region("fr/paris");
-    let a = shipped_adapter("iproyal_res");
+    let a = shipped_adapter("res_pass_suffix");
     assert_eq!(
         refused(&a, &rotating("abcdefgh", 10, &paris, false)),
         "city"
@@ -689,21 +701,21 @@ fn refuses_a_city_the_provider_cannot_express() {
 #[test]
 fn refuses_specs_of_the_wrong_kind_provider_or_subtype() {
     let fr = region("fr");
-    let isp = shipped_adapter("oxylabs_isp");
+    let isp = shipped_adapter("isp_static_port");
     assert!(is_mismatch(
         &isp,
         &rotating("abcd1234abcd1234", 10, &fr, false)
     ));
     let wrong = [
         // a static spec for a rotating adapter
-        ("oxylabs_res", "oxylabs_res", Subtype::Isp),
+        ("res_user_suffix", "res_user_suffix", Subtype::Isp),
         // an entry of another provider
-        ("oxylabs_isp", "customer", Subtype::Isp),
+        ("isp_static_port", "customer", Subtype::Isp),
         // an entry of another subtype
-        ("oxylabs_isp", "oxylabs_isp", Subtype::Datacenter),
+        ("isp_static_port", "isp_static_port", Subtype::Datacenter),
     ];
     for (adapter, provider, subtype) in wrong {
-        let e = entry(provider, subtype, "isp.oxylabs.io", 8001, "nl");
+        let e = entry(provider, subtype, "isp.oxylabs.io", 8001, "nl"); // wire-compat: shipped gateway host
         assert!(
             is_mismatch(&shipped_adapter(adapter), &static_spec(&e)),
             "{adapter} took {provider} {subtype:?}"
@@ -713,8 +725,12 @@ fn refuses_specs_of_the_wrong_kind_provider_or_subtype() {
 
 #[test]
 fn base_username_with_a_provider_separator_is_refused_at_load() {
-    let err = load_shipped_with_secret("oxylabs_res.toml", "oxylabs_res_user", "acme-sessid-evil")
-        .expect_err("separator refused");
+    let err = load_shipped_with_secret(
+        "res_user_suffix.toml",
+        "res_user_suffix_user",
+        "acme-sessid-evil",
+    )
+    .expect_err("separator refused");
     assert!(
         matches!(err, ProviderError::SeparatorInBase { .. }),
         "{err:?}"
@@ -727,8 +743,8 @@ fn base_username_with_a_provider_separator_is_refused_at_load() {
 
 #[test]
 fn entry_credentials_with_a_separator_or_colon_are_refused_at_recipe() {
-    let a = fixture_adapter("brightdata_isp");
-    let e = entry("brightdata_isp", Subtype::Isp, "203.0.113.7", 24000, "us");
+    let a = fixture_adapter("isp_zone_ip");
+    let e = entry("isp_zone_ip", Subtype::Isp, "203.0.113.7", 24000, "us");
     assert!(matches!(
         a.recipe(&login_spec(&e, "zone-ip-1.2.3.4", "p")),
         Err(ProviderError::SeparatorInBase { .. })
@@ -745,18 +761,24 @@ fn entry_credentials_with_a_separator_or_colon_are_refused_at_recipe() {
 fn fields_cap_at_255_bytes() {
     let build = |user_len: usize| {
         load_shipped_with_secret(
-            "oxylabs_isp.toml",
-            "oxylabs_isp_user",
+            "isp_static_port.toml",
+            "isp_static_port_user",
             &"u".repeat(user_len),
         )
         .expect("load")
     };
-    let e = entry("oxylabs_isp", Subtype::Isp, "isp.oxylabs.io", 8001, "nl");
+    let e = entry(
+        "isp_static_port",
+        Subtype::Isp,
+        "isp.oxylabs.io", // wire-compat: shipped gateway host
+        8001,
+        "nl",
+    );
     let spec = static_spec(&e);
     // the username is sent as is: no prefix
     let ok = build(255);
     assert_eq!(
-        get(&ok, "oxylabs_isp")
+        get(&ok, "isp_static_port")
             .recipe(&spec)
             .expect("255")
             .username
@@ -766,7 +788,7 @@ fn fields_cap_at_255_bytes() {
     );
     let over = build(256);
     assert!(matches!(
-        get(&over, "oxylabs_isp").recipe(&spec),
+        get(&over, "isp_static_port").recipe(&spec),
         Err(ProviderError::FieldTooLong {
             field: "username",
             len: 256
@@ -776,13 +798,13 @@ fn fields_cap_at_255_bytes() {
 
 #[test]
 fn debug_output_never_shows_credentials() {
-    let a = shipped_adapter("iproyal_res");
+    let a = shipped_adapter("res_pass_suffix");
     let br = region("br");
     let up = a
         .recipe(&rotating("sgn34f3e", 10, &br, false))
         .expect("recipe");
     let shown = format!("{up:?}");
-    assert!(shown.contains("geo.iproyal.com"), "{shown}");
+    assert!(shown.contains("geo.iproyal.com"), "{shown}"); // wire-compat: shipped gateway host
     for secret in ["ipp", "ipu", "sgn34f3e", "lifetime"] {
         assert!(!shown.contains(secret), "{secret} in {shown}");
     }
@@ -809,14 +831,14 @@ fn load_failures() {
     ));
     // missing secret file
     let err = AdapterSet::load(&root().join("../../data/adapters"), |n| {
-        if n == "iproyal_res_pass" {
+        if n == "res_pass_suffix_pass" {
             anyhow::bail!("not mounted");
         }
         secrets(n)
     })
     .expect_err("missing secret");
     assert!(
-        matches!(&err, ProviderError::Secret { name, .. } if name == "iproyal_res_pass"),
+        matches!(&err, ProviderError::Secret { name, .. } if name == "res_pass_suffix_pass"),
         "{err:?}"
     );
     // the cause is in the message and not also a `source`, so `{:#}` shows it once
@@ -844,8 +866,8 @@ fn broken_adapter_files_are_refused_at_load() {
         subtype = "residential"
         host = "gw.example.com"
         port = 1
-        user_file = "decodo_user"
-        pass_file = "decodo_pass"
+        user_file = "res_user_prefix_user"
+        pass_file = "res_user_prefix_pass"
     "#;
     let opt = |name: &str, to: &str, frag: &str| {
         format!("[[adapter.option]]\nname = \"{name}\"\nto = \"{to}\"\nfrag = \"{frag}\"\n")
@@ -923,8 +945,8 @@ fn rotating_seconds<'a>(
 }
 
 #[test]
-fn iproyal_seconds_and_seven_day_bounds_are_exact() {
-    let adapter = shipped_adapter("iproyal_res");
+fn res_pass_suffix_seconds_and_seven_day_bounds_are_exact() {
+    let adapter = shipped_adapter("res_pass_suffix");
     let br = region("br");
     for seconds in [1, 59, 60, 61, 604_800] {
         assert_eq!(
@@ -944,7 +966,7 @@ fn iproyal_seconds_and_seven_day_bounds_are_exact() {
 
 #[test]
 fn minute_provider_rounds_up_without_exceeding_thirty_minutes() {
-    let adapter = shipped_adapter("oxylabs_res");
+    let adapter = shipped_adapter("res_user_suffix");
     let fr = region("fr");
     let sid = "abcd1234abcd1234";
     for (seconds, minutes) in [(1, 1), (59, 1), (60, 1), (61, 2), (1800, 30)] {
@@ -973,11 +995,11 @@ fn minute_provider_rounds_up_without_exceeding_thirty_minutes() {
 }
 
 #[test]
-fn webshare_sticky_http_and_socks5_golden() {
+fn res_numeric_sticky_http_and_socks5_golden() {
     let us = region("us/los_angeles");
     for (id, scheme, port) in [
-        ("webshare_sticky_http", UpstreamScheme::Http, 80),
-        ("webshare_sticky_socks5", UpstreamScheme::Socks5, 1080),
+        ("res_numeric_sticky_http", UpstreamScheme::Http, 80),
+        ("res_numeric_sticky_socks5", UpstreamScheme::Socks5, 1080),
     ] {
         let adapter = shipped_adapter(id);
         let spec = rotating_seconds("1234567890123456", 61, &us, false);
@@ -986,7 +1008,7 @@ fn webshare_sticky_http_and_socks5_golden() {
             &spec,
             "webuser-us-city_los_angeles-1234567890123456",
             "webpass",
-            "p.webshare.io",
+            "p.webshare.io", // wire-compat: shipped gateway host
             port,
         );
         assert_eq!(adapter.recipe(&spec).expect("recipe").scheme, scheme);
@@ -1024,11 +1046,11 @@ fn webshare_sticky_http_and_socks5_golden() {
 }
 
 #[test]
-fn webshare_per_request_http_and_socks5_golden() {
+fn numeric_session_per_request_http_and_socks5_golden() {
     let us = region("us");
     for (id, scheme, port) in [
-        ("webshare_rotating_http", UpstreamScheme::Http, 80),
-        ("webshare_rotating_socks5", UpstreamScheme::Socks5, 1080),
+        ("res_numeric_rotating_http", UpstreamScheme::Http, 80),
+        ("res_numeric_rotating_socks5", UpstreamScheme::Socks5, 1080),
     ] {
         let adapter = shipped_adapter(id);
         let spec = rotating_seconds("localTracking1", 30, &us, false);
@@ -1037,7 +1059,7 @@ fn webshare_per_request_http_and_socks5_golden() {
             &spec,
             "webuser-us-rotate",
             "webpass",
-            "p.webshare.io",
+            "p.webshare.io", // wire-compat: shipped gateway host
             port,
         );
         assert_eq!(adapter.recipe(&spec).expect("recipe").scheme, scheme);
@@ -1062,20 +1084,20 @@ fn webshare_per_request_http_and_socks5_golden() {
 }
 
 #[test]
-fn brightdata_full_zone_username_golden() {
-    let adapter = shipped_adapter("brightdata_zone");
+fn zone_full_username_golden() {
+    let adapter = shipped_adapter("res_zone");
     let us = region("us/sanfrancisco");
     assert_endpoint(
         &adapter,
         &rotating_seconds("scan42", 61, &us, true),
-        "brd-customer-example-zone-residential-country-us-city-sanfrancisco-session-scan42-const",
+        "acct-example-zone-residential-country-us-city-sanfrancisco-session-scan42-const",
         "zonepass",
-        "brd.superproxy.io",
+        "brd.superproxy.io", // wire-compat: shipped gateway host
         33335,
     );
     assert_eq!(
         render(&adapter, &rotating("scan42", 10, &region("us"), false)).0,
-        "brd-customer-example-zone-residential-country-us-session-scan42",
+        "acct-example-zone-residential-country-us-session-scan42",
     );
     assert_eq!(
         refused(&adapter, &rotating("scan-42", 10, &us, false)),
@@ -1117,7 +1139,7 @@ fn https_adapter_preserves_tls_transport_and_public_address_rules() {
 
 #[test]
 fn session_identity_roundtrips_normalized_lifetime_and_strictness() {
-    let adapter = shipped_adapter("oxylabs_res");
+    let adapter = shipped_adapter("res_user_suffix");
     let sid = "abcd1234abcd1234";
     let encoded = adapter
         .encode_session(sid, Duration::from_secs(61), true)
@@ -1143,7 +1165,7 @@ fn session_identity_roundtrips_normalized_lifetime_and_strictness() {
     let legacy = adapter.decode_session(sid).expect("legacy");
     assert_eq!(legacy.ttl, adapter.session_life());
     assert!(!legacy.strict);
-    let seconds = shipped_adapter("iproyal_res");
+    let seconds = shipped_adapter("res_pass_suffix");
     let encoded = seconds
         .encode_session("12345678", Duration::from_secs(1), false)
         .expect("seconds");
@@ -1156,7 +1178,7 @@ fn session_identity_roundtrips_normalized_lifetime_and_strictness() {
 
 #[test]
 fn session_identity_refuses_malformed_or_unsupported_inputs() {
-    let adapter = shipped_adapter("oxylabs_res");
+    let adapter = shipped_adapter("res_user_suffix");
     for bad in [
         "abcd1234abcd1234~",
         "abcd1234abcd1234~60",
@@ -1181,13 +1203,13 @@ fn session_identity_refuses_malformed_or_unsupported_inputs() {
             .encode_session("abcd1234abcd1234", Duration::ZERO, false)
             .is_err()
     );
-    let webshare = shipped_adapter("webshare_sticky_http");
+    let numeric = shipped_adapter("res_numeric_sticky_http");
     assert!(
-        webshare
+        numeric
             .encode_session("1234567890123456", Duration::from_secs(60), true)
             .is_err()
     );
-    assert!(webshare.decode_session("1234567890123456~60~1").is_err());
+    assert!(numeric.decode_session("1234567890123456~60~1").is_err());
     assert!(
         shipped_adapter("customer")
             .decode_session("12345678")
@@ -1197,13 +1219,13 @@ fn session_identity_refuses_malformed_or_unsupported_inputs() {
 
 #[test]
 fn per_request_session_options_and_static_session_mode_are_refused() {
-    let text = std::fs::read_to_string(root().join("../../data/adapters/webshare_res.toml"))
+    let text = std::fs::read_to_string(root().join("../../data/adapters/res_numeric_session.toml"))
         .expect("read");
     let file: AdapterFile = toml::from_str(&text).expect("parse");
     let sticky = file
         .adapter
         .iter()
-        .find(|c| c.id.as_str() == "webshare_sticky_http")
+        .find(|c| c.id.as_str() == "res_numeric_sticky_http")
         .expect("sticky");
     let mut config = sticky.clone();
     config.session_mode = SessionMode::PerRequest;
@@ -1218,7 +1240,7 @@ fn per_request_session_options_and_static_session_mode_are_refused() {
 
 #[test]
 fn lifetime_option_maximum_applies_without_an_explicit_adapter_cap() {
-    let adapter = fixture_adapter("soax_res");
+    let adapter = fixture_adapter("res_package_key");
     assert_eq!(
         adapter
             .normalize_session_ttl(Duration::from_secs(604_800))
@@ -1235,7 +1257,7 @@ fn lifetime_option_maximum_applies_without_an_explicit_adapter_cap() {
             .normalize_session_ttl(Duration::from_secs(u64::MAX))
             .is_err()
     );
-    let minutes = fixture_adapter("decodo_res");
+    let minutes = fixture_adapter("res_user_prefix");
     assert_eq!(
         minutes
             .normalize_session_ttl(Duration::from_secs(61))

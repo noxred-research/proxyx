@@ -250,7 +250,7 @@ value would contain a dash. Select such a provider through the policy's `provide
 | `px` | The whole policy is the request. |
 | `px-kind-rotating-cc-fr` | Rotating units in France. |
 | `px-kind-rotating-cc-fr-city-paris-sid-scan42-ttl-30m` | Rotating unit in `fr/paris`, sticky key `scan42`, lease idle time 30 minutes. |
-| `px-kind-static-prov-oxylabs_isp` | Static IPs of the `oxylabs_isp` provider only. |
+| `px-kind-static-prov-isp_static_port` | Static IPs of the `isp_static_port` provider only. |
 | `px-rot-each` | A new unit for every tunnel. |
 | `px-sid-job_17-ttl-1h` | Sticky key `job_17`, idle time 1 hour. |
 | `px-kind-rotating-sid` | `option_denied`: odd number of parts. |
@@ -777,7 +777,7 @@ List static inventory rows. Query: `provider` (provider id) and `state` (one of 
 both optional.
 
 ```sh
-curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" "$API/v1/inventory?provider=oxylabs_isp&state=available"
+curl -sS -H "Authorization: Bearer $ADMIN_TOKEN" "$API/v1/inventory?provider=isp_static_port&state=available"
 ```
 
 Response `200`:
@@ -787,11 +787,11 @@ Response `200`:
   "items": [
     {
       "ip": "203.0.113.50",
-      "provider": "oxylabs_isp",
+      "provider": "isp_static_port",
       "region": "fr/paris",
       "subtype": "isp",
       "plan": "isp-10",
-      "host": "isp.oxylabs.io",
+      "host": "isp.example.net",
       "port": 8001,
       "asn": 12345,
       "rental_end": "2027-01-31",
@@ -833,11 +833,11 @@ Body: `{"entries": [...]}`, at most 10,000 entries, each an entry of the
 
 ```sh
 curl -sS -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" -H 'X-Operator: alice@example.com' \
-  -H 'Content-Type: application/json' $API/v1/inventory/oxylabs_isp -d '{
+  -H 'Content-Type: application/json' $API/v1/inventory/isp_static_port -d '{
     "entries": [{
-      "provider": "oxylabs_isp", "subtype": "isp", "plan": "isp-10",
-      "ip": "203.0.113.50", "host": "isp.oxylabs.io", "port": 8001,
-      "region": "fr/paris", "credentials": "oxylabs_isp_203-0-113-50",
+      "provider": "isp_static_port", "subtype": "isp", "plan": "isp-10",
+      "ip": "203.0.113.50", "host": "isp.example.net", "port": 8001,
+      "region": "fr/paris", "credentials": "isp_static_port_203-0-113-50",
       "rental_end": "2027-01-31"
     }]
   }'
@@ -851,7 +851,7 @@ byte, or an IP appears twice. Retired and moved IPs are withdrawn from the ready
 Response `200`:
 
 ```json
-{"provider": "oxylabs_isp", "added": ["203.0.113.50"], "updated": [], "revived": [], "retired": [], "unchanged": 0}
+{"provider": "isp_static_port", "added": ["203.0.113.50"], "updated": [], "revived": [], "retired": [], "unchanged": 0}
 ```
 
 ### `POST /v1/ips/{ip}/block`
@@ -1114,7 +1114,7 @@ that served the call at once and on every other replica at its keeper's next tic
 
 ```sh
 curl -sS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  $API/v1/org-blocks -d '{"org":"acme","scope":"provider","value":"oxylabs_res",
+  $API/v1/org-blocks -d '{"org":"acme","scope":"provider","value":"res_user_suffix",
     "reason":"abuse report 1234","ttl":"2h"}'
 ```
 
@@ -1122,7 +1122,7 @@ Response `201`:
 
 ```json
 {"id": "6f1f6d5e-3c7a-4d4b-9c52-2f1a5a5d8f10", "org": "acme", "scope": "provider",
- "value": "oxylabs_res", "reason": "abuse report 1234", "operator": "admin",
+ "value": "res_user_suffix", "reason": "abuse report 1234", "operator": "admin",
  "created_at": 1767225600, "expires_at": 1767232800, "revoked_at": null, "drained": 3}
 ```
 
@@ -1148,12 +1148,12 @@ canary), and the browser samples the warmer queued.
 ```json
 {
   "route_classes": [
-    {"route_class": "oxylabs_res", "provider": "oxylabs_res",
-     "regions": [{"region": "fr", "country": "fr", "targets": ["https://www.google.com/", "https://www.google.fr/"]}]}
+    {"route_class": "res_user_suffix", "provider": "res_user_suffix",
+     "regions": [{"region": "fr", "country": "fr", "targets": ["https://www.example.com/", "https://www.example.fr/"]}]}
   ],
   "samples": [
-    {"job_id": "a1b2", "route_class": "oxylabs_res", "provider": "oxylabs_res", "region": "fr",
-     "country": "fr", "sid": "s9", "targets": ["https://www.google.com/"]}
+    {"job_id": "a1b2", "route_class": "res_user_suffix", "provider": "res_user_suffix", "region": "fr",
+     "country": "fr", "sid": "s9", "targets": ["https://www.example.com/"]}
   ]
 }
 ```
@@ -1169,7 +1169,7 @@ The prober's raw measurements. The API applies the policy criteria (`max_ttfb_ms
 
 ```json
 {
-  "kind": "canary", "provider": "oxylabs_res", "region": "fr",
+  "kind": "canary", "provider": "res_user_suffix", "region": "fr",
   "results": [
     {"outcome": "ok", "status": 200, "ttfb_ms": 410.0, "load_ms": 1800.0},
     {"outcome": "blocked", "status": 429, "block_reason": "rate limited"}

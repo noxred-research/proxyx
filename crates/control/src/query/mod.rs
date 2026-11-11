@@ -939,7 +939,7 @@ mod tests {
             org_id: Some("org-1".into()),
             branches: NonEmpty(vec![QueryBranch {
                 host: Some(StringFilter::Contains {
-                    value: "stripe".into(),
+                    value: "spayco".into(),
                 }),
                 ..Default::default()
             }]),
@@ -953,7 +953,7 @@ mod tests {
         };
         let (sql, binds) = lower(&q);
         assert_eq!(sql, "org_id = ? AND lower(host) LIKE lower(?)");
-        assert_eq!(binds, vec!["org-1", "%stripe%"]);
+        assert_eq!(binds, vec!["org-1", "%spayco%"]);
     }
 
     #[test]
@@ -963,7 +963,7 @@ mod tests {
             branches: NonEmpty(vec![
                 QueryBranch {
                     host: Some(StringFilter::Contains {
-                        value: "stripe".into(),
+                        value: "spayco".into(),
                     }),
                     status_code: Some(IntFilter::Gte { value: 500 }),
                     ..Default::default()
@@ -990,7 +990,7 @@ mod tests {
             "org_id = ? AND ((lower(host) LIKE lower(?) AND status_code >= 500) \
              OR (lower(path) LIKE lower(?) AND status_code = 429))"
         );
-        assert_eq!(binds, vec!["org-1", "%stripe%", "%/api%"]);
+        assert_eq!(binds, vec!["org-1", "%spayco%", "%/api%"]);
     }
 
     #[test]

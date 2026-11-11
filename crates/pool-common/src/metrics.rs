@@ -449,7 +449,9 @@ mod tests {
     #[test]
     fn no_family_labels_collide_with_the_service_label() {
         let m = Metrics::new("warmer");
-        m.check_failures_total.with_label_values(&["ipqs"]).inc();
+        m.check_failures_total
+            .with_label_values(&["fraud_score"])
+            .inc();
         let text = m.render();
         let line = text
             .lines()
@@ -513,7 +515,9 @@ mod tests {
         m.set_cost_used_ratio("p", 0.5);
         m.replace_reports_total.with_label_values(&["p"]).inc();
         m.fair_use_exceeded_total.with_label_values(&["p"]).inc();
-        m.check_failures_total.with_label_values(&["ipqs"]).inc();
+        m.check_failures_total
+            .with_label_values(&["fraud_score"])
+            .inc();
         m.api_requests_total
             .with_label_values(&["/v1/orgs", "2xx"])
             .inc();

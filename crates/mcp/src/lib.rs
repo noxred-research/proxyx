@@ -10,7 +10,7 @@
 //! * **Configure**: `propose_config_change` returns a validated diff, `apply_config_change`
 //!   applies it, and policy documents are validated with the gateway's own `proxyx-policy`.
 //! * **Assist**: optional LLM-backed tools (traffic narrative, block page classification, policy
-//!   drafts) through any OpenAI-compatible endpoint; a model advises and never authorizes.
+//!   drafts) through any chat-completions compatible endpoint; a model advises and never authorizes.
 //!
 //! Two transports share one protocol engine: newline-delimited JSON-RPC on stdio, and
 //! streamable HTTP with a bearer token. Both speak revision 2026-07-28 (stateless, per-request

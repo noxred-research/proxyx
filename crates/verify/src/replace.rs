@@ -149,9 +149,12 @@ mod tests {
         }
     }
 
-    /// A check where IPQS and AbuseIPDB both say `risk`.
+    /// A check where the fraud-score and abuse-confidence scorers both say `risk`.
     fn both(risk: u8) -> Vec<Score> {
-        vec![s(ScorerKind::Ipqs, risk), s(ScorerKind::AbuseIpdb, risk)]
+        vec![
+            s(ScorerKind::FraudScore, risk),
+            s(ScorerKind::AbuseConfidence, risk),
+        ]
     }
 
     fn reasons(history: IpHistory<'_>) -> Vec<ReplaceReason> {
@@ -194,15 +197,24 @@ mod tests {
 
     #[test]
     fn one_noisy_service_never_triggers_a_replacement() {
-        let one = vec![s(ScorerKind::Ipqs, 100), s(ScorerKind::AbuseIpdb, 5)];
+        let one = vec![
+            s(ScorerKind::FraudScore, 100),
+            s(ScorerKind::AbuseConfidence, 5),
+        ];
         assert!(on_checks(&vec![one; 5]).is_empty());
         // The same service twice in a check is still one source.
-        let twice = vec![s(ScorerKind::Ipqs, 100), s(ScorerKind::Ipqs, 100)];
+        let twice = vec![
+            s(ScorerKind::FraudScore, 100),
+            s(ScorerKind::FraudScore, 100),
+        ];
         assert!(on_checks(&vec![twice; 3]).is_empty());
         // A check where the second service was down breaks the run.
-        assert!(on_checks(&[both(90), vec![s(ScorerKind::Ipqs, 90)], both(90)]).is_empty());
+        assert!(on_checks(&[both(90), vec![s(ScorerKind::FraudScore, 90)], both(90)]).is_empty());
         // Which two services does not matter.
-        let other = vec![s(ScorerKind::Scamalytics, 99), s(ScorerKind::AbuseIpdb, 99)];
+        let other = vec![
+            s(ScorerKind::ProxyRisk, 99),
+            s(ScorerKind::AbuseConfidence, 99),
+        ];
         assert_eq!(
             on_checks(&[both(90), other, both(90)]),
             [ReplaceReason::Reputation]

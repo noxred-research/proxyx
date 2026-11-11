@@ -15,8 +15,8 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use policy::InboundOptions;
 use provider::{AdapterFile, AdapterSet, UnitSpec};
 
-const ROTATING_ADAPTER: &str = include_str!("../../../data/adapters/oxylabs_res.toml");
-const STATIC_ADAPTER: &str = include_str!("../../../data/adapters/oxylabs_isp.toml");
+const ROTATING_ADAPTER: &str = include_str!("../../../data/adapters/res_user_suffix.toml");
+const STATIC_ADAPTER: &str = include_str!("../../../data/adapters/isp_static_port.toml");
 
 fn username_parse(c: &mut Criterion) {
     let mut g = c.benchmark_group("username_parse");
@@ -25,11 +25,11 @@ fn username_parse(c: &mut Criterion) {
         ("region", "px-kind-rotating-cc-fr"),
         (
             "full",
-            "px-kind-rotating-cc-fr-city-paris-sid-scan42-ttl-30m-prov-oxylabs_res",
+            "px-kind-rotating-cc-fr-city-paris-sid-scan42-ttl-30m-prov-res_user_suffix",
         ),
         (
             "sticky_static",
-            "px-kind-static-prov-oxylabs_isp-sid-job_17-ttl-1h",
+            "px-kind-static-prov-isp_static_port-sid-job_17-ttl-1h",
         ),
         // the refusal paths are as hot as the accepting ones under a scan
         ("refused_repeated_key", "px-cc-fr-cc-de"),
@@ -53,8 +53,8 @@ fn adapters() -> AdapterSet {
             .adapter,
     );
     AdapterSet::from_configs(configs, &|name: &str| match name {
-        "oxylabs_res_user" | "oxylabs_isp_user" => Ok(Secret::new("acct")),
-        "oxylabs_res_pass" | "oxylabs_isp_pass" => Ok(Secret::new("s3cret-pass")),
+        "res_user_suffix_user" | "isp_static_port_user" => Ok(Secret::new("acct")),
+        "res_user_suffix_pass" | "isp_static_port_pass" => Ok(Secret::new("s3cret-pass")),
         other => Err(anyhow::anyhow!("no secret {other}")),
     })
     .expect("adapter set")
@@ -63,19 +63,19 @@ fn adapters() -> AdapterSet {
 fn recipe_render(c: &mut Criterion) {
     let set = adapters();
     let rotating = set
-        .get(&"oxylabs_res".parse().expect("id"))
-        .expect("oxylabs_res");
+        .get(&"res_user_suffix".parse().expect("id"))
+        .expect("res_user_suffix");
     let isp = set
-        .get(&"oxylabs_isp".parse().expect("id"))
-        .expect("oxylabs_isp");
+        .get(&"isp_static_port".parse().expect("id"))
+        .expect("isp_static_port");
     let country = Region::new("fr", None).expect("region");
     let city = Region::new("fr", Some("paris")).expect("region");
     let entry = InventoryEntry {
-        provider: "oxylabs_isp".parse().expect("id"),
+        provider: "isp_static_port".parse().expect("id"),
         subtype: Subtype::Isp,
         plan: "bench".into(),
         ip: "203.0.113.10".parse().expect("ip"),
-        host: "isp.oxylabs.io".into(),
+        host: "isp.example.net".into(),
         port: 8001,
         region: country.clone(),
         asn: None,

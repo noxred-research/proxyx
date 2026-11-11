@@ -85,7 +85,7 @@ slug_newtype!(
     64
 );
 slug_newtype!(
-    /// A configured provider adapter id, for example `oxylabs_isp`.
+    /// A configured provider adapter id, for example `isp_static_port`.
     ProviderId,
     "provider id",
     48

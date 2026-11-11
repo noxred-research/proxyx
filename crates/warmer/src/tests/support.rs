@@ -93,7 +93,7 @@ pub(crate) struct Fake {
     checks_down: AtomicBool,
     scorers_down: AtomicBool,
     probe_status: AtomicU16,
-    ipify_delay_ms: AtomicU64,
+    ip_json_delay_ms: AtomicU64,
     probe_delay_ms: AtomicU64,
     active: AtomicU32,
     peak: AtomicU32,
@@ -148,8 +148,8 @@ impl Fake {
         self.scorers_down.store(down, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_ipify_delay(&self, ms: u64) {
-        self.ipify_delay_ms.store(ms, Ordering::SeqCst);
+    pub(crate) fn set_ip_json_delay(&self, ms: u64) {
+        self.ip_json_delay_ms.store(ms, Ordering::SeqCst);
     }
 
     /// Every probe target answers after this long (a slow IP: clean answers
@@ -199,7 +199,7 @@ impl Fake {
         self.auth_users.lock().get(path).cloned()
     }
 
-    /// Most `/ipify` requests that were in flight at once: one per create.
+    /// Most `/ip_json` requests that were in flight at once: one per create.
     pub(crate) fn peak_creates(&self) -> u32 {
         self.peak.load(Ordering::SeqCst)
     }
@@ -229,21 +229,21 @@ impl Fake {
         let ip = self.ip_of(user);
         *self.hits.lock().entry(path.to_owned()).or_default() += 1;
         match path {
-            "/ipify" | "/cf" | "/ipinfo" if self.checks_down.load(Ordering::SeqCst) => {
+            "/ip_json" | "/trace" | "/ip_country" if self.checks_down.load(Ordering::SeqCst) => {
                 (503, "check service down".into())
             }
-            "/ipify" => {
+            "/ip_json" => {
                 let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(now, Ordering::SeqCst);
-                let delay = self.ipify_delay_ms.load(Ordering::SeqCst);
+                let delay = self.ip_json_delay_ms.load(Ordering::SeqCst);
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 (200, format!(r#"{{"ip":"{ip}"}}"#))
             }
-            "/cf" => (200, format!("fl=1\nip={ip}\nloc=FR\n")),
-            "/ipinfo" => (200, format!(r#"{{"ip":"{ip}","country":"FR"}}"#)),
+            "/trace" => (200, format!("fl=1\nip={ip}\nloc=FR\n")),
+            "/ip_country" => (200, format!(r#"{{"ip":"{ip}","country":"FR"}}"#)),
             "/echo" if self.echo_down.load(Ordering::SeqCst) => (500, "echo down".into()),
             "/echo" => (200, ip.to_string()),
             p if p.starts_with("/probe") => {
@@ -456,7 +456,7 @@ pub(crate) struct Setup {
     pub adapters: Vec<fn(u16) -> String>,
     pub policy: String,
     pub timing: fn(&mut Timing),
-    /// Both IPQS and AbuseIPDB (the replacement rule needs two services).
+    /// Both the fraud-score and abuse-confidence scorers (the replacement rule needs two services).
     pub two_scorers: bool,
     /// Probe targets; a path with `/fine` is never blocked.
     pub probe_targets: Vec<&'static str>,
@@ -580,9 +580,9 @@ impl Harness {
         let metrics = Arc::new(Metrics::new("test"));
         let exit_cfg = ExitIpConfig {
             services: [
-                (ServiceKind::Ipify, "http://checks.test/ipify"),
-                (ServiceKind::Cloudflare, "http://checks.test/cf"),
-                (ServiceKind::Ipinfo, "http://checks.test/ipinfo"),
+                (ServiceKind::IpJson, "http://checks.test/ip_json"),
+                (ServiceKind::TraceLines, "http://checks.test/trace"),
+                (ServiceKind::IpCountryJson, "http://checks.test/ip_country"),
             ]
             .into_iter()
             .map(|(kind, url)| CheckService {
@@ -598,12 +598,12 @@ impl Harness {
             key: Secret::new("key"),
         };
         let mut slots = vec![ScorerSlot {
-            scorer: Scorer::Ipqs(account()),
+            scorer: Scorer::FraudScore(account()),
             daily_budget: 10_000,
         }];
         if setup.two_scorers {
             slots.push(ScorerSlot {
-                scorer: Scorer::AbuseIpdb(account()),
+                scorer: Scorer::AbuseConfidence(account()),
                 daily_budget: 10_000,
             });
         }

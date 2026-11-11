@@ -10,9 +10,9 @@ from proxyx_prober.contract import MAX_TARGETS, Outcome, ProbeResults, RunResult
 
 GOOD_ROUTE_CLASS = {
     "route_class": "fr-web",
-    "provider": "oxylabs_isp",
+    "provider": "isp_static_port",
     "regions": [
-        {"region": "fr/paris", "country": "fr", "targets": ["https://www.google.fr/"]}
+        {"region": "fr/paris", "country": "fr", "targets": ["https://www.example.fr/"]}
     ],
 }
 
@@ -35,12 +35,14 @@ def results_body() -> ProbeResults:
         job_id=None,
         kind="canary",
         route_class="fr-web",
-        provider="oxylabs_isp",
+        provider="isp_static_port",
         region="fr/paris",
         country="fr",
         session="abc123",
         started_at=datetime(2026, 10, 15, 12, 0, tzinfo=UTC),
-        results=[RunResult(target="https://www.google.fr/", run=1, outcome=Outcome.OK)],
+        results=[
+            RunResult(target="https://www.example.fr/", run=1, outcome=Outcome.OK)
+        ],
     )
 
 
@@ -65,13 +67,13 @@ def route_class(name: str, targets: list[str], **overrides: str) -> dict:
 
 
 async def test_invalid_entries_are_skipped_not_fatal(tmp_path: Path) -> None:
-    url = "https://www.google.fr/"
+    url = "https://www.example.fr/"
     bad_country = route_class("bad-2", [url])
     bad_country["regions"][0]["country"] = "FR"
     bad_sample = {
         "job_id": "j1",
         "route_class": "fr-web",
-        "provider": "oxylabs_isp",
+        "provider": "isp_static_port",
         "region": "fr",
         "country": "fr",
         "sid": "has-dash",
@@ -176,7 +178,7 @@ async def test_post_results_body_shape(tmp_path: Path) -> None:
     assert body["session"] == "abc123"
     assert body["started_at"].startswith("2026-10-15T12:00:00")
     assert body["results"][0] == {
-        "target": "https://www.google.fr/",
+        "target": "https://www.example.fr/",
         "run": 1,
         "outcome": "ok",
         "status": None,

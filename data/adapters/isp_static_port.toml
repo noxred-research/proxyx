@@ -1,0 +1,26 @@
+# Static ISP, self-service. One inventory entry per rented IP, on ports 8001-8010.
+# Verified against a real account 2026-10-17: one entry point, one port per IP (8001-8010),
+# and the username is sent as is, with NO `user-` prefix (the provider's documentation
+# shows a different host and a `user-` prefix; the account does not).
+#
+# The port is not set here: each inventory entry carries its own port, and the IP, not
+# the port, is the key (the provider may change the port-to-IP map).
+# `user_file` and `pass_file` name files in the secrets directory. No value lives here.
+#
+# `echo_url` returns the exit IP as plain text and no country: it is one IP vote of the
+# exit check. The exit country comes from the public services of the check (the `trace_lines`,
+# `ip_country_json` and `ip_country_iso_json` kinds); see `proxyx_pool::exit_ip`.
+
+[[adapter]]
+id = "isp_static_port"
+kind = "static"
+subtype = "isp"
+scheme = "http"
+host = "isp.oxylabs.io" # wire-compat: the provider gateway
+user_file = "isp_static_port_user"
+pass_file = "isp_static_port_pass"
+user = "{base_user}"
+pass = "{base_pass}"
+# Fair usage: 100 concurrent sessions per IP until 100 GB a month, then 10.
+max_conns_per_ip = 100
+echo_url = "https://ip.oxylabs.io" # wire-compat: the provider echo

@@ -15,9 +15,9 @@ def test_status_beats_body_markers() -> None:
     assert detect_block(429, PAGE, {}, body) == "http_429"
 
 
-def test_google_sorry_redirect_is_a_block_even_with_status_200() -> None:
-    url = "https://www.google.fr/sorry/index?continue=https://www.google.fr/"
-    assert detect_block(200, url, {}, "") == "google_sorry"
+def test_sorry_redirect_is_a_block_even_with_status_200() -> None:
+    url = "https://www.example.fr/sorry/index?continue=https://www.example.fr/"
+    assert detect_block(200, url, {}, "") == "sorry_redirect"
 
 
 def test_sorry_must_be_the_path_prefix() -> None:
@@ -25,21 +25,23 @@ def test_sorry_must_be_the_path_prefix() -> None:
     assert detect_block(200, url, {}, "") is None
 
 
-def test_cloudflare_challenge_header() -> None:
+def test_challenge_header() -> None:
+    # detection-data: the challenge header of a CDN
     assert detect_block(503, PAGE, {"cf-mitigated": "challenge"}, "") == (
-        "cloudflare_challenge"
+        "js_challenge"
     )
 
 
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ("<title>Just a moment...</title>", "cloudflare_challenge"),
+        ("<title>Just a moment...</title>", "js_challenge"),
         (
             "Our systems have detected unusual traffic from your computer",
             "unusual_traffic",
         ),
-        ("<script src='https://geo.captcha-delivery.com/c.js'>", "datadome_captcha"),
+        # detection-data: a captcha host matched on target sites
+        ("<script src='https://geo.captcha-delivery.com/c.js'>", "captcha_frame"),
         ("Access to this page has been denied", "access_denied"),
     ],
 )
@@ -48,7 +50,7 @@ def test_interstitial_phrases_with_status_200(body: str, reason: str) -> None:
 
 
 def test_ordinary_page_mentioning_captcha_is_not_blocked() -> None:
-    body = "<form>Sign up <div class='g-recaptcha'></div> captcha help</form>"
+    body = "<form>Sign up <div class='captcha-widget'></div> captcha help</form>"
     assert detect_block(200, PAGE, {}, body) is None
 
 

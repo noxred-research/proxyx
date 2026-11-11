@@ -247,8 +247,8 @@ mod tests {
     fn scopes_parse_like_the_store_writes_them() {
         for (scope, value) in [
             ("ip", "203.0.113.9"),
-            ("provider", "oxylabs_isp"),
-            ("route_class", "oxylabs_isp:fr/paris"),
+            ("provider", "isp_static_port"),
+            ("route_class", "isp_static_port:fr/paris"),
             ("pool", "private"),
         ] {
             let parsed = parse_scope(scope, value).expect("scope");

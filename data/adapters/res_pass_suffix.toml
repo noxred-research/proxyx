@@ -1,18 +1,17 @@
-# IPRoyal Residential: the options go in the PASSWORD. Verified 2026-11-11:
+# Residential, options in the PASSWORD. Verified 2026-11-11:
 #   {pass}_country-{cc}_session-{id}_lifetime-{N}s[_killswitch-1]
 # The session id is exactly 8 alphanumeric characters. Lifetime: 1 second to 7 days, one
 # unit only. `_killswitch-1` answers HTTP 410 instead of changing the IP.
-# https://docs.iproyal.com/proxies/residential/proxy/rotation
 
 [[adapter]]
-id = "iproyal_res"
+id = "res_pass_suffix"
 kind = "rotating"
 subtype = "residential"
 scheme = "http"
-host = "geo.iproyal.com"
+host = "geo.iproyal.com" # wire-compat: the provider gateway
 port = 12321
-user_file = "iproyal_res_user"
-pass_file = "iproyal_res_pass"
+user_file = "res_pass_suffix_user"
+pass_file = "res_pass_suffix_pass"
 user = "{base_user}"
 pass = "{base_pass}{opts}"
 max_session_minutes = 10080
