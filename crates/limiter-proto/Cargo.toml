@@ -1,0 +1,10 @@
+[package]
+name = "proxyx-limiter-proto"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "limiter_proto"
+path = "src/lib.rs"

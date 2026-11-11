@@ -1,0 +1,99 @@
+# Control plane (`proxyx control api|ingester|keys`, `proxyx migrate control`). Pass it with
+# `--config examples/control.toml`, or install it as /etc/proxyx/control.toml. Environment
+# variables are `PROXYX_CONTROL_<KEY>` and `__` nests (`PROXYX_CONTROL_CLICKHOUSE__URL`);
+# see docs/configuration.md.
+
+env = "dev"
+database_url = "postgres://proxyx:proxyx@localhost:5432/proxyx_control"
+# Other backends (docs/databases.md): MariaDB `mariadb://proxyx:proxyx@localhost:3306/proxyx_control`,
+# SQLite (one host only) `sqlite:///var/lib/proxyx/control.db?mode=rwc`.
+redis_url = "redis://localhost:6379"
+# broker_kind = "redis_stream"     # or "kafka", "rabbitmq" ("redpanda" is a deprecated alias of "kafka")
+
+api_addr = "0.0.0.0:9000"              # /rpc, /graphql, /health, /metrics
+ingester_health_addr = "0.0.0.0:9001"
+
+# Callers present `Authorization: Bearer pxk_...`; create keys with `proxyx control keys create`.
+auth_mode = "keys"
+
+# Public addresses that session responses hand to clients.
+proxy_public_host = "localhost:8443"
+proxy_public_host_socks5 = "localhost:1080"
+
+# Capture store: where captures are written and queried. ClickHouse is the default; see
+# docs/capture-stores.md for OpenSearch / Elasticsearch.
+[capture_store]
+backend = "clickhouse"            # or "opensearch"
+
+[clickhouse]
+url = "http://localhost:8123"
+database = "proxyx"
+user = "proxyx"
+password = "proxyx"
+
+# Used instead of [clickhouse] when backend = "opensearch" (OpenSearch 2.x or 3.x, or Elasticsearch 8).
+# `proxyx migrate control` installs its index templates. Traffic view exports are not available
+# with this store.
+# [capture_store.opensearch]
+# url = "https://opensearch.internal:9200"
+# username = "proxyx"
+# password = "proxyx"                      # or api_key = "..." for Elasticsearch
+# ca_cert = "/etc/proxyx/secrets/opensearch-ca.pem"
+# index_prefix = "proxyx"
+# rollover = "daily"                       # or "weekly"
+# number_of_shards = 1
+# number_of_replicas = 1
+# refresh_interval = "5s"
+# Connection pool and timeouts, and the in-place retry of transient write failures:
+# request_timeout_secs = 30
+# bulk_timeout_secs = 120
+# connect_timeout_secs = 10
+# pool_idle_timeout_secs = 90              # keep below a load balancer's idle timeout
+# tcp_keepalive_secs = 60
+# max_retries = 3
+# retry_initial_backoff_ms = 200
+# retry_max_backoff_ms = 5000
+# circuit_breaker_threshold = 5            # consecutive failed flushes before the breaker opens
+# circuit_breaker_reset_secs = 60
+#
+# Retention: attach a lifecycle policy to new indices (see docs/capture-stores.md#retention).
+# [capture_store.opensearch.index_settings]
+# "index.plugins.index_state_management.policy_id" = "proxyx-retention"   # OpenSearch ISM
+# "index.lifecycle.name" = "proxyx-retention"                             # Elasticsearch ILM
+
+# The captures log broker: Redis Streams by default (request_log_stream, consumer_group). Run
+# `proxyx migrate control` to create the Kafka topic or the RabbitMQ queues. The session proxy
+# must use the same broker and partition count. See docs/capture-pipeline.md.
+# Set `broker_kind = "kafka"` (or "rabbitmq") in the top part of this file, above the first [table].
+#
+# [kafka]
+# brokers = "kafka-0:9092,kafka-1:9092,kafka-2:9092"
+# topic = "proxyx.captures"
+# partitions = 12                  # permanent
+# replication_factor = 3
+# retention_ms = 604800000
+# compression = "none"             # none, gzip, lz4, snappy, zstd
+# linger_ms = 0                    # coalesce concurrent publishers (the API's SessionEnd)
+# [kafka.tls]
+# ca_cert = "/etc/proxyx/secrets/kafka-ca.pem"
+# [kafka.sasl]
+# mechanism = "SCRAM-SHA-512"      # PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+# username = "proxyx"
+# password = "..."
+#
+# [rabbitmq]
+# url = "amqps://proxyx:...@rabbit.internal:5671/proxyx"
+# exchange = "proxyx.captures"
+# partitions = 12                  # permanent
+# quorum_group_size = 3            # 1 on a single node
+# delivery_limit = 20              # redeliveries before dead-lettering
+# message_ttl_ms = 604800000
+# prefetch = 500                   # keep >= the ingester's bulk_size
+# [rabbitmq.tls]
+# ca_cert = "/etc/proxyx/secrets/rabbit-ca.pem"
+
+# The MITM CA certificate (PEM) that session responses return. In `generate` mode it shares
+# ca.der and ca.key.der in data_dir with the session proxy, so use the same data_dir there.
+[ca]
+type = "generate"
+data_dir = "data"

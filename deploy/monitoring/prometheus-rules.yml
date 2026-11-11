@@ -1,0 +1,903 @@
+# ProxyX Prometheus rules: recording rules and alerts.
+#
+# Scrape jobs these rules expect (see docs/monitoring.md):
+#   proxyx-gateway, proxyx-warmer, proxyx-prober, proxyx-intercept, proxyx-control-api,
+#   proxyx-ingester, proxyx-limiter, proxyx-edge.
+# Every alert carries `severity` (critical or warning), `role`, and the annotations `summary`,
+# `description` and `runbook_url`. Metric definitions are in docs/metrics/*.md;
+# ci/check-alert-metrics.py checks every name used here against them.
+#
+# Check:  promtool check rules deploy/monitoring/prometheus-rules.yml
+# Test:   promtool test rules deploy/monitoring/prometheus-rules.test.yml
+
+groups:
+  # ------------------------------------------------------------------ recording rules
+  - name: proxyx-recording
+    interval: 30s
+    rules:
+      # Pool gateway.
+      - record: proxyx:pool_connections_refused:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_pool_connections_total{outcome!~"ok|bad_request|over_limit"}[5m]))
+          / sum(rate(proxyx_pool_connections_total[5m]))
+      - record: proxyx:pool_dial_duration_seconds:p95_rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, provider, stage) (rate(proxyx_pool_dial_duration_seconds_bucket[5m])))
+      - record: proxyx:pool_api_requests_5xx:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_pool_api_requests_total{status_class="5xx"}[5m]))
+          / sum(rate(proxyx_pool_api_requests_total[5m]))
+      - record: proxyx:pool_api_request_duration_seconds:p95_rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, route) (rate(proxyx_pool_api_request_duration_seconds_bucket[5m])))
+      # Pool warmer.
+      - record: proxyx:pool_warm_creates_failed:ratio_rate15m
+        expr: |
+          sum by (provider) (rate(proxyx_pool_warm_creates_total{outcome="failed"}[15m]))
+          / sum by (provider) (rate(proxyx_pool_warm_creates_total{outcome=~"ok|failed"}[15m]))
+      - record: proxyx:pool_rotate_failed:ratio_rate1h
+        expr: |
+          sum by (provider) (rate(proxyx_pool_rotate_total{outcome=~"timeout|error"}[1h]))
+          / sum by (provider) (rate(proxyx_pool_rotate_total[1h]))
+      # Session proxy.
+      - record: proxyx:intercept_requests_error:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_intercept_requests_total{status_class="error"}[5m]))
+          / sum(rate(proxyx_intercept_requests_total[5m]))
+      - record: proxyx:intercept_requests_5xx:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_intercept_requests_total{status_class="5xx"}[5m]))
+          / sum(rate(proxyx_intercept_requests_total[5m]))
+      - record: proxyx:intercept_connections_upstream_failed:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_intercept_connections_total{outcome=~"upstream_error|upstream_timeout"}[5m]))
+          / sum(rate(proxyx_intercept_connections_total[5m]))
+      - record: proxyx:intercept_upstream_duration_seconds:p50_rate5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (le, protocol) (rate(proxyx_intercept_upstream_duration_seconds_bucket[5m])))
+      - record: proxyx:intercept_upstream_duration_seconds:p95_rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, protocol) (rate(proxyx_intercept_upstream_duration_seconds_bucket[5m])))
+      - record: proxyx:intercept_upstream_duration_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, protocol) (rate(proxyx_intercept_upstream_duration_seconds_bucket[5m])))
+      - record: proxyx:intercept_overhead_seconds:p99_rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, phase) (rate(proxyx_intercept_overhead_seconds_bucket[5m])))
+      # Control API and ingester.
+      - record: proxyx:control_api_requests_5xx:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_control_api_requests_total{status_class="5xx"}[5m]))
+          / sum(rate(proxyx_control_api_requests_total[5m]))
+      - record: proxyx:control_api_request_duration_seconds:p95_rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, route) (rate(proxyx_control_api_request_duration_seconds_bucket[5m])))
+      - record: proxyx:ingester_flush_failed:ratio_rate5m
+        expr: |
+          sum by (table) (rate(proxyx_ingester_flush_duration_seconds_count{outcome="error"}[5m]))
+          / sum by (table) (rate(proxyx_ingester_flush_duration_seconds_count[5m]))
+      - record: proxyx:capture_commit_lag_seconds:p95_rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, table) (rate(proxyx_capture_commit_lag_seconds_bucket[5m])))
+      # Limiter.
+      - record: proxyx:limiter_buckets:used_ratio
+        expr: proxyx_limiter_buckets / proxyx_limiter_buckets_capacity
+      - record: proxyx:limiter_consume_denied:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_limiter_consume_denied_total[5m]))
+          / sum(rate(proxyx_limiter_requests_total{op="consume"}[5m]))
+      # Edge.
+      - record: proxyx:edge_requests_failed:ratio_rate5m
+        expr: |
+          sum(rate(proxyx_edge_requests_total{result=~"dns_error|connect_error|parent_error|timeout|internal"}[5m]))
+          / sum(rate(proxyx_edge_requests_total[5m]))
+      - record: proxyx:edge_egress_failed:ratio_rate5m
+        expr: |
+          sum by (pool) (rate(proxyx_edge_egress_connections_total{outcome!="ok"}[5m]))
+          / sum by (pool) (rate(proxyx_edge_egress_connections_total[5m]))
+
+  # ------------------------------------------------------------------ scrape targets
+  - name: proxyx-targets
+    rules:
+      - alert: ProxyXGatewayDown
+        expr: up{job="proxyx-gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: pool-gateway
+        annotations:
+          summary: "Pool gateway {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the ops port of gateway {{ $labels.instance }} for 2 minutes. The process is down, or its ops listener or network path is broken. New tunnels on this replica may fail."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/014-deploy-and-rollback.md"
+      - alert: ProxyXWarmerDown
+        expr: up{job="proxyx-warmer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "Pool warmer {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the ops port of warmer {{ $labels.instance }} for 2 minutes. While it is down the ready cache is not refilled and stuck state is not swept."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+      - alert: ProxyXInterceptDown
+        expr: up{job="proxyx-intercept"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the admin port of session proxy {{ $labels.instance }} for 2 minutes. The process is down or its admin listener is gone."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXControlAPIDown
+        expr: up{job="proxyx-control-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: control
+        annotations:
+          summary: "Control API {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the control API {{ $labels.instance }} for 2 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXIngesterDown
+        expr: up{job="proxyx-ingester"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: ingester
+        annotations:
+          summary: "Ingester {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the ingester health port of {{ $labels.instance }} for 2 minutes. Captures pile up in the broker until it runs again."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXLimiterDown
+        expr: up{job="proxyx-limiter"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: limiter
+        annotations:
+          summary: "Limiter {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the limiter {{ $labels.instance }} for 2 minutes. Session proxies that use it either deny requests or fail open, by their failopen policy. A restarted limiter starts with empty buckets."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXEdgeDown
+        expr: up{job="proxyx-edge"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          role: edge
+        annotations:
+          summary: "Edge proxy {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the ops listener of edge proxy {{ $labels.instance }} for 2 minutes. The process is down or has no ops_listen."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXProberScrapeDown
+        expr: up{job="proxyx-prober"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          role: prober
+        annotations:
+          summary: "Prober {{ $labels.instance }} is not scraped"
+          description: "Prometheus has not scraped the prober {{ $labels.instance }} for 15 minutes. Canary and browser-sample verdicts stop until it is back."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+
+  # ------------------------------------------------------------------ pool gateway
+  - name: proxyx-pool-gateway
+    rules:
+      - alert: ProxyXRedisDown
+        expr: max by (service, instance) (proxyx_pool_redis_down) == 1
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-gateway
+        annotations:
+          summary: "{{ $labels.service }} {{ $labels.instance }} cannot reach Redis"
+          description: "The last Redis ping or call of {{ $labels.service }} {{ $labels.instance }} failed, for 5 minutes. The gateway refuses new leases with cache_unavailable; open tunnels continue. The warmer cannot refill or sweep."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/001-redis-down.md"
+      - alert: ProxyXPostgresDown
+        expr: max by (service, instance) (proxyx_pool_postgres_down) == 1
+        for: 10m
+        labels:
+          severity: critical
+          role: pool-gateway
+        annotations:
+          summary: "{{ $labels.service }} {{ $labels.instance }} cannot reach PostgreSQL"
+          description: "The last PostgreSQL query of {{ $labels.service }} {{ $labels.instance }} failed, for 10 minutes. The process serves its last good snapshot; configuration and inventory changes stop."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/002-postgres-down.md"
+      - alert: ProxyXConfigRejected
+        expr: max by (source) (proxyx_pool_config_reload_failed) == 1
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-gateway
+        annotations:
+          summary: "Reload of {{ $labels.source }} is rejected"
+          description: "The last reload of the {{ $labels.source }} source failed validation for 5 minutes. The previous version stays in use, so the change has no effect."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/007-config-reload-rejected.md"
+      - alert: ProxyXSnapshotStale
+        expr: max by (service, instance) (proxyx_pool_snapshot_age_seconds) > 300
+        for: 5m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "{{ $labels.service }} {{ $labels.instance }} runs a stale snapshot"
+          description: "The policy and inventory snapshot of {{ $labels.service }} {{ $labels.instance }} is {{ $value | humanizeDuration }} old; reloads run every 30 seconds by default. A failed deploy or a schema the binary cannot read can freeze it. This alert has no dedicated runbook: the deploy and rollback procedure covers it."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/014-deploy-and-rollback.md"
+      - alert: ProxyXLeaseLimitBroken
+        expr: |
+          sum by (provider) (increase(proxyx_pool_lease_limit_broken_total{limit=~"max_conns|fair_use"}[10m])) >= 10
+        for: 30m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Provider {{ $labels.provider }} serves leases past its soft limits"
+          description: "{{ $value | humanize }} leases in 10 minutes broke max_conns or fair_use on {{ $labels.provider }}, for 30 minutes. The pool is too small for the load."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/013-lease-limit-broken.md"
+      - alert: ProxyXBlockSignalsDropped
+        expr: |
+          sum(increase(proxyx_pool_block_signals_ignored_total[30m])) >= 10
+          and
+          sum(increase(proxyx_pool_block_signals_ignored_total[30m]))
+            / (
+              sum(increase(proxyx_pool_block_signals_ignored_total[30m]))
+              + sum(increase(proxyx_pool_block_signals_total{source="client"}[30m]))
+            ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Most client block signals are ignored"
+          description: "Over 30 minutes at least 10 block-signal events from session proxies were dropped, more than half of all client events. Blocked IPs may stay in leasing."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/011-block-signals-dropped.md"
+      - alert: ProxyXGatewayNoCapacity
+        expr: |
+          sum(rate(proxyx_pool_connections_total{outcome=~"cache_empty|no_healthy_ip"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Gateways refuse tunnels for lack of ready units"
+          description: "Tunnels are refused with cache_empty or no_healthy_ip at {{ $value | printf \"%.2f\" }} per second, for 5 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+      - alert: ProxyXGatewayProviderUnavailable
+        expr: |
+          sum(rate(proxyx_pool_connections_total{outcome=~"provider_unavailable|provider_auth|provider_timeout"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Gateways refuse tunnels because of provider failures"
+          description: "Tunnels are refused with provider_unavailable, provider_auth or provider_timeout at {{ $value | printf \"%.2f\" }} per second, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/004-provider-breaker-open.md"
+      - alert: ProxyXGatewayConnectionCap
+        expr: sum by (instance) (rate(proxyx_pool_connections_total{outcome="over_limit"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Gateway {{ $labels.instance }} closes connections over its cap"
+          description: "Gateway {{ $labels.instance }} closes {{ $value | printf \"%.2f\" }} connections per second at accept because max_connections or the pending-connection caps are full."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#pool-gateway"
+      - alert: ProxyXGatewaySourceLimited
+        expr: sum(rate(proxyx_pool_auth_failures_total{reason="source_limited"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Sources are held to the unknown-key lookup limit"
+          description: "{{ $value | printf \"%.2f\" }} logins per second are refused because their source already caused 20 unknown-key lookups in a minute. That is a scan, or a client that cycles keys. A valid key never verified by the pod can be refused with 407 meanwhile."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#pool-gateway"
+      - alert: ProxyXGatewayDialSlow
+        expr: |
+          proxyx:pool_dial_duration_seconds:p95_rate5m{stage=~"dns|tcp|handshake"} > 5
+        for: 15m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Slow {{ $labels.stage }} dial to {{ $labels.provider }}"
+          description: "The 95th percentile of the {{ $labels.stage }} stage of dials to {{ $labels.provider }} is {{ $value | humanizeDuration }}, for 15 minutes. Needs the recording rule proxyx:pool_dial_duration_seconds:p95_rate5m."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/004-provider-breaker-open.md"
+      - alert: ProxyXPoolAPIErrors
+        expr: proxyx:pool_api_requests_5xx:ratio_rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Pool control API answers 5xx"
+          description: "{{ $value | humanizePercentage }} of pool control API requests fail with 5xx, for 10 minutes. Check PostgreSQL and Redis first."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/002-postgres-down.md"
+      - alert: ProxyXPoolAPISlow
+        expr: proxyx:pool_api_request_duration_seconds:p95_rate5m > 5
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-gateway
+        annotations:
+          summary: "Pool control API route {{ $labels.route }} is slow"
+          description: "The 95th percentile on {{ $labels.route }} is {{ $value | humanizeDuration }}, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#pool-gateway"
+
+  # ------------------------------------------------------------------ pool warmer and cache
+  - name: proxyx-pool-warmer
+    rules:
+      - alert: ProxyXCacheLow
+        expr: max by (kind, provider) (proxyx_pool_cache_low{tier="all"}) == 1
+        for: 0m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "Cache of {{ $labels.provider }} ({{ $labels.kind }}) is below its low watermark"
+          description: "Leasable units of {{ $labels.provider }} ({{ $labels.kind }}) stayed below the low watermark for the policy's low_for time (2 minutes by default). The warmer applies that delay, so the alert needs none of its own."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+      - alert: ProxyXCacheBelowMinReady
+        expr: |
+          sum by (kind, provider) (proxyx_pool_cache_ready)
+            < max by (kind, provider) (proxyx_pool_cache_min_ready)
+        for: 15m
+        labels:
+          severity: warning
+          role: pool-warmer
+        annotations:
+          summary: "{{ $labels.provider }} ({{ $labels.kind }}) has fewer ready units than min_ready"
+          description: "Ready units of {{ $labels.provider }} ({{ $labels.kind }}) are below the policy's min_ready for 15 minutes. This is an early warning ahead of the low watermark."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+      - alert: ProxyXProviderBreakerOpen
+        expr: max by (provider) (proxyx_pool_provider_breaker_state) == 2
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "Provider {{ $labels.provider }} breaker is open"
+          description: "The breaker of at least one route class of {{ $labels.provider }} has been open for 5 minutes. The provider cannot create sessions or serve dials; policy fallback carries the load if it exists."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/004-provider-breaker-open.md"
+      - alert: ProxyXBudgetNearLimit
+        expr: max by (provider) (proxyx_pool_cost_used_ratio) >= 0.9
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "Provider {{ $labels.provider }} used {{ $value | humanizePercentage }} of its cost budget"
+          description: "The cost budget of {{ $labels.provider }} has been at 90% or more for 5 minutes. At 100% no new sessions are created until the UTC window resets."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/005-provider-budget-at-90-percent.md"
+      - alert: ProxyXRentalEnding
+        expr: min by (provider) (proxyx_pool_inventory_rental_days_left) < 14
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "A rental of {{ $labels.provider }} ends in {{ $value | humanize }} days"
+          description: "The nearest rental end among the dated IPs of {{ $labels.provider }} is under 14 days away. ProxyX does not renew rentals."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/006-static-ip-rental-ending.md"
+      - alert: ProxyXSweeperRising
+        expr: sum by (kind) (increase(proxyx_pool_sweeper_reclaimed_total[15m])) >= 3
+        for: 30m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "The sweeper keeps reclaiming {{ $labels.kind }} state"
+          description: "{{ $value | humanize }} {{ $labels.kind }} items were reclaimed in 15 minutes, for 30 minutes. Something crashes or leaks unfinished work."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/008-sweeper-reclaim-rate-rising.md"
+      - alert: ProxyXIPReplaceRequested
+        expr: max by (provider) (proxyx_pool_inventory_ips{state="replace_requested"}) > 0
+        for: 5m
+        labels:
+          severity: critical
+          role: pool-warmer
+        annotations:
+          summary: "{{ $labels.provider }} has {{ $value | humanize }} IPs waiting for replacement"
+          description: "IPs of {{ $labels.provider }} are in replace_requested for 5 minutes. They are not leased. Replacing them needs the provider."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/009-ip-replace-requested.md"
+      - alert: ProxyXPoolCooled
+        expr: |
+          sum by (provider) (max by (provider, state) (proxyx_pool_inventory_ips{state=~"cooldown|quarantined"}))
+          / sum by (provider) (max by (provider, state) (proxyx_pool_inventory_ips{state=~"available|leased|degraded|cooldown|quarantined"}))
+          >= 0.5
+        for: 10m
+        labels:
+          severity: warning
+          role: pool-warmer
+        annotations:
+          summary: "Half or more of {{ $labels.provider }} static IPs rest"
+          description: "{{ $value | humanizePercentage }} of the usable static IPs of {{ $labels.provider }} are in cooldown or quarantined, for 10 minutes. The 0.5 threshold matches the default block.max_cooldown_share; change it if you change the policy."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/010-pool-cooled.md"
+      - alert: ProxyXWarmCreatesFailing
+        expr: proxyx:pool_warm_creates_failed:ratio_rate15m > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          role: pool-warmer
+        annotations:
+          summary: "Session creates of {{ $labels.provider }} fail"
+          description: "{{ $value | humanizePercentage }} of the session creates of {{ $labels.provider }} fail, for 15 minutes. A provider breaker usually follows."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/004-provider-breaker-open.md"
+      - alert: ProxyXRotateFailing
+        expr: proxyx:pool_rotate_failed:ratio_rate1h > 0.5
+        for: 30m
+        labels:
+          severity: warning
+          role: pool-warmer
+        annotations:
+          summary: "SIM box resets of {{ $labels.provider }} fail"
+          description: "{{ $value | humanizePercentage }} of the SIM box resets of {{ $labels.provider }} time out or fail, over an hour. Exhausted resets lead to replacement requests."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/009-ip-replace-requested.md"
+      - alert: ProxyXIPChecksFailing
+        expr: sum by (check) (rate(proxyx_pool_check_failures_total[15m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          role: pool-warmer
+        annotations:
+          summary: "Calls to the {{ $labels.check }} IP check keep failing"
+          description: "Calls to the {{ $labels.check }} check service fail at {{ $value | printf \"%.2f\" }} per second, for 30 minutes. Exit-IP and reputation verdicts degrade."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#pool-warmer-and-cache"
+
+  # ------------------------------------------------------------------ prober
+  - name: proxyx-prober
+    rules:
+      - alert: ProxyXProberBlocked
+        expr: |
+          sum(increase(proxyx_pool_probe_jobs_total{outcome=~"credentials_rejected|results_lost"}[30m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+          role: prober
+        annotations:
+          summary: "The prober cannot authenticate or deliver results"
+          description: "Probe jobs ended as credentials_rejected or results_lost during the last 30 minutes, for 10 minutes. No canary verdict reaches the pool."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+      - alert: ProxyXProberSilent
+        expr: time() - max(proxyx_pool_probe_last_posted_timestamp_seconds{kind="canary"}) > 3 * 3600
+        for: 0m
+        labels:
+          severity: warning
+          role: prober
+        annotations:
+          summary: "No canary result for 3 hours"
+          description: "The prober last posted a canary result {{ $value | humanizeDuration }} ago; the canary interval is 1 hour."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+      - alert: ProxyXProberMissing
+        expr: absent(proxyx_pool_probe_last_posted_timestamp_seconds{kind="canary"})
+        for: 3h
+        labels:
+          severity: warning
+          role: prober
+        annotations:
+          summary: "The prober metric has been absent for 3 hours"
+          description: "No canary timestamp series exists: the prober is down or not scraped. Drop this alert if you run no prober."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+
+  # ------------------------------------------------------------------ session proxy
+  - name: proxyx-session-proxy
+    rules:
+      - alert: ProxyXInterceptNotReady
+        expr: |
+          proxyx_intercept_ready == 0
+          unless on (job, instance) proxyx_intercept_draining == 1
+        for: 5m
+        labels:
+          severity: critical
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} is not ready"
+          description: "Session proxy {{ $labels.instance }} has reported not ready for 5 minutes and is not draining. Look at proxyx_intercept_readiness_check{check} for the failing dependency."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXInterceptReadinessCheckFailing
+        expr: proxyx_intercept_readiness_check == 0
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} fails its {{ $labels.check }} check"
+          description: "The {{ $labels.check }} readiness check of session proxy {{ $labels.instance }} has failed for 5 minutes. Checks are redis, capture_pipeline and listeners."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXInterceptDrainingTooLong
+        expr: proxyx_intercept_draining == 1
+        for: 15m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} drains for over 15 minutes"
+          description: "Session proxy {{ $labels.instance }} has been draining for 15 minutes. The default shutdown_drain_timeout_secs is 300; the capture flush adds up to 30 seconds. A longer drain means tunnels do not end or the capture buffer does not empty."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - alert: ProxyXInterceptBreakerOpen
+        expr: max by (target_kind) (proxyx_intercept_upstream_breaker_state) == 1
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Upstream breaker open for {{ $labels.target_kind }}"
+          description: "At least one {{ $labels.target_kind }} target has an open breaker (value 1; 2 is half_open) for 5 minutes. The session proxy fails fast on it."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptBreakerFlapping
+        expr: |
+          sum by (target_kind) (increase(proxyx_intercept_upstream_breaker_transitions_total{to="open"}[30m])) >= 5
+        for: 0m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Upstream breakers for {{ $labels.target_kind }} keep opening"
+          description: "Breakers for {{ $labels.target_kind }} opened {{ $value | humanize }} times in 30 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptBreakerRejecting
+        expr: sum by (target_kind) (rate(proxyx_intercept_upstream_breaker_rejected_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Requests to {{ $labels.target_kind }} are failing fast"
+          description: "The breaker rejects {{ $value | printf \"%.2f\" }} requests per second for {{ $labels.target_kind }} targets, for 5 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXCaptureBufferStalled
+        expr: |
+          proxyx_intercept_capture_buffer_depth > 0
+          and on (job, instance) rate(proxyx_intercept_captures_published_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+          role: session-proxy
+        annotations:
+          summary: "Capture publishing is stalled on {{ $labels.instance }}"
+          description: "{{ $labels.instance }} has {{ $value }} captures queued and has published none for 5 minutes. When the buffer fills, proxied traffic is backpressured even though the proxy reports healthy. Stop starting new crawls and scans until publishing recovers."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+      - alert: ProxyXCaptureBufferHigh
+        expr: proxyx_intercept_capture_buffer_depth > 192
+        for: 10m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Capture buffer of {{ $labels.instance }} is near its capacity"
+          description: "The buffer holds {{ $value }} captures, for 10 minutes. 192 is 75% of the default channel_capacity of 256; scale the threshold if you changed it. The broker is slow and MITM connections are being backpressured."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+      - alert: ProxyXCapturesDropped
+        expr: increase(proxyx_intercept_captures_dropped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} lost captures"
+          description: "{{ $value | humanize }} captures were dropped in 15 minutes after every publish attempt failed. That data is gone."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+      - alert: ProxyXInterceptUpstreamErrors
+        expr: |
+          proxyx:intercept_requests_error:ratio_rate5m > 0.05
+          or proxyx:intercept_connections_upstream_failed:ratio_rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Many upstream requests or connects fail"
+          description: "{{ $value | humanizePercentage }} of forwarded requests end in error (no response headers), or of connections end in upstream_error or upstream_timeout, for 10 minutes. This is the rate over all targets; an unreachable site and a broken egress proxy look the same here."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptUpstream5xx
+        expr: proxyx:intercept_requests_5xx:ratio_rate5m > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Upstreams answer 5xx to more than 10% of requests"
+          description: "{{ $value | humanizePercentage }} of upstream responses were 5xx, for 15 minutes. The status comes from the sites being crawled, so this is a signal, not always a proxy fault."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptOverheadHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(proxyx_intercept_overhead_seconds_bucket{phase=~"request|response|capture_wait"}[5m]))) > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "The session proxy adds more than 250 ms at p99"
+          description: "The 99th percentile of overhead added by the proxy (phases request, response and capture_wait) is {{ $value | humanizeDuration }}, for 15 minutes. The lock_wait and ratelimit_wait phases are policy delays and are not counted."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptUpstreamSlow
+        expr: proxyx:intercept_upstream_duration_seconds:p99_rate5m{protocol!="websocket"} > 10
+        for: 15m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "{{ $labels.protocol }} upstream responses are slow"
+          description: "The 99th percentile of time to upstream response headers is {{ $value | humanizeDuration }} for {{ $labels.protocol }}, for 15 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXInterceptConnectionLimit
+        expr: sum by (instance) (rate(proxyx_intercept_connection_limit_refusals_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Session proxy {{ $labels.instance }} refuses connections at its limit"
+          description: "{{ $labels.instance }} refuses {{ $value | printf \"%.2f\" }} connections per second because tuning.max_connections is reached."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - alert: ProxyXRatelimitBackendErrors
+        expr: sum by (backend) (rate(proxyx_intercept_ratelimit_backend_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "The {{ $labels.backend }} rate-limit backend returns errors"
+          description: "Rate-limit calls to {{ $labels.backend }} fail at {{ $value | printf \"%.2f\" }} per second, for 5 minutes. Orgs are denied or let through by their failopen_policy."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - alert: ProxyXRatelimitFailOpen
+        expr: sum by (backend) (rate(proxyx_intercept_ratelimit_failopen_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: session-proxy
+        annotations:
+          summary: "Rate limits are not enforced: {{ $labels.backend }} fails open"
+          description: "Requests pass without a rate-limit decision at {{ $value | printf \"%.2f\" }} per second because the {{ $labels.backend }} backend failed, for 5 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+
+  # ------------------------------------------------------------------ control API and ingester
+  - name: proxyx-control
+    rules:
+      - alert: ProxyXControlAPIErrors
+        expr: proxyx:control_api_requests_5xx:ratio_rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          role: control
+        annotations:
+          summary: "Control API answers 5xx"
+          description: "{{ $value | humanizePercentage }} of control API requests fail with 5xx, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXControlAPISlow
+        expr: proxyx:control_api_request_duration_seconds:p95_rate5m > 5
+        for: 10m
+        labels:
+          severity: warning
+          role: control
+        annotations:
+          summary: "Control API route {{ $labels.route }} is slow"
+          description: "The 95th percentile on {{ $labels.route }} is {{ $value | humanizeDuration }}, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXIngesterCircuitOpen
+        expr: max by (table) (proxyx_ingester_circuit_open) == 1
+        for: 2m
+        labels:
+          severity: critical
+          role: ingester
+        annotations:
+          summary: "Ingester circuit for {{ $labels.table }} is open"
+          description: "Consecutive flush failures opened the circuit for {{ $labels.table }}. No writes reach the capture store until a flush succeeds."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXIngesterFlushFailing
+        expr: proxyx:ingester_flush_failed:ratio_rate5m > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          role: ingester
+        annotations:
+          summary: "Capture store writes for {{ $labels.table }} fail"
+          description: "{{ $value | humanizePercentage }} of the batch writes for {{ $labels.table }} fail, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXIngesterRowsDropped
+        expr: sum by (table) (increase(proxyx_ingester_rows_dropped_total[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          role: ingester
+        annotations:
+          summary: "The ingester drops rows of {{ $labels.table }}"
+          description: "{{ $value | humanize }} rows of {{ $labels.table }} were dropped in 15 minutes because writing them failed. They are acked and lost."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXIngesterDecodeErrors
+        expr: sum(rate(proxyx_ingester_messages_total{outcome="error"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          role: ingester
+        annotations:
+          summary: "The ingester skips messages it cannot decode"
+          description: "{{ $value | printf \"%.2f\" }} messages per second fail to decode and are skipped, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - alert: ProxyXCaptureCommitLagHigh
+        expr: proxyx:capture_commit_lag_seconds:p95_rate5m > 120
+        for: 10m
+        labels:
+          severity: warning
+          role: ingester
+        annotations:
+          summary: "Captures for {{ $labels.table }} commit {{ $value | humanizeDuration }} late"
+          description: "The 95th percentile delay from capture to committed row for {{ $labels.table }} is over 2 minutes, for 10 minutes. The ingester falls behind."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+
+  # ------------------------------------------------------------------ limiter
+  - name: proxyx-limiter
+    rules:
+      - alert: ProxyXLimiterBucketsNearCapacity
+        expr: proxyx:limiter_buckets:used_ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          role: limiter
+        annotations:
+          summary: "Limiter {{ $labels.instance }} holds {{ $value | humanizePercentage }} of its bucket capacity"
+          description: "The number of buckets is over 90% of the maximum, for 10 minutes. At the maximum the limiter rejects new buckets. Raise PROXYX_LIMITER_MAX_BUCKETS."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - alert: ProxyXLimiterRejectingBuckets
+        expr: sum by (reason) (rate(proxyx_limiter_create_rejected_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          role: limiter
+        annotations:
+          summary: "The limiter rejects new buckets ({{ $labels.reason }})"
+          description: "Bucket creates are rejected at {{ $value | printf \"%.2f\" }} per second, reason {{ $labels.reason }} (the bucket slab is full), for 5 minutes. The orgs behind them are denied or let through by the failopen_policy. Raise PROXYX_LIMITER_MAX_BUCKETS."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - alert: ProxyXLimiterConnectionsRefused
+        expr: sum by (instance) (rate(proxyx_limiter_connections_refused_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: limiter
+        annotations:
+          summary: "Limiter {{ $labels.instance }} closes connections at its cap"
+          description: "The limiter closes {{ $value | printf \"%.2f\" }} connections per second at accept because PROXYX_LIMITER_MAX_CONNECTIONS is reached, for 5 minutes. Each session proxy replica keeps up to 16 pooled connections."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - alert: ProxyXLimiterRestarted
+        expr: proxyx_limiter_uptime_seconds < 300
+        for: 0m
+        labels:
+          severity: warning
+          role: limiter
+        annotations:
+          summary: "Limiter {{ $labels.instance }} restarted"
+          description: "The limiter has run for {{ $value | humanizeDuration }}. Its state is in memory, so every bucket started full again."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+
+  # ------------------------------------------------------------------ edge proxy
+  - name: proxyx-edge
+    rules:
+      - alert: ProxyXEdgeParentDown
+        expr: proxyx_edge_parent_up == 0
+        for: 5m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge parent {{ $labels.parent }} is out of use"
+          description: "Parent proxy {{ $labels.parent }} of {{ $labels.instance }} takes no requests for 5 minutes: its circuit breaker is open or it fails its active health probes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeParentUnhealthy
+        expr: proxyx_edge_parent_healthy == 0
+        for: 5m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge parent {{ $labels.parent }} fails its health probes"
+          description: "Parent proxy {{ $labels.parent }} of {{ $labels.instance }} has failed unhealthy_threshold active probes in a row, for 5 minutes. This is independent of the circuit breaker."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeEgressAddressesOut
+        expr: proxyx_edge_egress_addresses{state=~"open|unhealthy"} > 0
+        for: 10m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Egress pool {{ $labels.pool }} has addresses out of service ({{ $labels.state }})"
+          description: "{{ $value }} addresses of pool {{ $labels.pool }} on {{ $labels.instance }} are {{ $labels.state }}, for 10 minutes. open: the circuit breaker shut them out after failed connects. unhealthy: they failed the active check (no longer assigned to an interface or not bindable)."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeEgressUnavailable
+        expr: sum by (instance, pool) (rate(proxyx_edge_egress_connections_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          role: edge
+        annotations:
+          summary: "Egress pool {{ $labels.pool }} has no usable address"
+          description: "Connects from pool {{ $labels.pool }} on {{ $labels.instance }} fail with unavailable at {{ $value | printf \"%.2f\" }} per second, for 5 minutes: every address of the destination's family is out of service. The edge proxy's /readyz answers 503 while no healthy egress path exists."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeEgressCheckFailing
+        expr: sum by (instance) (increase(proxyx_edge_health_checks_total{kind="egress", result="failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge {{ $labels.instance }} egress checks fail"
+          description: "{{ $value | printf \"%.0f\" }} active egress checks failed in 15 minutes: an address left the host or became unbindable, or a prefix is no longer routed here."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeBreakerFlapping
+        expr: sum by (instance, kind) (increase(proxyx_edge_breaker_transitions_total{state="open"}[30m])) >= 5
+        for: 0m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge {{ $labels.kind }} breakers keep opening on {{ $labels.instance }}"
+          description: "{{ $labels.kind }} breakers opened {{ $value | printf \"%.0f\" }} times in 30 minutes, summed over every breaker of that kind."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeConfigReloadFailed
+        expr: sum by (instance) (increase(proxyx_edge_config_reloads_total{result="failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge {{ $labels.instance }} rejected a configuration reload"
+          description: "A SIGHUP reload failed in the last 15 minutes. The running configuration stays in force; the log names the reason."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeAccessLogDropping
+        expr: rate(proxyx_edge_access_log_dropped_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge {{ $labels.instance }} drops access log lines"
+          description: "The access log writer drops {{ $value | printf \"%.2f\" }} lines per second because the log disk is slow or failing, for 5 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeConnectionCap
+        expr: sum by (instance, listener) (rate(proxyx_edge_connections_total{outcome="over_limit"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Edge listener {{ $labels.listener }} closes connections over its limit"
+          description: "{{ $labels.instance }} closes {{ $value | printf \"%.2f\" }} connections per second at accept on {{ $labels.listener }}, for 10 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeAuthFailures
+        expr: sum by (listener) (rate(proxyx_edge_auth_failures_total{reason=~"invalid|blocked"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Many failed logins on edge listener {{ $labels.listener }}"
+          description: "{{ $value | printf \"%.2f\" }} logins per second fail with an invalid password or a blocked source, for 10 minutes. This is a scan or a misconfigured client."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeRequestFailures
+        expr: proxyx:edge_requests_failed:ratio_rate5m > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "A quarter of edge requests fail to reach their target"
+          description: "{{ $value | humanizePercentage }} of edge requests end in dns_error, connect_error, parent_error, timeout or internal, for 15 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - alert: ProxyXEdgeEgressFailures
+        expr: proxyx:edge_egress_failed:ratio_rate5m > 0.25
+        for: 15m
+        labels:
+          severity: warning
+          role: edge
+        annotations:
+          summary: "Egress pool {{ $labels.pool }} fails to connect"
+          description: "{{ $value | humanizePercentage }} of connects from pool {{ $labels.pool }} fail or find no address, for 15 minutes."
+          runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"

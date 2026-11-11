@@ -1,0 +1,13 @@
+[package]
+name = "proxyx-control-graphql"
+version.workspace = true
+license.workspace = true
+publish = false
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-graphql = { version = "7", features = ["uuid"] }
+async-trait = "0.1"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+uuid = { version = "1", features = ["v4", "v7", "v5", "serde"] }

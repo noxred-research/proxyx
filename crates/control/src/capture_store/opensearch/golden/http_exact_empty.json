@@ -1,0 +1,27 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "term": {
+                "host": ""
+              }
+            },
+            {
+              "term": {
+                "len.response_body": 0
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,38 @@
+# Residential, the account's package key as password (provider documentation read 2026-10-15):
+#   username: country-{cc}[-city-{city}]-session-{id}-rotate-timed_{seconds}
+#   password: the package key. Session id: letters, digits, `_`, 32 characters at most.
+# No strict mode is documented, so a strict lease is refused.
+
+[[adapter]]
+id = "res_package_key"
+kind = "rotating"
+subtype = "residential"
+host = "package.example.net"
+port = 1337
+pass_file = "res_package_key_pass"
+user = "{opts}"
+pass = "{base_pass}"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "country-{v}"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city-{v}"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+charset = "word"
+max_len = 32
+
+[[adapter.option]]
+name = "ttl"
+to = "user"
+frag = "-rotate-timed_{v}"
+unit = "sec"
+max = 604800

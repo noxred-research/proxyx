@@ -1,0 +1,37 @@
+# An org's own upstream proxy (static). `PUT /v1/orgs/{org}/upstream` stores the host,
+# port and login of one org as an inventory unit owned by that org. `customer` dials it
+# over HTTP CONNECT, `customer_https` over TLS-protected HTTP CONNECT, and
+# `customer_socks5` over SOCKS5; the API picks the adapter from the
+# request's `scheme`. The address must be public routable: private, loopback, link-local,
+# CGNAT, metadata and cluster addresses are refused at write, at load and at dial. A unit
+# with no login dials without one.
+
+[[adapter]]
+id = "customer"
+kind = "static"
+subtype = "datacenter"
+scheme = "http"
+public_only = true
+credentials_optional = true
+user = "{base_user}"
+pass = "{base_pass}"
+
+[[adapter]]
+id = "customer_socks5"
+kind = "static"
+subtype = "datacenter"
+scheme = "socks5"
+public_only = true
+credentials_optional = true
+user = "{base_user}"
+pass = "{base_pass}"
+
+[[adapter]]
+id = "customer_https"
+kind = "static"
+subtype = "datacenter"
+scheme = "https"
+public_only = true
+credentials_optional = true
+user = "{base_user}"
+pass = "{base_pass}"

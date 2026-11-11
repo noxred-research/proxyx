@@ -1,0 +1,129 @@
+# Residential, numeric session id and per-request rotation. Verified 2026-11-11.
+# Sticky: {user}-{cc}[-city_{city}]-{numeric_session_id}
+# Per-request rotation: {user}-{cc}[-city_{city}]-rotate
+# Sticky lifetime is set in the provider dashboard (1 minute..24 hours), not credentials.
+# Set max_session_minutes to that dashboard duration before enabling this example.
+# No strict/no-replacement mode is documented. Strict requests are refused.
+# Per-request adapters are for direct recipes, not reusable exit-IP pool units.
+
+[[adapter]]
+id = "res_numeric_sticky_http"
+kind = "rotating"
+subtype = "residential"
+scheme = "http"
+host = "p.webshare.io" # wire-compat: the provider gateway
+port = 80
+user_file = "res_numeric_session_user"
+pass_file = "res_numeric_session_pass"
+user = "{base_user}{opts}"
+pass = "{base_pass}"
+max_session_minutes = 1440
+echo_url = "https://ipv4.webshare.io/" # wire-compat: the provider echo
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city_{v}"
+charset = "alpha_underscore"
+case = "lower"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-{v}"
+charset = "digits"
+len = 16
+
+[[adapter]]
+id = "res_numeric_sticky_socks5"
+kind = "rotating"
+subtype = "residential"
+scheme = "socks5"
+host = "p.webshare.io" # wire-compat: the provider gateway
+port = 1080
+user_file = "res_numeric_session_user"
+pass_file = "res_numeric_session_pass"
+user = "{base_user}{opts}"
+pass = "{base_pass}"
+max_session_minutes = 1440
+echo_url = "https://ipv4.webshare.io/" # wire-compat: the provider echo
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city_{v}"
+charset = "alpha_underscore"
+case = "lower"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-{v}"
+charset = "digits"
+len = 16
+
+[[adapter]]
+id = "res_numeric_rotating_http"
+kind = "rotating"
+subtype = "residential"
+scheme = "http"
+session_mode = "per_request"
+host = "p.webshare.io" # wire-compat: the provider gateway
+port = 80
+user_file = "res_numeric_session_user"
+pass_file = "res_numeric_session_pass"
+user = "{base_user}{opts}-rotate"
+pass = "{base_pass}"
+max_session_minutes = 1440
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city_{v}"
+charset = "alpha_underscore"
+case = "lower"
+
+[[adapter]]
+id = "res_numeric_rotating_socks5"
+kind = "rotating"
+subtype = "residential"
+scheme = "socks5"
+session_mode = "per_request"
+host = "p.webshare.io" # wire-compat: the provider gateway
+port = 1080
+user_file = "res_numeric_session_user"
+pass_file = "res_numeric_session_pass"
+user = "{base_user}{opts}-rotate"
+pass = "{base_pass}"
+max_session_minutes = 1440
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city_{v}"
+charset = "alpha_underscore"
+case = "lower"

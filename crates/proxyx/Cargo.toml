@@ -1,0 +1,44 @@
+[package]
+name = "proxyx"
+description = "ProxyX: proxy gateway, pool manager, control plane and rate-limit service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "proxyx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tikv-jemallocator.workspace = true
+tokio.workspace = true
+proxyx-control = { path = "../control" }
+proxyx-edge = { path = "../edge" }
+proxyx-limiter-server = { path = "../limiter-server" }
+proxyx-mcp = { path = "../mcp" }
+proxyx-ops = { path = "../ops" }
+proxyx-pool = { path = "../pool" }
+
+[dev-dependencies]
+base64.workspace = true
+common = { path = "../pool-common", package = "proxyx-pool-common" }
+limiter-client = { path = "../limiter-client", package = "proxyx-limiter-client" }
+limiter-proto = { path = "../limiter-proto", package = "proxyx-limiter-proto" }
+parking_lot.workspace = true
+redis.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+store = { path = "../store", package = "proxyx-store" }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+verify = { path = "../verify", package = "proxyx-verify" }

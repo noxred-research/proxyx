@@ -1,0 +1,39 @@
+[package]
+name = "proxyx-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "`proxyx doctor` and `proxyx assess`: role self-checks and pool health assessment"
+
+[lints]
+workspace = true
+
+# Linked into the `proxyx` binary only. It reads the configuration types of the
+# roles that binary runs (pool, control, edge, limiter), so it may depend on the
+# control plane; the session proxy (BoringSSL) has its own `doctor` subcommand
+# built on `proxyx-diag` and must not depend on this crate.
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common = { path = "../pool-common", package = "proxyx-pool-common" }
+diag = { path = "../diag", package = "proxyx-diag" }
+policy = { path = "../policy", package = "proxyx-policy" }
+proxyx-control = { path = "../control" }
+proxyx-edge = { path = "../edge" }
+proxyx-limiter-server = { path = "../limiter-server" }
+proxyx-pool = { path = "../pool" }
+provider = { path = "../provider", package = "proxyx-provider" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+store = { path = "../store", package = "proxyx-store" }
+time.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+redis.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+uuid.workspace = true

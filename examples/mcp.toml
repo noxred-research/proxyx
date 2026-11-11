@@ -1,0 +1,113 @@
+# MCP server (`proxyx mcp`, or the standalone `proxyx-mcp`). Pass it with `--config examples/mcp.toml`,
+# set PROXYX_MCP_CONFIG, or install it as /etc/proxyx/mcp.toml. See docs/mcp.md.
+#
+# Everything is off unless this file turns it on: with no [safety] section the server is read-only,
+# lists no mutating tool and shows no secret. Credentials are never values here: each one is read
+# from the file named, once, at start.
+
+# --- Streamable HTTP transport (stdio needs no settings) -------------------------------------------
+[http]
+bind = "127.0.0.1:8765"            # loopback; put a TLS reverse proxy in front for anything else
+path = "/mcp"
+token_file = "/etc/proxyx/secrets/mcp-token"   # bearer token clients must send; required for HTTP
+allowed_origins = []               # Origins allowed besides loopback ones (DNS rebinding defence)
+max_body_bytes = 1048576
+
+# --- What to talk to ---------------------------------------------------------------------------------
+# Pool gateway control API (/v1): inventory, policies, org keys, blocks, customer upstreams.
+[endpoints.pool]
+url = "http://127.0.0.1:8081"
+admin_token_file = "/etc/proxyx/secrets/admin-token"
+operator = "proxyx-mcp"            # sent as X-Operator, so the gateway's audit trail names this server
+# org_key_file = "/etc/proxyx/secrets/mcp-org-key"   # lets report_block_signal use the org-key route
+
+# Session control plane (/rpc): sessions, traffic search, org limits, egress proxy.
+[endpoints.control]
+url = "http://127.0.0.1:9000"
+key_file = "/etc/proxyx/secrets/mcp-pxk"       # a `pxk_` service key (proxyx control keys create --kind service)
+org = "acme"                                     # the org that key is bound to; default of every `org` argument
+
+# Ops ports of every running role: health, readiness and Prometheus metrics. No credentials.
+# kind: gateway | warmer | control-api | ingester | intercept
+[[endpoints.roles]]
+name = "gateway"
+kind = "gateway"
+url = "http://127.0.0.1:8888"
+
+[[endpoints.roles]]
+name = "warmer"
+kind = "warmer"
+url = "http://127.0.0.1:8889"
+
+[[endpoints.roles]]
+name = "control"
+kind = "control-api"
+url = "http://127.0.0.1:9000"
+
+[[endpoints.roles]]
+name = "ingester"
+kind = "ingester"
+url = "http://127.0.0.1:9001"
+
+[[endpoints.roles]]
+name = "session-proxy"
+kind = "intercept"
+url = "http://127.0.0.1:8890"
+
+# --- Safety: what an agent may change ----------------------------------------------------------------
+[safety]
+profile = "read_only"              # read_only (default) | operator (sessions, org blocks, block signals) | admin (everything)
+# capabilities = ["sessions", "org_blocks"]   # replaces the profile; one or more of:
+#   sessions org_keys org_limits egress org_blocks signals policy inventory pool_sessions
+# allow_tools = ["list_*", "health", "assess"]  # when set, only these tools exist; a trailing * is a prefix
+# deny_tools = ["put_inventory"]
+approval = "off"                   # off | all | listed. all: every mutation waits for `proxyx mcp approve <id>`
+# approval_tools = ["put_*", "delete_*", "create_org_key"]   # for approval = "listed"
+approval_ttl_secs = 86400
+# confirm_token_file = "/etc/proxyx/secrets/mcp-confirm"     # enables the confirm_change tool; hold it as an operator, not in the agent
+reveal_secrets_once = false        # true: a created org key or session proxy URL is shown once in the creating call;
+                                   # false: it is written to a 0600 file and only the path is returned
+force_dry_run = false              # true: every mutation is only previewed
+# state_dir = "/var/lib/proxyx-mcp"  # pending changes, written secrets, session registry (default ~/.local/state/proxyx-mcp)
+
+# The engagement the work is authorized under. Recorded in every audit entry.
+[scope]
+# engagement = "SOW-2026-114"      # reference of the written authorization
+# expires = "2026-12-31T23:59:59Z" # mutations are refused after this moment
+require_engagement = false         # true: mutations are refused unless engagement is set
+allowed_orgs = []                  # when set, tools can only act on these orgs, and not on shared resources
+
+[limits]
+max_rows = 100                     # rows in a list result
+max_body_bytes = 4096              # bytes of one captured body in a result
+max_result_bytes = 262144          # bytes of text in one tool result
+request_timeout_secs = 20          # one backend request
+max_calls_per_minute = 240
+max_mutations_per_hour = 120
+max_session_ttl_secs = 3600        # longest session an agent may ask for
+allow_inline_secrets = false       # false: logins are passed by credential_ref only
+max_in_flight = 16
+
+[audit]
+# path = "/var/log/proxyx-mcp/audit.jsonl"   # append-only, hash-chained JSONL (default state_dir/audit.jsonl)
+
+[metrics]
+sample_interval_secs = 30          # background scrapes that make rates possible; 0 disables
+history = 120
+
+# Logins a tool may use by name (credential_ref). The model never sees the password.
+# [credentials.customer-egress]
+# username = "svc-user"
+# password_file = "/etc/proxyx/secrets/customer-egress-password"
+
+# --- Optional LLM for summarize_traffic, classify_block_page and suggest_policy ------------------------
+# Any chat-completions compatible endpoint: a hosted service, a gateway or a local inference server.
+# Without this section those tools run on rules and statistics only (or are not listed).
+# [llm]
+# endpoint = "http://127.0.0.1:11434/v1"        # base URL or the full .../chat/completions URL
+# model = "my-model"
+# api_key_file = "/etc/proxyx/secrets/llm-key"  # omit for a local server without a key
+# ca_file = "/etc/proxyx/secrets/llm-ca.pem"   # PEM of the private CA that signed an https endpoint's certificate
+# timeout_secs = 60
+# max_input_chars = 24000
+# max_output_tokens = 1024

@@ -1,0 +1,9 @@
+# Code owners. Besides review routing, this file is the allow-list for CI: the `authorize`
+# job of every workflow reads this file from the default branch and runs the workflow only
+# when the actor (and, for pull requests, the author) owns the `*` rule below and the pull
+# request does not come from a fork. Contributors who are not listed here never run a
+# workflow. Only user owners are honoured; team owners (@org/team) are ignored by that check.
+* @kaan-zeroday
+
+# Explicitly protect workflow policy and this allow-list as well as the wildcard above.
+/.github/ @kaan-zeroday

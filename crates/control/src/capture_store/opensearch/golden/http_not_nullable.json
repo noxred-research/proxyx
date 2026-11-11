@@ -1,0 +1,29 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "exists": {
+                "field": "correlation_id"
+              }
+            }
+          ],
+          "must_not": [
+            {
+              "term": {
+                "correlation_id": "x"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

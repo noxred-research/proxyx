@@ -1,0 +1,51 @@
+[project]
+name = "proxyx-prober"
+version = "0.1.0"
+description = "ProxyX quality prober: real browser page loads through the gateway's probe listener"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "AGPL-3.0-only"
+dependencies = [
+    "httpx>=0.28.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "prometheus_client>=0.20.0",
+    "playwright>=1.48.0",
+]
+
+[project.urls]
+Homepage = "https://proxyx.dev"
+Repository = "https://github.com/noxred-research/proxyx"
+
+[project.scripts]
+proxyx-prober = "proxyx_prober.__main__:main"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
+]
+dev = [
+    "proxyx-prober[test]",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

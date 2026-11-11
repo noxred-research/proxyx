@@ -1,0 +1,42 @@
+# Residential, options in the PASSWORD. Verified 2026-11-11:
+#   {pass}_country-{cc}_session-{id}_lifetime-{N}s[_killswitch-1]
+# The session id is exactly 8 alphanumeric characters. Lifetime: 1 second to 7 days, one
+# unit only. `_killswitch-1` answers HTTP 410 instead of changing the IP.
+
+[[adapter]]
+id = "res_pass_suffix"
+kind = "rotating"
+subtype = "residential"
+scheme = "http"
+host = "geo.iproyal.com" # wire-compat: the provider gateway
+port = 12321
+user_file = "res_pass_suffix_user"
+pass_file = "res_pass_suffix_pass"
+user = "{base_user}"
+pass = "{base_pass}{opts}"
+max_session_minutes = 10080
+
+[[adapter.option]]
+name = "country"
+to = "pass"
+frag = "_country-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "sid"
+to = "pass"
+frag = "_session-{v}"
+charset = "alnum"
+len = 8
+
+[[adapter.option]]
+name = "ttl"
+to = "pass"
+frag = "_lifetime-{v}s"
+unit = "sec"
+max = 604800
+
+[[adapter.option]]
+name = "strict"
+to = "pass"
+frag = "_killswitch-1"

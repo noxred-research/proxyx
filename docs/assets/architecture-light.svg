@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="600" viewBox="0 0 1120 600" role="img" aria-label="ProxyX architecture: clients, pool gateway, session proxy with TLS interception and capture, state stores, upstream providers and platform services"><title>ProxyX architecture</title><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#0ea5e9"/><stop offset="1" stop-color="#7c3aed"/></linearGradient><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#64748b"/></marker></defs><style>text{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;fill:#0f172a}.h{font-size:15px;font-weight:700}.b{font-size:13.5px;font-weight:600}.s{font-size:11.5px;fill:#64748b}</style><rect width="1120" height="600" rx="16" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="24" y="60" width="210" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+<text class="h" x="40" y="86">Clients</text>
+<rect x="44" y="100" width="170" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="129" y="123" text-anchor="middle">HTTP · CONNECT</text>
+<text class="s" x="129" y="140" text-anchor="middle">curl · browsers · crawlers</text>
+<rect x="44" y="170" width="170" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="129" y="193" text-anchor="middle">SOCKS5 clients</text>
+<text class="s" x="129" y="210" text-anchor="middle">org key per tenant</text>
+<rect x="44" y="240" width="170" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="129" y="263" text-anchor="middle">Sessions API</text>
+<text class="s" x="129" y="280" text-anchor="middle">create · extend · query</text>
+<text class="s" x="44" y="326">loopback or your network</text>
+<text class="s" x="44" y="343">sessions API: control plane</text>
+<rect x="270" y="60" width="230" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+<text class="h" x="286" y="86">Pool gateway</text>
+<rect x="290" y="100" width="190" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="385" y="123" text-anchor="middle">Ingress · org keys</text>
+<text class="s" x="385" y="140" text-anchor="middle">limits · blocks · budgets</text>
+<rect x="290" y="170" width="190" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="385" y="193" text-anchor="middle">Routing · leasing</text>
+<text class="s" x="385" y="210" text-anchor="middle">sticky · rotation · breakers</text>
+<rect x="290" y="240" width="190" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="385" y="263" text-anchor="middle">Provider adapters</text>
+<text class="s" x="385" y="280" text-anchor="middle">declarative TOML templates</text>
+<text class="s" x="290" y="320">username templating carries geo,</text>
+<text class="s" x="290" y="337">session and sticky parameters</text>
+<rect x="540" y="60" width="330" height="470" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+<text class="h" x="556" y="86">Session proxy  (intercept)</text>
+<rect x="560" y="100" width="290" height="46" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="705" y="120" text-anchor="middle">Listeners</text>
+<text class="s" x="705" y="137" text-anchor="middle">HTTP · CONNECT · SOCKS5 · per-session credentials</text>
+<rect x="560" y="164" width="138" height="70" rx="9" fill="#ecfeff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="629" y="196" text-anchor="middle">TLS interception</text>
+<text class="s" x="629" y="213" text-anchor="middle">per-deployment CA</text>
+<rect x="712" y="164" width="138" height="70" rx="9" fill="#eef2ff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="781" y="196" text-anchor="middle">Capture</text>
+<text class="s" x="781" y="213" text-anchor="middle">HTTP/1.1 · h2 · WebSocket</text>
+<rect x="560" y="252" width="290" height="56" rx="9" fill="#fff1f2" stroke="#e11d48" stroke-width="1.5"/>
+<text class="b" x="705" y="277" text-anchor="middle">Policy</text>
+<text class="s" x="705" y="294" text-anchor="middle">header injection · upstream overrides · rate limits</text>
+<rect x="560" y="326" width="138" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="629" y="349" text-anchor="middle">TLS profiles</text>
+<text class="s" x="629" y="366" text-anchor="middle">browser-grade</text>
+<rect x="712" y="326" width="138" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="781" y="349" text-anchor="middle">Egress chaining</text>
+<text class="s" x="781" y="366" text-anchor="middle">pool gateway or any proxy</text>
+<rect x="560" y="396" width="290" height="52" rx="9" fill="#eef2ff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="705" y="419" text-anchor="middle">Capture pipeline</text>
+<text class="s" x="705" y="436" text-anchor="middle">broker → ClickHouse → query DSL</text>
+<text class="s" x="560" y="478">REST + GraphQL queries · export views</text>
+<text class="s" x="560" y="498">to object storage</text>
+<rect x="906" y="60" width="190" height="300" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+<text class="h" x="922" y="86">State</text>
+<rect x="926" y="100" width="150" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="1001" y="123" text-anchor="middle">PostgreSQL</text>
+<text class="s" x="1001" y="140" text-anchor="middle">orgs · sessions · leases</text>
+<rect x="926" y="170" width="150" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="1001" y="193" text-anchor="middle">Valkey / Redis</text>
+<text class="s" x="1001" y="210" text-anchor="middle">streams · hot state</text>
+<rect x="926" y="240" width="150" height="52" rx="9" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+<text class="b" x="1001" y="263" text-anchor="middle">ClickHouse</text>
+<text class="s" x="1001" y="280" text-anchor="middle">captured traffic</text>
+<text class="s" x="926" y="326">plus Kafka-compatible broker</text>
+<rect x="270" y="440" width="230" height="90" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+<text class="h" x="385" y="476" text-anchor="middle">Upstream providers</text>
+<text class="s" x="385" y="498" text-anchor="middle">residential · ISP · datacenter · mobile</text>
+<text class="s" x="385" y="514" text-anchor="middle">static IPs · bring-your-own</text>
+<rect x="906" y="380" width="190" height="150" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-dasharray="5 4"/>
+<text class="h" x="922" y="406">Platform services</text>
+<text class="s" x="926" y="428">pool warmer + verifier</text>
+<text class="s" x="926" y="448">distributed limiter</text>
+<text class="s" x="926" y="468">Prometheus · OpenTelemetry</text>
+<text class="s" x="926" y="500">one binary, several roles</text>
+<line x1="214" y1="126" x2="270" y2="126" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<line x1="214" y1="196" x2="270" y2="196" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<line x1="500" y1="126" x2="540" y2="126" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<line x1="870" y1="126" x2="906" y2="126" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<line x1="870" y1="196" x2="906" y2="196" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)"/>
+<line x1="870" y1="266" x2="906" y2="266" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)"/>
+<line x1="385" y1="360" x2="385" y2="440" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" marker-start="url(#ar)"/>
+<line x1="540" y1="485" x2="500" y2="485" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)"/>
+<line x1="870" y1="470" x2="906" y2="450" stroke="#64748b" stroke-width="1.8" marker-end="url(#ar)" stroke-dasharray="5 4"/>
+</svg>

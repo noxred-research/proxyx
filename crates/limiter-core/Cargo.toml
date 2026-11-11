@@ -1,0 +1,14 @@
+[package]
+name = "proxyx-limiter-core"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+name = "limiter_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "deterministic_bench"
+path = "src/bin/deterministic_bench.rs"

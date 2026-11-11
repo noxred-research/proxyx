@@ -1,0 +1,30 @@
+# VPN egress sidecar: a VPN tunnel (WireGuard, OpenVPN or Tailscale) with a SOCKS5 proxy
+# (microsocks) in front of it. Point a static inventory entry of the `vpn-pool` adapter
+# at its SOCKS5 port to leave the internet from the VPN exit. See entrypoint.egress.sh for the
+# environment variables.
+#
+#   docker build -f docker/Dockerfile.egress -t proxyx-egress:dev docker
+#   docker run --rm --cap-add NET_ADMIN --device /dev/net/tun \
+#     -e VPN_TYPE=wireguard -e VPN_CONFIG=/vpn/wg0.conf -v ./wg0.conf:/vpn/wg0.conf:ro \
+#     proxyx-egress:dev
+#
+# A WireGuard config that routes everything (`AllowedIPs = 0.0.0.0/0`, as most commercial VPNs
+# do) makes wg-quick set `net.ipv4.conf.all.src_valid_mark`. A container cannot write it, so
+# set it when the container starts: add `--sysctl net.ipv4.conf.all.src_valid_mark=1`
+# (Compose: `sysctls: ["net.ipv4.conf.all.src_valid_mark=1"]`).
+
+# Base images are pinned by manifest-list digest; Dependabot proposes digest updates.
+FROM tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c AS tailscale
+
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates iproute2 iptables iputils-ping microsocks openresolv openvpn procps wireguard-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i 's|^\(\s*\)\[\[ \$proto == -4 \]\] && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1|\1[[ $proto == -4 ]] \&\& [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) != 1 ]] \&\& cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1|' /usr/bin/wg-quick \
+    && grep -q 'sysctl -n net.ipv4.conf.all.src_valid_mark' /usr/bin/wg-quick
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscaled /usr/local/bin/
+COPY entrypoint.egress.sh /usr/local/bin/entrypoint.egress.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.egress.sh
+EXPOSE 1080
+ENTRYPOINT ["/usr/local/bin/entrypoint.egress.sh"]

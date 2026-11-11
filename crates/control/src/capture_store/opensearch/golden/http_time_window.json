@@ -1,0 +1,30 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "term": {
+                "source_id": "s1"
+              }
+            },
+            {
+              "range": {
+                "timestamp": {
+                  "gte": 1700000000000,
+                  "lte": 1700003600000
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

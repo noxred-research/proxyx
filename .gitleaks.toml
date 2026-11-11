@@ -1,0 +1,39 @@
+# Secret-scan configuration (https://github.com/gitleaks/gitleaks). Run:
+#   gitleaks git . --log-opts="--all --full-history --diff-merges=separate" --config .gitleaks.toml --redact
+#   gitleaks dir . --config .gitleaks.toml --redact
+title = "proxyx"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "proxyx-api-key"
+description = "ProxyX control-plane API key"
+regex = '''pxk_[A-Za-z0-9_-]{43}'''
+
+[[rules]]
+id = "proxyx-org-key"
+description = "ProxyX pool gateway org key"
+regex = '''\bak_[A-Za-z0-9_-]{43}\b'''
+
+[allowlist]
+description = "Reviewed synthetic values only; fixture directories are scanned normally"
+regexTarget = "secret"
+regexes = [
+  # RFC 6455 sample nonce in crates/intercept/src/mitm/mod.rs WebSocket tests.
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  # docs/gateway.md curl example: placeholder password, optionally preceded by username.
+  '''(?:^|:)ak_YOUR_KEY'?$''',
+  # docs/gateway.md and docs/providers.md: credential file name `<adapter id>_<RFC 5737 address>`.
+  # The prefix is generic so the historical commits, which used an earlier adapter id, stay clean.
+  '''^[a-z]+(?:_[a-z]+)*_203-0-113-50$''',
+  # crates/bench/src/gateway.rs: repetitive benchmark-only org key.
+  '''^ak_benchbenchbenchbenchbenchbenchbenchbench000$''',
+  # crates/mcp/src/redact.rs: all-A key used to assert secret redaction.
+  '''^ak_A{43}$''',
+  # crates/mcp/tests/common/mod.rs: repetitive keys served by local test backends.
+  '''^ak_orgkeyorgkeyorgkeyorgkeyorgkey0123456789abc$''',
+  '''^ak_newkeynewkeynewkeynewkeynewkey0123456789xyz$''',
+  # crates/mcp/tests/common/mod.rs: local LLM test backend's expected bearer token.
+  '''^llm-api-key-0123456789$''',
+]

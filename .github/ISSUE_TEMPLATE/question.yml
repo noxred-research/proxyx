@@ -1,0 +1,38 @@
+name: Question
+description: Ask how to use or deploy proxyx
+title: "[question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the [documentation](https://github.com/noxred-research/proxyx/blob/main/docs/README.md), the
+        [README](https://github.com/noxred-research/proxyx/blob/main/README.md) and `proxyx <command> --help`. Do not paste credentials, cookies or
+        captured third-party content. Security vulnerabilities go through private reporting, see
+        [SECURITY.md](https://github.com/noxred-research/proxyx/blob/main/SECURITY.md).
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands, configuration and what you read, with secrets removed.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: proxyx version or commit
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true

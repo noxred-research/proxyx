@@ -1,0 +1,62 @@
+# Example Prometheus configuration: one scrape job per ProxyX role, the rule file, and the
+# Alertmanager. Replace every target with your own addresses. The job names matter: the
+# rules in prometheus-rules.yml select on them (for example up{job="proxyx-limiter"}).
+#
+# Check:  promtool check config deploy/monitoring/prometheus.example.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - prometheus-rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager.example.org:9093"]
+
+scrape_configs:
+  # Pool gateway: ops port, default 8888 (PROXYX_POOL_OPS_LISTEN).
+  - job_name: proxyx-gateway
+    static_configs:
+      - targets: ["gateway-1.example.org:8888", "gateway-2.example.org:8888"]
+
+  # Pool warmer: ops port, default 8888.
+  - job_name: proxyx-warmer
+    static_configs:
+      - targets: ["warmer-1.example.org:8888"]
+
+  # Browser prober: metrics port, default 8081. Leave this job out if you run no prober.
+  - job_name: proxyx-prober
+    static_configs:
+      - targets: ["prober-1.example.org:8081"]
+
+  # Session proxy (proxyx-intercept): admin port, default 8888.
+  - job_name: proxyx-intercept
+    static_configs:
+      - targets: ["session-proxy-1.example.org:8888"]
+
+  # Control API: default 9000.
+  - job_name: proxyx-control-api
+    static_configs:
+      - targets: ["control-1.example.org:9000"]
+
+  # Ingester health and metrics listener: default 9001.
+  - job_name: proxyx-ingester
+    static_configs:
+      - targets: ["ingester-1.example.org:9001"]
+
+  # Limiter: the optional HTTP port of `proxyx limiter` (PROXYX_LIMITER_METRICS_ADDR, off by
+  # default). Its series carry no `service` label, so this job adds one. Leave the job out if
+  # the session proxy uses the Redis rate-limit backend.
+  - job_name: proxyx-limiter
+    static_configs:
+      - targets: ["limiter-1.example.org:39092"]
+        labels:
+          service: proxyx-limiter
+
+  # Edge proxy: server.ops_listen of the edge configuration; there is no default.
+  - job_name: proxyx-edge
+    static_configs:
+      - targets: ["edge-1.example.org:9100"]

@@ -1,0 +1,32 @@
+{
+  "bool": {
+    "filter": [
+      {
+        "term": {
+          "org_id": "org-1"
+        }
+      },
+      {
+        "bool": {
+          "filter": [
+            {
+              "regexp": {
+                "host": {
+                  "case_insensitive": true,
+                  "value": ".*[Ssſ]payco\\*\\?.*"
+                }
+              }
+            },
+            {
+              "range": {
+                "status_code": {
+                  "gte": 500
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,1136 @@
+# Unit tests for prometheus-rules.yml.
+#
+# Run:  promtool test rules deploy/monitoring/prometheus-rules.test.yml
+#
+# Each test feeds synthetic series and states which alerts fire at which time, and which
+# must stay silent. One minute between samples; `0x4` means five samples of 0.
+
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------- scrape targets
+  - name: scrape target down fires after 2 minutes, one per role
+    interval: 1m
+    input_series:
+      - series: 'up{job="proxyx-gateway", instance="gw-1:8888"}'
+        values: '1 1 0x10'
+      - series: 'up{job="proxyx-gateway", instance="gw-2:8888"}'
+        values: '1x12'
+      - series: 'up{job="proxyx-limiter", instance="lim-1:39092"}'
+        values: '0x12'
+      - series: 'up{job="proxyx-ingester", instance="ing-1:9001"}'
+        values: '0x12'
+      - series: 'up{job="proxyx-warmer", instance="wm-1:8888"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXGatewayDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXGatewayDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-gateway
+              job: proxyx-gateway
+              instance: "gw-1:8888"
+            exp_annotations:
+              summary: "Pool gateway gw-1:8888 is not scraped"
+              description: "Prometheus has not scraped the ops port of gateway gw-1:8888 for 2 minutes. The process is down, or its ops listener or network path is broken. New tunnels on this replica may fail."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/014-deploy-and-rollback.md"
+      - eval_time: 10m
+        alertname: ProxyXLimiterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: limiter
+              job: proxyx-limiter
+              instance: "lim-1:39092"
+            exp_annotations:
+              summary: "Limiter lim-1:39092 is not scraped"
+              description: "Prometheus has not scraped the limiter lim-1:39092 for 2 minutes. Session proxies that use it either deny requests or fail open, by their failopen policy. A restarted limiter starts with empty buckets."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - eval_time: 10m
+        alertname: ProxyXIngesterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: ingester
+              job: proxyx-ingester
+              instance: "ing-1:9001"
+            exp_annotations:
+              summary: "Ingester ing-1:9001 is not scraped"
+              description: "Prometheus has not scraped the ingester health port of ing-1:9001 for 2 minutes. Captures pile up in the broker until it runs again."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      - eval_time: 10m
+        alertname: ProxyXWarmerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              job: proxyx-warmer
+              instance: "wm-1:8888"
+            exp_annotations:
+              summary: "Pool warmer wm-1:8888 is not scraped"
+              description: "Prometheus has not scraped the ops port of warmer wm-1:8888 for 2 minutes. While it is down the ready cache is not refilled and stuck state is not swept."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+
+  # ---------------------------------------------------------------- redis, postgres, config
+  - name: redis down fires after 5 minutes and only for the failing replica
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_redis_down{service="proxyx-gateway", instance="gw-1:8888"}'
+        values: '0 0 1x20'
+      - series: 'proxyx_pool_redis_down{service="proxyx-gateway", instance="gw-2:8888"}'
+        values: '0x22'
+      - series: 'proxyx_pool_redis_down{service="proxyx-warmer", instance="wm-1:8888"}'
+        values: '1 1 0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXRedisDown
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ProxyXRedisDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-gateway
+              service: proxyx-gateway
+              instance: "gw-1:8888"
+            exp_annotations:
+              summary: "proxyx-gateway gw-1:8888 cannot reach Redis"
+              description: "The last Redis ping or call of proxyx-gateway gw-1:8888 failed, for 5 minutes. The gateway refuses new leases with cache_unavailable; open tunnels continue. The warmer cannot refill or sweep."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/001-redis-down.md"
+
+  - name: postgres down fires after 10 minutes and clears
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_postgres_down{service="proxyx-warmer", instance="wm-1:8888"}'
+        values: '0 1x14 0x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ProxyXPostgresDown
+        exp_alerts: []
+      - eval_time: 13m
+        alertname: ProxyXPostgresDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-gateway
+              service: proxyx-warmer
+              instance: "wm-1:8888"
+            exp_annotations:
+              summary: "proxyx-warmer wm-1:8888 cannot reach PostgreSQL"
+              description: "The last PostgreSQL query of proxyx-warmer wm-1:8888 failed, for 10 minutes. The process serves its last good snapshot; configuration and inventory changes stop."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/002-postgres-down.md"
+      - eval_time: 20m
+        alertname: ProxyXPostgresDown
+        exp_alerts: []
+
+  - name: config reload rejected and stale snapshot
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_config_reload_failed{service="proxyx-gateway", instance="gw-1:8888", source="policies"}'
+        values: '0 1x15'
+      - series: 'proxyx_pool_config_reload_failed{service="proxyx-gateway", instance="gw-1:8888", source="inventory"}'
+        values: '0x16'
+      - series: 'proxyx_pool_snapshot_age_seconds{service="proxyx-gateway", instance="gw-1:8888"}'
+        values: '0+60x16'
+      - series: 'proxyx_pool_snapshot_age_seconds{service="proxyx-gateway", instance="gw-2:8888"}'
+        values: '10 40 10 40 10 40 10 40 10 40 10 40 10 40 10 40 10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXConfigRejected
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXConfigRejected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-gateway
+              source: policies
+            exp_annotations:
+              summary: "Reload of policies is rejected"
+              description: "The last reload of the policies source failed validation for 5 minutes. The previous version stays in use, so the change has no effect."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/007-config-reload-rejected.md"
+      # Snapshot age passes 300 s at minute 5 and must stay above it for 5 more minutes.
+      - eval_time: 8m
+        alertname: ProxyXSnapshotStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyXSnapshotStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: pool-gateway
+              service: proxyx-gateway
+              instance: "gw-1:8888"
+            exp_annotations:
+              summary: "proxyx-gateway gw-1:8888 runs a stale snapshot"
+              description: "The policy and inventory snapshot of proxyx-gateway gw-1:8888 is 15m 0s old; reloads run every 30 seconds by default. A failed deploy or a schema the binary cannot read can freeze it. This alert has no dedicated runbook: the deploy and rollback procedure covers it."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/014-deploy-and-rollback.md"
+
+  # ---------------------------------------------------------------- cache
+  - name: cache low fires only for tier all
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_cache_low{service="proxyx-warmer", kind="rotating", provider="pa", tier="all"}'
+        values: '0 0 1x5'
+      - series: 'proxyx_pool_cache_low{service="proxyx-warmer", kind="rotating", provider="pa", tier="normal"}'
+        values: '1x7'
+      - series: 'proxyx_pool_cache_low{service="proxyx-warmer", kind="static", provider="pb", tier="all"}'
+        values: '0x7'
+      - series: 'proxyx_pool_cache_low{service="proxyx-warmer", kind="static", provider="pb", tier="normal"}'
+        values: '1x7'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ProxyXCacheLow
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ProxyXCacheLow
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              kind: rotating
+              provider: pa
+            exp_annotations:
+              summary: "Cache of pa (rotating) is below its low watermark"
+              description: "Leasable units of pa (rotating) stayed below the low watermark for the policy's low_for time (2 minutes by default). The warmer applies that delay, so the alert needs none of its own."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+
+  - name: ready units below min_ready for 15 minutes
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_cache_ready{kind="rotating", provider="pa", tier="normal"}'
+        values: '2x20'
+      - series: 'proxyx_pool_cache_ready{kind="rotating", provider="pa", tier="degraded"}'
+        values: '1x20'
+      - series: 'proxyx_pool_cache_min_ready{kind="rotating", provider="pa"}'
+        values: '10x20'
+      - series: 'proxyx_pool_cache_ready{kind="rotating", provider="pb", tier="normal"}'
+        values: '8x20'
+      - series: 'proxyx_pool_cache_ready{kind="rotating", provider="pb", tier="degraded"}'
+        values: '3x20'
+      - series: 'proxyx_pool_cache_min_ready{kind="rotating", provider="pb"}'
+        values: '10x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ProxyXCacheBelowMinReady
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: ProxyXCacheBelowMinReady
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: pool-warmer
+              kind: rotating
+              provider: pa
+            exp_annotations:
+              summary: "pa (rotating) has fewer ready units than min_ready"
+              description: "Ready units of pa (rotating) are below the policy's min_ready for 15 minutes. This is an early warning ahead of the low watermark."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/003-cache-below-low-watermark.md"
+
+  # ---------------------------------------------------------------- provider breaker, budget, rental
+  - name: provider breaker open fires only for state 2 (open), not half-open
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_provider_breaker_state{service="proxyx-warmer", provider="pa"}'
+        values: '0 2x15'
+      - series: 'proxyx_pool_provider_breaker_state{service="proxyx-warmer", provider="pb"}'
+        values: '0 1x15'
+      - series: 'proxyx_pool_provider_breaker_state{service="proxyx-warmer", provider="pc"}'
+        values: '0x16'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXProviderBreakerOpen
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXProviderBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              provider: pa
+            exp_annotations:
+              summary: "Provider pa breaker is open"
+              description: "The breaker of at least one route class of pa has been open for 5 minutes. The provider cannot create sessions or serve dials; policy fallback carries the load if it exists."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/004-provider-breaker-open.md"
+
+  - name: budget at 90 percent and rental ending
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_cost_used_ratio{service="proxyx-warmer", provider="pa"}'
+        values: '0.5 0.95x12'
+      - series: 'proxyx_pool_cost_used_ratio{service="proxyx-warmer", provider="pb"}'
+        values: '0.85x13'
+      - series: 'proxyx_pool_inventory_rental_days_left{service="proxyx-warmer", provider="pa"}'
+        values: '10x12'
+      - series: 'proxyx_pool_inventory_rental_days_left{service="proxyx-warmer", provider="pa"}'
+        values: '10x12'
+      - series: 'proxyx_pool_inventory_rental_days_left{service="proxyx-warmer", provider="pb"}'
+        values: '20x12'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ProxyXBudgetNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              provider: pa
+            exp_annotations:
+              summary: "Provider pa used 95% of its cost budget"
+              description: "The cost budget of pa has been at 90% or more for 5 minutes. At 100% no new sessions are created until the UTC window resets."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/005-provider-budget-at-90-percent.md"
+      - eval_time: 12m
+        alertname: ProxyXRentalEnding
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              provider: pa
+            exp_annotations:
+              summary: "A rental of pa ends in 10 days"
+              description: "The nearest rental end among the dated IPs of pa is under 14 days away. ProxyX does not renew rentals."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/006-static-ip-rental-ending.md"
+
+  # ---------------------------------------------------------------- sweeper, replace, cooled, lease limit
+  - name: sweeper rising needs a sustained rate; one burst does not fire
+    interval: 1m
+    input_series:
+      # One reclaim per minute for an hour: increase over 15 minutes is far above 3.
+      - series: 'proxyx_pool_sweeper_reclaimed_total{service="proxyx-warmer", kind="session"}'
+        values: '0+1x60'
+      # A single burst of 10 at minute 5, then flat.
+      - series: 'proxyx_pool_sweeper_reclaimed_total{service="proxyx-warmer", kind="lease"}'
+        values: '0x5 10x55'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ProxyXSweeperRising
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: ProxyXSweeperRising
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              kind: session
+            exp_annotations:
+              summary: "The sweeper keeps reclaiming session state"
+              description: "15 session items were reclaimed in 15 minutes, for 30 minutes. Something crashes or leaks unfinished work."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/008-sweeper-reclaim-rate-rising.md"
+
+  - name: replacement requested and pool cooled
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", provider="pa", state="replace_requested"}'
+        values: '0 2x14'
+      # Two warmer replicas report the same inventory; the rules deduplicate them.
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-1", provider="pa", state="available"}'
+        values: '2x15'
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-2", provider="pa", state="available"}'
+        values: '2x15'
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-1", provider="pa", state="cooldown"}'
+        values: '3x15'
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-2", provider="pa", state="cooldown"}'
+        values: '3x15'
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-1", provider="pb", state="available"}'
+        values: '9x15'
+      - series: 'proxyx_pool_inventory_ips{service="proxyx-warmer", instance="wm-1", provider="pb", state="cooldown"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXIPReplaceRequested
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXIPReplaceRequested
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: pool-warmer
+              provider: pa
+            exp_annotations:
+              summary: "pa has 2 IPs waiting for replacement"
+              description: "IPs of pa are in replace_requested for 5 minutes. They are not leased. Replacing them needs the provider."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/009-ip-replace-requested.md"
+      # pa: 3 cooled of 5 usable (deduplicated) = 0.6; pb: 1 of 10 = 0.1.
+      - eval_time: 14m
+        alertname: ProxyXPoolCooled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: pool-warmer
+              provider: pa
+            exp_annotations:
+              summary: "Half or more of pa static IPs rest"
+              description: "60% of the usable static IPs of pa are in cooldown or quarantined, for 10 minutes. The 0.5 threshold matches the default block.max_cooldown_share; change it if you change the policy."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/010-pool-cooled.md"
+
+  - name: lease limit broken counts only max_conns and fair_use
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_lease_limit_broken_total{service="proxyx-gateway", provider="pa", limit="max_conns"}'
+        values: '0+2x60'
+      - series: 'proxyx_pool_lease_limit_broken_total{service="proxyx-gateway", provider="pa", limit="rest"}'
+        values: '0+5x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ProxyXLeaseLimitBroken
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: ProxyXLeaseLimitBroken
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: pool-gateway
+              provider: pa
+            exp_annotations:
+              summary: "Provider pa serves leases past its soft limits"
+              description: "20 leases in 10 minutes broke max_conns or fair_use on pa, for 30 minutes. The pool is too small for the load."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/013-lease-limit-broken.md"
+
+  - name: block signals dropped needs both the count and the share
+    interval: 1m
+    input_series:
+      # Ignored: 1 per minute (about 30 per window). Applied client events: 0.
+      - series: 'proxyx_pool_block_signals_ignored_total{service="proxyx-gateway"}'
+        values: '0+1x80'
+      - series: 'proxyx_pool_block_signals_total{service="proxyx-gateway", source="client", type="challenge", scope="ip"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ProxyXBlockSignalsDropped
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ProxyXBlockSignalsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: pool-gateway
+            exp_annotations:
+              summary: "Most client block signals are ignored"
+              description: "Over 30 minutes at least 10 block-signal events from session proxies were dropped, more than half of all client events. Blocked IPs may stay in leasing."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/011-block-signals-dropped.md"
+
+  - name: block signals mostly applied do not fire
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_block_signals_ignored_total{service="proxyx-gateway"}'
+        values: '0+1x80'
+      - series: 'proxyx_pool_block_signals_total{service="proxyx-gateway", source="client", type="challenge", scope="ip"}'
+        values: '0+5x80'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ProxyXBlockSignalsDropped
+        exp_alerts: []
+
+  # ---------------------------------------------------------------- prober
+  - name: prober blocked, silent and missing
+    interval: 1m
+    input_series:
+      - series: 'proxyx_pool_probe_jobs_total{service="proxyx-prober", kind="canary", outcome="credentials_rejected"}'
+        values: '0+1x30'
+      - series: 'proxyx_pool_probe_jobs_total{service="proxyx-prober", kind="canary", outcome="posted"}'
+        values: '0+1x30'
+      # The canary timestamp stays at 0 (the epoch), so time() minus it is the eval time.
+      - series: 'proxyx_pool_probe_last_posted_timestamp_seconds{service="proxyx-prober", kind="canary"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXProberBlocked
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ProxyXProberBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: prober
+            exp_annotations:
+              summary: "The prober cannot authenticate or deliver results"
+              description: "Probe jobs ended as credentials_rejected or results_lost during the last 30 minutes, for 10 minutes. No canary verdict reaches the pool."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+      # The series exists, so it is neither silent before 3 hours nor missing.
+      - eval_time: 29m
+        alertname: ProxyXProberSilent
+        exp_alerts: []
+      - eval_time: 29m
+        alertname: ProxyXProberMissing
+        exp_alerts: []
+
+  - name: prober silent when the canary timestamp is old
+    interval: 10m
+    input_series:
+      - series: 'proxyx_pool_probe_last_posted_timestamp_seconds{service="proxyx-prober", kind="canary"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: ProxyXProberSilent
+        exp_alerts: []
+      - eval_time: 4h
+        alertname: ProxyXProberSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: prober
+            exp_annotations:
+              summary: "No canary result for 3 hours"
+              description: "The prober last posted a canary result 4h 0m 0s ago; the canary interval is 1 hour."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+
+  - name: prober missing when the series is absent for 3 hours
+    interval: 10m
+    input_series:
+      - series: 'up{job="proxyx-gateway", instance="gw-1:8888"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: ProxyXProberMissing
+        exp_alerts: []
+      - eval_time: 4h
+        alertname: ProxyXProberMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: prober
+              kind: canary
+            exp_annotations:
+              summary: "The prober metric has been absent for 3 hours"
+              description: "No canary timestamp series exists: the prober is down or not scraped. Drop this alert if you run no prober."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/runbooks/012-prober-not-reporting.md"
+
+  # ---------------------------------------------------------------- session proxy
+  - name: session proxy not ready, but not while it drains
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_ready{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888"}'
+        values: '1 0x15'
+      - series: 'proxyx_intercept_draining{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888"}'
+        values: '0x16'
+      - series: 'proxyx_intercept_ready{service="proxyx-intercept", job="proxyx-intercept", instance="sp-2:8888"}'
+        values: '1 0x15'
+      - series: 'proxyx_intercept_draining{service="proxyx-intercept", job="proxyx-intercept", instance="sp-2:8888"}'
+        values: '0 1x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ProxyXInterceptNotReady
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXInterceptNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-1:8888"
+            exp_annotations:
+              summary: "Session proxy sp-1:8888 is not ready"
+              description: "Session proxy sp-1:8888 has reported not ready for 5 minutes and is not draining. Look at proxyx_intercept_readiness_check{check} for the failing dependency."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+      # sp-2 drains for more than 15 minutes.
+      - eval_time: 14m
+        alertname: ProxyXInterceptDrainingTooLong
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: ProxyXInterceptDrainingTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-2:8888"
+            exp_annotations:
+              summary: "Session proxy sp-2:8888 drains for over 15 minutes"
+              description: "Session proxy sp-2:8888 has been draining for 15 minutes. The default shutdown_drain_timeout_secs is 300; the capture flush adds up to 30 seconds. A longer drain means tunnels do not end or the capture buffer does not empty."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+
+  - name: readiness check names the failing dependency
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_readiness_check{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888", check="redis"}'
+        values: '1 0x15'
+      - series: 'proxyx_intercept_readiness_check{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888", check="listeners"}'
+        values: '1x16'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ProxyXInterceptReadinessCheckFailing
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXInterceptReadinessCheckFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-1:8888"
+              check: redis
+            exp_annotations:
+              summary: "Session proxy sp-1:8888 fails its redis check"
+              description: "The redis readiness check of session proxy sp-1:8888 has failed for 5 minutes. Checks are redis, capture_pipeline and listeners."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#scrape-targets-and-readiness"
+
+  - name: upstream breaker open fires for open, not half-open
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_upstream_breaker_state{service="proxyx-intercept", instance="sp-1:8888", target_kind="egress_proxy"}'
+        values: '0 1x15'
+      - series: 'proxyx_intercept_upstream_breaker_state{service="proxyx-intercept", instance="sp-1:8888", target_kind="origin"}'
+        values: '0 2x15'
+      - series: 'proxyx_intercept_upstream_breaker_state{service="proxyx-intercept", instance="sp-1:8888", target_kind="private_override"}'
+        values: '0x16'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ProxyXInterceptBreakerOpen
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXInterceptBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              target_kind: egress_proxy
+            exp_annotations:
+              summary: "Upstream breaker open for egress_proxy"
+              description: "At least one egress_proxy target has an open breaker (value 1; 2 is half_open) for 5 minutes. The session proxy fails fast on it."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+
+  - name: breaker flapping and fast-fail rejections
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_upstream_breaker_transitions_total{service="proxyx-intercept", target_kind="origin", to="open"}'
+        values: '0+1x40'
+      - series: 'proxyx_intercept_upstream_breaker_transitions_total{service="proxyx-intercept", target_kind="egress_proxy", to="closed"}'
+        values: '0+1x40'
+      - series: 'proxyx_intercept_upstream_breaker_rejected_total{service="proxyx-intercept", target_kind="origin"}'
+        values: '0+3x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXInterceptBreakerFlapping
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ProxyXInterceptBreakerFlapping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              target_kind: origin
+            exp_annotations:
+              summary: "Upstream breakers for origin keep opening"
+              description: "Breakers for origin opened 20 times in 30 minutes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - eval_time: 20m
+        alertname: ProxyXInterceptBreakerRejecting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              target_kind: origin
+            exp_annotations:
+              summary: "Requests to origin are failing fast"
+              description: "The breaker rejects 0.05 requests per second for origin targets, for 5 minutes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+
+  - name: capture buffer stalls only when nothing is published
+    interval: 1m
+    input_series:
+      # sp-1: 40 captures queued and the published counter is flat.
+      - series: 'proxyx_intercept_capture_buffer_depth{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888"}'
+        values: '40x20'
+      - series: 'proxyx_intercept_captures_published_total{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888"}'
+        values: '100x20'
+      # sp-2: a queue, but publishing goes on.
+      - series: 'proxyx_intercept_capture_buffer_depth{service="proxyx-intercept", job="proxyx-intercept", instance="sp-2:8888"}'
+        values: '40x20'
+      - series: 'proxyx_intercept_captures_published_total{service="proxyx-intercept", job="proxyx-intercept", instance="sp-2:8888"}'
+        values: '0+50x20'
+      # sp-3: near capacity and publishing.
+      - series: 'proxyx_intercept_capture_buffer_depth{service="proxyx-intercept", job="proxyx-intercept", instance="sp-3:8888"}'
+        values: '240x20'
+      - series: 'proxyx_intercept_captures_published_total{service="proxyx-intercept", job="proxyx-intercept", instance="sp-3:8888"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXCaptureBufferStalled
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ProxyXCaptureBufferStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-1:8888"
+            exp_annotations:
+              summary: "Capture publishing is stalled on sp-1:8888"
+              description: "sp-1:8888 has 40 captures queued and has published none for 5 minutes. When the buffer fills, proxied traffic is backpressured even though the proxy reports healthy. Stop starting new crawls and scans until publishing recovers."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+      - eval_time: 12m
+        alertname: ProxyXCaptureBufferHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-3:8888"
+            exp_annotations:
+              summary: "Capture buffer of sp-3:8888 is near its capacity"
+              description: "The buffer holds 240 captures, for 10 minutes. 192 is 75% of the default channel_capacity of 256; scale the threshold if you changed it. The broker is slow and MITM connections are being backpressured."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+
+  - name: captures dropped fires on any increase
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_captures_dropped_total{service="proxyx-intercept", job="proxyx-intercept", instance="sp-1:8888"}'
+        values: '0x5 3 3 3 3'
+      - series: 'proxyx_intercept_captures_dropped_total{service="proxyx-intercept", job="proxyx-intercept", instance="sp-2:8888"}'
+        values: '0x9'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ProxyXCapturesDropped
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: ProxyXCapturesDropped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: session-proxy
+              service: proxyx-intercept
+              job: proxyx-intercept
+              instance: "sp-1:8888"
+            exp_annotations:
+              summary: "Session proxy sp-1:8888 lost captures"
+              description: "3 captures were dropped in 15 minutes after every publish attempt failed. That data is gone."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#capture-pipeline"
+
+  - name: connection limit and rate-limit backend alerts
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_connection_limit_refusals_total{service="proxyx-intercept", instance="sp-1:8888"}'
+        values: '0+6x20'
+      - series: 'proxyx_intercept_ratelimit_backend_errors_total{service="proxyx-intercept", instance="sp-1:8888", backend="limiter"}'
+        values: '0+6x20'
+      - series: 'proxyx_intercept_ratelimit_backend_errors_total{service="proxyx-intercept", instance="sp-1:8888", backend="redis"}'
+        values: '0x20'
+      - series: 'proxyx_intercept_ratelimit_failopen_total{service="proxyx-intercept", instance="sp-1:8888", backend="limiter"}'
+        values: '0+6x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXInterceptConnectionLimit
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ProxyXInterceptConnectionLimit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              instance: "sp-1:8888"
+            exp_annotations:
+              summary: "Session proxy sp-1:8888 refuses connections at its limit"
+              description: "sp-1:8888 refuses 0.10 connections per second because tuning.max_connections is reached."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - eval_time: 12m
+        alertname: ProxyXRatelimitBackendErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              backend: limiter
+            exp_annotations:
+              summary: "The limiter rate-limit backend returns errors"
+              description: "Rate-limit calls to limiter fail at 0.10 per second, for 5 minutes. Orgs are denied or let through by their failopen_policy."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - eval_time: 12m
+        alertname: ProxyXRatelimitFailOpen
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+              backend: limiter
+            exp_annotations:
+              summary: "Rate limits are not enforced: limiter fails open"
+              description: "Requests pass without a rate-limit decision at 0.10 per second because the limiter backend failed, for 5 minutes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+
+  - name: upstream error ratio over five percent fires, below does not
+    interval: 1m
+    input_series:
+      # 10 error requests and 90 good ones per minute: ratio 0.1.
+      - series: 'proxyx_intercept_requests_total{service="proxyx-intercept", instance="sp-1:8888", protocol="https", status_class="error"}'
+        values: '0+10x30'
+      - series: 'proxyx_intercept_requests_total{service="proxyx-intercept", instance="sp-1:8888", protocol="https", status_class="2xx"}'
+        values: '0+90x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXInterceptUpstreamErrors
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ProxyXInterceptUpstreamErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+            exp_annotations:
+              summary: "Many upstream requests or connects fail"
+              description: "10% of forwarded requests end in error (no response headers), or of connections end in upstream_error or upstream_timeout, for 10 minutes. This is the rate over all targets; an unreachable site and a broken egress proxy look the same here."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+    promql_expr_test:
+      - expr: round(proxyx:intercept_requests_error:ratio_rate5m, 0.01)
+        eval_time: 25m
+        exp_samples:
+          - labels: '{}'
+            value: 0.1
+
+  - name: upstream 5xx ratio and p99 overhead
+    interval: 1m
+    input_series:
+      - series: 'proxyx_intercept_requests_total{service="proxyx-intercept", instance="sp-1:8888", protocol="https", status_class="5xx"}'
+        values: '0+20x40'
+      - series: 'proxyx_intercept_requests_total{service="proxyx-intercept", instance="sp-1:8888", protocol="https", status_class="2xx"}'
+        values: '0+80x40'
+      # All observations land in the 1 s bucket, so p99 is above 250 ms.
+      - series: 'proxyx_intercept_overhead_seconds_bucket{service="proxyx-intercept", instance="sp-1:8888", protocol="https", phase="response", le="0.5"}'
+        values: '0x40'
+      - series: 'proxyx_intercept_overhead_seconds_bucket{service="proxyx-intercept", instance="sp-1:8888", protocol="https", phase="response", le="1"}'
+        values: '0+60x40'
+      - series: 'proxyx_intercept_overhead_seconds_bucket{service="proxyx-intercept", instance="sp-1:8888", protocol="https", phase="response", le="+Inf"}'
+        values: '0+60x40'
+      # A policy delay of 5 s per request in ratelimit_wait must not fire the overhead alert.
+      - series: 'proxyx_intercept_overhead_seconds_bucket{service="proxyx-intercept", instance="sp-1:8888", protocol="https", phase="ratelimit_wait", le="10"}'
+        values: '0+60x40'
+      - series: 'proxyx_intercept_overhead_seconds_bucket{service="proxyx-intercept", instance="sp-1:8888", protocol="https", phase="ratelimit_wait", le="+Inf"}'
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ProxyXInterceptUpstream5xx
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+            exp_annotations:
+              summary: "Upstreams answer 5xx to more than 10% of requests"
+              description: "20% of upstream responses were 5xx, for 15 minutes. The status comes from the sites being crawled, so this is a signal, not always a proxy fault."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+      - eval_time: 30m
+        alertname: ProxyXInterceptOverheadHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: session-proxy
+            exp_annotations:
+              summary: "The session proxy adds more than 250 ms at p99"
+              description: "The 99th percentile of overhead added by the proxy (phases request, response and capture_wait) is 995ms, for 15 minutes. The lock_wait and ratelimit_wait phases are policy delays and are not counted."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#session-proxy"
+
+  # ---------------------------------------------------------------- ingester and control
+  - name: ingester circuit open fires per table
+    interval: 1m
+    input_series:
+      - series: 'proxyx_ingester_circuit_open{service="proxyx-ingester", instance="ing-1:9001", table="http_captures"}'
+        values: '0 1x10'
+      - series: 'proxyx_ingester_circuit_open{service="proxyx-ingester", instance="ing-1:9001", table="ws_messages"}'
+        values: '0x11'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ProxyXIngesterCircuitOpen
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ProxyXIngesterCircuitOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: ingester
+              table: http_captures
+            exp_annotations:
+              summary: "Ingester circuit for http_captures is open"
+              description: "Consecutive flush failures opened the circuit for http_captures. No writes reach the capture store until a flush succeeds."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+
+  - name: ingester drops rows and commit lag
+    interval: 1m
+    input_series:
+      - series: 'proxyx_ingester_rows_dropped_total{service="proxyx-ingester", table="http_captures"}'
+        values: '0x3 5 5 5 5 5 5'
+      - series: 'proxyx_ingester_flush_duration_seconds_count{service="proxyx-ingester", table="http_captures", outcome="error"}'
+        values: '0+3x40'
+      - series: 'proxyx_ingester_flush_duration_seconds_count{service="proxyx-ingester", table="http_captures", outcome="ok"}'
+        values: '0+7x40'
+      - series: 'proxyx_capture_commit_lag_seconds_bucket{service="proxyx-ingester", table="http_captures", le="60"}'
+        values: '0x40'
+      - series: 'proxyx_capture_commit_lag_seconds_bucket{service="proxyx-ingester", table="http_captures", le="300"}'
+        values: '0+100x40'
+      - series: 'proxyx_capture_commit_lag_seconds_bucket{service="proxyx-ingester", table="http_captures", le="+Inf"}'
+        values: '0+100x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXIngesterRowsDropped
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ProxyXIngesterRowsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: ingester
+              table: http_captures
+            exp_annotations:
+              summary: "The ingester drops rows of http_captures"
+              description: "5 rows of http_captures were dropped in 15 minutes because writing them failed. They are acked and lost."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - eval_time: 25m
+        alertname: ProxyXIngesterFlushFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: ingester
+              table: http_captures
+            exp_annotations:
+              summary: "Capture store writes for http_captures fail"
+              description: "30% of the batch writes for http_captures fail, for 10 minutes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+      - eval_time: 25m
+        alertname: ProxyXCaptureCommitLagHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: ingester
+              table: http_captures
+            exp_annotations:
+              summary: "Captures for http_captures commit 4m 48s late"
+              description: "The 95th percentile delay from capture to committed row for http_captures is over 2 minutes, for 10 minutes. The ingester falls behind."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+
+  - name: control API 5xx ratio
+    interval: 1m
+    input_series:
+      - series: 'proxyx_control_api_requests_total{service="proxyx-control", route="/rpc/sessions", status_class="5xx"}'
+        values: '0+10x30'
+      - series: 'proxyx_control_api_requests_total{service="proxyx-control", route="/rpc/sessions", status_class="2xx"}'
+        values: '0+90x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXControlAPIErrors
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ProxyXControlAPIErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: control
+            exp_annotations:
+              summary: "Control API answers 5xx"
+              description: "10% of control API requests fail with 5xx, for 10 minutes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#control-api-and-ingester"
+
+  # ---------------------------------------------------------------- limiter
+  - name: limiter bucket capacity above 90 percent
+    interval: 1m
+    input_series:
+      - series: 'proxyx_limiter_buckets{service="proxyx-limiter", job="proxyx-limiter", instance="lim-1:39092"}'
+        values: '950x20'
+      - series: 'proxyx_limiter_buckets_capacity{service="proxyx-limiter", job="proxyx-limiter", instance="lim-1:39092"}'
+        values: '1000x20'
+      - series: 'proxyx_limiter_buckets{service="proxyx-limiter", job="proxyx-limiter", instance="lim-2:39092"}'
+        values: '800x20'
+      - series: 'proxyx_limiter_buckets_capacity{service="proxyx-limiter", job="proxyx-limiter", instance="lim-2:39092"}'
+        values: '1000x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyXLimiterBucketsNearCapacity
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ProxyXLimiterBucketsNearCapacity
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: limiter
+              service: proxyx-limiter
+              job: proxyx-limiter
+              instance: "lim-1:39092"
+            exp_annotations:
+              summary: "Limiter lim-1:39092 holds 95% of its bucket capacity"
+              description: "The number of buckets is over 90% of the maximum, for 10 minutes. At the maximum the limiter rejects new buckets. Raise PROXYX_LIMITER_MAX_BUCKETS."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+
+  - name: limiter rejections and restart
+    interval: 1m
+    input_series:
+      - series: 'proxyx_limiter_create_rejected_total{service="proxyx-limiter", reason="full"}'
+        values: '0+6x20'
+      - series: 'proxyx_limiter_uptime_seconds{service="proxyx-limiter", instance="lim-1:39092"}'
+        values: '0+60x20'
+      - series: 'proxyx_limiter_connections_refused_total{service="proxyx-limiter", instance="lim-1:39092"}'
+        values: '0+12x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXLimiterRejectingBuckets
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ProxyXLimiterRejectingBuckets
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: limiter
+              reason: full
+            exp_annotations:
+              summary: "The limiter rejects new buckets (full)"
+              description: "Bucket creates are rejected at 0.10 per second, reason full (the bucket slab is full), for 5 minutes. The orgs behind them are denied or let through by the failopen_policy. Raise PROXYX_LIMITER_MAX_BUCKETS."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - eval_time: 12m
+        alertname: ProxyXLimiterConnectionsRefused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: limiter
+              instance: "lim-1:39092"
+            exp_annotations:
+              summary: "Limiter lim-1:39092 closes connections at its cap"
+              description: "The limiter closes 0.20 connections per second at accept because PROXYX_LIMITER_MAX_CONNECTIONS is reached, for 5 minutes. Each session proxy replica keeps up to 16 pooled connections."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - eval_time: 2m
+        alertname: ProxyXLimiterRestarted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: limiter
+              service: proxyx-limiter
+              instance: "lim-1:39092"
+            exp_annotations:
+              summary: "Limiter lim-1:39092 restarted"
+              description: "The limiter has run for 2m 0s. Its state is in memory, so every bucket started full again."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#limiter"
+      - eval_time: 10m
+        alertname: ProxyXLimiterRestarted
+        exp_alerts: []
+
+  # ---------------------------------------------------------------- edge
+  - name: edge parent out of use, unhealthy, and egress addresses out of service
+    interval: 1m
+    input_series:
+      - series: 'proxyx_edge_parent_up{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", parent="up1"}'
+        values: '1 0x20'
+      - series: 'proxyx_edge_parent_up{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", parent="up2"}'
+        values: '1x21'
+      - series: 'proxyx_edge_parent_healthy{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", parent="up1"}'
+        values: '1x21'
+      - series: 'proxyx_edge_parent_healthy{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", parent="up2"}'
+        values: '1 0x20'
+      - series: 'proxyx_edge_egress_addresses{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", pool="main", state="unhealthy"}'
+        values: '0 2x20'
+      - series: 'proxyx_edge_egress_addresses{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", pool="main", state="open"}'
+        values: '0x21'
+      - series: 'proxyx_edge_egress_addresses{service="proxyx-edge", job="proxyx-edge", instance="edge-1:9100", pool="main", state="total"}'
+        values: '8x21'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXEdgeParentDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: ProxyXEdgeParentDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: edge
+              service: proxyx-edge
+              job: proxyx-edge
+              instance: "edge-1:9100"
+              parent: up1
+            exp_annotations:
+              summary: "Edge parent up1 is out of use"
+              description: "Parent proxy up1 of edge-1:9100 takes no requests for 5 minutes: its circuit breaker is open or it fails its active health probes."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - eval_time: 10m
+        alertname: ProxyXEdgeParentUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: edge
+              service: proxyx-edge
+              job: proxyx-edge
+              instance: "edge-1:9100"
+              parent: up2
+            exp_annotations:
+              summary: "Edge parent up2 fails its health probes"
+              description: "Parent proxy up2 of edge-1:9100 has failed unhealthy_threshold active probes in a row, for 5 minutes. This is independent of the circuit breaker."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      # Only the unhealthy series is above 0; the open series stays at 0 and must not fire.
+      - eval_time: 15m
+        alertname: ProxyXEdgeEgressAddressesOut
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: edge
+              service: proxyx-edge
+              job: proxyx-edge
+              instance: "edge-1:9100"
+              pool: main
+              state: unhealthy
+            exp_annotations:
+              summary: "Egress pool main has addresses out of service (unhealthy)"
+              description: "2 addresses of pool main on edge-1:9100 are unhealthy, for 10 minutes. open: the circuit breaker shut them out after failed connects. unhealthy: they failed the active check (no longer assigned to an interface or not bindable)."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+
+  - name: edge egress unavailable, failed egress checks and flapping breakers
+    interval: 1m
+    input_series:
+      - series: 'proxyx_edge_egress_connections_total{service="proxyx-edge", instance="edge-1:9100", pool="main", outcome="unavailable"}'
+        values: '0+6x20'
+      - series: 'proxyx_edge_egress_connections_total{service="proxyx-edge", instance="edge-1:9100", pool="main", outcome="ok"}'
+        values: '0+60x20'
+      - series: 'proxyx_edge_egress_connections_total{service="proxyx-edge", instance="edge-1:9100", pool="other", outcome="no_address"}'
+        values: '0+6x20'
+      - series: 'proxyx_edge_health_checks_total{service="proxyx-edge", instance="edge-1:9100", kind="egress", result="failed"}'
+        values: '0x5 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'proxyx_edge_health_checks_total{service="proxyx-edge", instance="edge-1:9100", kind="parent", result="failed"}'
+        values: '0+1x20'
+      - series: 'proxyx_edge_breaker_transitions_total{service="proxyx-edge", instance="edge-1:9100", kind="parent", state="open"}'
+        values: '0+1x20'
+      - series: 'proxyx_edge_breaker_transitions_total{service="proxyx-edge", instance="edge-1:9100", kind="egress", state="closed"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyXEdgeEgressUnavailable
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ProxyXEdgeEgressUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              role: edge
+              instance: "edge-1:9100"
+              pool: main
+            exp_annotations:
+              summary: "Egress pool main has no usable address"
+              description: "Connects from pool main on edge-1:9100 fail with unavailable at 0.10 per second, for 5 minutes: every address of the destination's family is out of service. The edge proxy's /readyz answers 503 while no healthy egress path exists."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - eval_time: 4m
+        alertname: ProxyXEdgeEgressCheckFailing
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: ProxyXEdgeEgressCheckFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: edge
+              instance: "edge-1:9100"
+            exp_annotations:
+              summary: "Edge edge-1:9100 egress checks fail"
+              description: "1 active egress checks failed in 15 minutes: an address left the host or became unbindable, or a prefix is no longer routed here."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"
+      - eval_time: 12m
+        alertname: ProxyXEdgeBreakerFlapping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              role: edge
+              instance: "edge-1:9100"
+              kind: parent
+            exp_annotations:
+              summary: "Edge parent breakers keep opening on edge-1:9100"
+              description: "parent breakers opened 12 times in 30 minutes, summed over every breaker of that kind."
+              runbook_url: "https://github.com/noxred-research/proxyx/blob/main/docs/monitoring.md#edge-proxy"

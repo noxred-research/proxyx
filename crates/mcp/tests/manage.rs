@@ -1,0 +1,1298 @@
+//! Mutating tools: capability gating, dry runs, the propose/apply workflow, approval, secret
+//! handling and the audit log.
+
+mod common;
+
+use common::*;
+use proxyx_mcp::audit;
+use proxyx_mcp::store::Store;
+use serde_json::{Value, json};
+
+fn audit_text(fx: &Fixture) -> String {
+    std::fs::read_to_string(fx.audit_path()).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn read_only_server_refuses_every_mutation_and_touches_nothing() {
+    let fx = Fixture::start().await;
+    let server = fx.read_only();
+    let listed = ask(&server, modern(1, "tools/list", json!({}))).await;
+    assert!(
+        !tool_names(&listed).contains(&"set_org_rate_limit".to_owned()),
+        "not listed when its capability is off"
+    );
+    for (tool, args) in [
+        (
+            "create_session",
+            json!({"captured_hosts": ["*.example.com"]}),
+        ),
+        ("create_org_key", json!({"org": "acme"})),
+        (
+            "set_org_rate_limit",
+            json!({"org": "acme", "requests_per_minute": 1, "burst": 1}),
+        ),
+        (
+            "put_policy",
+            json!({"toml": "[[policy]]\nname = \"x\"\nscope = \"org\"\nmatch = \"acme\""}),
+        ),
+        (
+            "create_org_block",
+            json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x"}),
+        ),
+        (
+            "put_inventory",
+            json!({"provider": "isp1", "entries": [{"ip": "203.0.113.5"}]}),
+        ),
+    ] {
+        let error = tool_err(&server, tool, args).await;
+        let text = error.to_string();
+        assert!(
+            text.contains("refused") && text.contains("capability"),
+            "{tool}: {text}"
+        );
+    }
+    // propose works without the capability and says it cannot be applied here
+    let proposal = tool_ok(
+        &server,
+        "propose_config_change",
+        json!({"action": "set_org_rate_limit", "arguments": {"org": "acme", "requests_per_minute": 3000, "burst": 500}}),
+    )
+    .await;
+    assert_eq!(proposal["status"], "proposed");
+    assert_eq!(proposal["can_apply_here"], false);
+    assert_eq!(proposal["diff"]["requests_per_minute"]["from"], 6000);
+    assert_eq!(proposal["diff"]["requests_per_minute"]["to"], 3000);
+    let id = proposal["change_id"]
+        .as_str()
+        .expect("change id")
+        .to_owned();
+    let applied = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert!(applied.to_string().contains("not allowed"), "{applied}");
+    assert!(
+        fx.pool.log.mutations().is_empty() && fx.control.log.mutations().is_empty(),
+        "nothing reached a backend"
+    );
+    // the refusals are in the audit log
+    let log = audit_text(&fx);
+    assert!(log.contains("\"outcome\":\"refused\""));
+}
+
+#[tokio::test]
+async fn capabilities_are_independent() {
+    let fx = Fixture::start().await;
+    let server = fx.server("capabilities = [\"org_limits\"]", "");
+    let ok = tool_ok(
+        &server,
+        "set_org_rate_limit",
+        json!({"org": "acme", "requests_per_minute": 1200, "burst": 100}),
+    )
+    .await;
+    assert_eq!(ok["status"], "applied");
+    assert_eq!(
+        fx.control.log.calls("PUT", "/rpc/orgs/acme/rate-limit")[0].body,
+        json!({"requests_per_minute": 1200, "burst": 100})
+    );
+    let other = tool_err(
+        &server,
+        "create_org_block",
+        json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x"}),
+    )
+    .await;
+    assert!(other.to_string().contains("org_blocks"));
+}
+
+#[tokio::test]
+async fn dry_run_and_forced_dry_run_change_nothing() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let preview = tool_ok(
+        &server,
+        "set_org_rate_limit",
+        json!({"org": "acme", "requests_per_minute": 10, "burst": 5, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(preview["status"], "dry_run");
+    assert_eq!(preview["diff"]["burst"]["to"], 5);
+    assert_eq!(preview["would_call"][0], "PUT /rpc/orgs/{org}/rate-limit");
+    assert!(fx.control.log.mutations().is_empty());
+
+    let forced = fx.server("profile = \"admin\"\nforce_dry_run = true", "");
+    let still = tool_ok(
+        &forced,
+        "create_org_block",
+        json!({"org": "acme", "scope": "provider", "value": "p2", "reason": "test"}),
+    )
+    .await;
+    assert_eq!(still["status"], "dry_run");
+    assert_eq!(still["forced_by_server"], true);
+    assert!(fx.pool.log.mutations().is_empty());
+    assert_eq!(
+        audit_text(&fx).matches("\"outcome\":\"dry_run\"").count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn validation_rejects_bad_input_before_any_backend_call() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    for (tool, args, needle) in [
+        (
+            "create_org_block",
+            json!({"org": "acme", "scope": "ip", "value": "not-an-ip", "reason": "x"}),
+            "does not fit scope",
+        ),
+        (
+            "create_org_block",
+            json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x", "ttl": "forever"}),
+            "must match",
+        ),
+        (
+            "set_customer_upstream",
+            json!({"org": "acme", "scheme": "http", "host": "10.0.0.5", "port": 3128, "region": "fr"}),
+            "public routable",
+        ),
+        (
+            "set_org_egress_proxy",
+            json!({"org": "acme", "proxy_type": "socks5", "address": "nohost"}),
+            "must match",
+        ),
+        (
+            "create_session",
+            json!({"captured_hosts": ["a/b"]}),
+            "not a host pattern",
+        ),
+        (
+            "create_session",
+            json!({"captured_hosts": ["a.example"], "ttl_secs": 86400}),
+            "above this server's limit",
+        ),
+        (
+            "put_inventory",
+            json!({"provider": "isp1", "entries": [{"provider": "isp1", "ip": "10.1.1.1", "host": "h", "port": 1}]}),
+            "not a public address",
+        ),
+        (
+            "put_policy",
+            json!({"toml": "[[policy]]\nname = \"x\"\nscope = \"org\"\nmatch = \"acme\"\nregions = []"}),
+            "invalid",
+        ),
+    ] {
+        let error = tool_err(&server, tool, args).await;
+        assert!(
+            error.to_string().contains(needle),
+            "{tool}: expected {needle:?} in {error}"
+        );
+    }
+    assert!(fx.pool.log.mutations().is_empty() && fx.control.log.mutations().is_empty());
+}
+
+#[tokio::test]
+async fn secrets_go_to_a_private_file_unless_revealing_once_is_enabled() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let created = tool_ok(
+        &server,
+        "create_org_key",
+        json!({"org": "acme", "label": "ci"}),
+    )
+    .await;
+    let text = created.to_string();
+    assert!(
+        !text.contains(NEW_ORG_KEY),
+        "the key is not in the result: {text}"
+    );
+    assert!(created["result"].get("revealed_once").is_none());
+    let file = created["result"]["secret_file"]
+        .as_str()
+        .expect("secret file");
+    assert!(
+        std::fs::read_to_string(file)
+            .expect("file")
+            .contains(NEW_ORG_KEY)
+    );
+    assert_eq!(
+        created["result"]["key_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .len(),
+        12
+    );
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/orgs/acme/keys")[0]
+            .operator
+            .as_deref(),
+        Some("mcp-test")
+    );
+
+    let session = tool_ok(
+        &server,
+        "create_session",
+        json!({"captured_hosts": ["*.example.com"], "ttl_secs": 300, "source_id": "run-9"}),
+    )
+    .await;
+    let text = session.to_string();
+    assert!(
+        !text.contains("password@") && !text.contains(SESSION_ID),
+        "the proxy URL is a credential: {text}"
+    );
+    assert!(session["result"]["secret_file"].is_string());
+    let alias = session["result"]["session_id"].as_str().expect("handle");
+    assert!(alias.starts_with("session_"));
+    let env = std::fs::read_to_string(session["result"]["secret_file"].as_str().expect("file"))
+        .expect("env file");
+    assert!(env.contains(&format!("HTTPS_PROXY={SESSION_PROXY_URL}")));
+    assert!(env.contains(&format!("SESSION_ID={SESSION_ID}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(session["result"]["secret_file"].as_str().expect("file"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let body = &fx.control.log.calls("POST", "/rpc/sessions")[0].body;
+    assert_eq!(
+        (
+            body["org_id"].as_str(),
+            body["source_id"].as_str(),
+            body["ttl_secs"].as_u64()
+        ),
+        (Some("acme"), Some("run-9"), Some(300))
+    );
+    let registered = tool_ok(&server, "list_sessions", json!({})).await;
+    assert_eq!(registered["sessions"][0]["session_id"], alias);
+    assert!(!registered.to_string().contains(SESSION_ID));
+    let status = tool_ok(&server, "session_status", json!({"session_id": alias})).await;
+    assert_eq!(status["session_id"], alias);
+    assert!(!status.to_string().contains(SESSION_ID));
+    let raw = tool_err(&server, "session_status", json!({"session_id": SESSION_ID})).await;
+    assert!(raw.to_string().contains("session handle"));
+
+    // the log has neither secret
+    let log = audit_text(&fx);
+    for secret in [
+        NEW_ORG_KEY,
+        SESSION_ID,
+        SESSION_PROXY_URL,
+        ADMIN,
+        SERVICE_KEY,
+        "0f6d3a4e-5b1c-4d52-9a0e-7c1b2e8d4f10:password",
+    ] {
+        assert!(!log.contains(secret), "{secret} leaked into the audit log");
+    }
+
+    let revealing = fx.server("profile = \"admin\"\nreveal_secrets_once = true", "");
+    let shown = tool_ok(&revealing, "create_org_key", json!({"org": "acme"})).await;
+    assert_eq!(
+        shown["result"]["revealed_once"]["key"], NEW_ORG_KEY,
+        "shown once in the creating call"
+    );
+    assert!(shown["result"].get("secret_file").is_none());
+    assert!(
+        !audit_text(&fx).contains(NEW_ORG_KEY),
+        "even a revealed key never reaches the audit log"
+    );
+    let session = tool_ok(
+        &revealing,
+        "create_session",
+        json!({"captured_hosts": ["*.example.com"]}),
+    )
+    .await;
+    assert_eq!(session["result"]["revealed_once"]["SESSION_ID"], SESSION_ID);
+    assert_eq!(
+        session["result"]["revealed_once"]["HTTP_PROXY"],
+        SESSION_PROXY_URL
+    );
+    assert!(
+        session["result"]["session_id"]
+            .as_str()
+            .expect("handle")
+            .starts_with("session_")
+    );
+    let listed = tool_ok(&revealing, "list_sessions", json!({})).await;
+    assert!(!listed.to_string().contains(SESSION_ID));
+    assert!(!audit_text(&fx).contains(SESSION_ID));
+    // and it cannot be read back afterwards
+    let log = tool_ok(&revealing, "list_changes", json!({})).await;
+    assert!(!log.to_string().contains(NEW_ORG_KEY));
+    let resource = ask(
+        &revealing,
+        modern(2, "resources/read", json!({"uri": "proxyx://audit/recent"})),
+    )
+    .await;
+    assert!(!resource.to_string().contains(NEW_ORG_KEY));
+}
+
+#[tokio::test]
+async fn logins_are_passed_by_reference_and_never_stored_or_echoed() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let inline = tool_err(
+        &server,
+        "set_customer_upstream",
+        json!({"org": "acme", "scheme": "http", "host": "proxy.example.net", "port": 3128, "region": "fr", "username": "u", "password": "inline-pass"}),
+    )
+    .await;
+    assert!(inline.to_string().contains("inline secrets are disabled"));
+    let unknown = tool_err(&server, "set_customer_upstream", json!({"org": "acme", "scheme": "http", "host": "proxy.example.net", "port": 3128, "region": "fr", "credential_ref": "nope"})).await;
+    assert!(
+        unknown.to_string().contains("upstream-main"),
+        "lists the references that exist"
+    );
+
+    let args = json!({"org": "acme", "scheme": "http", "host": "proxy.example.net", "port": 3128, "region": "fr", "credential_ref": "upstream-main"});
+    let done = tool_ok(&server, "set_customer_upstream", args.clone()).await;
+    assert_eq!(done["status"], "applied");
+    let sent = &fx.pool.log.calls("PUT", "/v1/orgs/acme/upstream")[0].body;
+    assert_eq!(
+        sent["password"], UPSTREAM_PASSWORD,
+        "the backend gets the secret from the file"
+    );
+    assert_eq!(sent["username"], "svc-user");
+    assert!(!done.to_string().contains(UPSTREAM_PASSWORD));
+    assert!(!audit_text(&fx).contains(UPSTREAM_PASSWORD));
+    let shown = tool_ok(&server, "get_customer_upstream", json!({"org": "acme"})).await;
+    assert_eq!(shown["has_login"], true);
+
+    let valid = tool_ok(
+        &server,
+        "validate_customer_upstream",
+        json!({"org": "acme"}),
+    )
+    .await;
+    assert_eq!(valid["result"]["valid"], true);
+    let diff = tool_ok(&server, "set_customer_upstream", json!({"org": "acme", "scheme": "http", "host": "bad.example.net", "port": 3128, "region": "fr", "dry_run": true})).await;
+    assert_eq!(diff["diff"]["host"]["from"], "proxy.example.net");
+    tool_ok(&server, "set_customer_upstream", json!({"org": "acme", "scheme": "http", "host": "bad.example.net", "port": 3128, "region": "fr"})).await;
+    let invalid = tool_ok(
+        &server,
+        "validate_customer_upstream",
+        json!({"org": "acme"}),
+    )
+    .await;
+    assert_eq!(invalid["result"]["valid"], false);
+    assert_eq!(invalid["result"]["reason"], "refused");
+
+    // egress proxy through the control plane, also by reference
+    tool_ok(&server, "set_org_egress_proxy", json!({"org": "acme", "proxy_type": "socks5", "address": "egress.example.net:1080", "credential_ref": "upstream-main"})).await;
+    assert_eq!(
+        fx.control.log.calls("PUT", "/rpc/orgs/acme/proxy")[0].body["password"],
+        UPSTREAM_PASSWORD
+    );
+    assert!(!audit_text(&fx).contains(UPSTREAM_PASSWORD));
+}
+
+#[tokio::test]
+async fn approval_flow_pending_approve_apply_once() {
+    let fx = Fixture::start().await;
+    let server = fx.server("profile = \"admin\"\napproval = \"all\"", "");
+    let held = tool_ok(&server, "create_org_block", json!({"org": "acme", "scope": "provider", "value": "p2", "reason": "abuse report 1234", "ttl": "2h"})).await;
+    assert_eq!(held["status"], "pending_approval");
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    assert_eq!(held["approve_with"], format!("proxyx mcp approve {id}"));
+    assert_eq!(held["diff"]["creates"]["scope"], "provider");
+    assert!(fx.pool.log.mutations().is_empty(), "held, not applied");
+    let pending = tool_ok(&server, "list_changes", json!({"status": "proposed"})).await;
+    assert_eq!(pending["changes"][0]["change_id"], id.as_str());
+    assert_eq!(pending["changes"][0]["approval_required"], true);
+
+    let early = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert!(early.to_string().contains("approval"), "{early}");
+    assert!(fx.pool.log.mutations().is_empty());
+
+    // the operator approves out of band, as `proxyx mcp approve` does
+    let store = Store::open(fx.state_dir()).expect("store");
+    store
+        .approve(&id, "alice", Some("checked"))
+        .expect("approve");
+
+    let dry = tool_ok(
+        &server,
+        "apply_config_change",
+        json!({"change_id": id, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(dry["status"], "dry_run");
+    assert!(fx.pool.log.mutations().is_empty());
+    let applied = tool_ok(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(fx.pool.log.calls("POST", "/v1/org-blocks").len(), 1);
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/org-blocks")[0].body["reason"],
+        "abuse report 1234"
+    );
+    let again = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert!(again.to_string().contains("already applied"));
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/org-blocks").len(),
+        1,
+        "a change applies once"
+    );
+
+    let log = audit_text(&fx);
+    assert!(
+        log.contains("\"phase\":\"intent\""),
+        "the intent is recorded before the call"
+    );
+    assert!(log.contains(&id));
+    assert_eq!(
+        audit::verify(&fx.audit_path()).expect("verify").broken,
+        None
+    );
+}
+
+#[tokio::test]
+async fn rejected_and_edited_changes_do_not_apply_and_listed_mode_is_selective() {
+    let fx = Fixture::start().await;
+    let server = fx.server(
+        "profile = \"admin\"\napproval = \"listed\"\napproval_tools = [\"put_*\", \"delete_*\"]",
+        "",
+    );
+    // not listed: runs directly
+    let direct = tool_ok(
+        &server,
+        "create_org_block",
+        json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "direct"}),
+    )
+    .await;
+    assert_eq!(direct["status"], "applied");
+    // listed: held
+    let held = tool_ok(&server, "put_org_policy", json!({"org": "acme", "toml": "[[policy]]\nname = \"acme-limits\"\nmax_tunnels_per_org = 7"})).await;
+    assert_eq!(held["status"], "pending_approval");
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    let store = Store::open(fx.state_dir()).expect("store");
+    store.reject(&id, "bob", Some("too broad")).expect("reject");
+    let refused = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert!(refused.to_string().contains("rejected by bob"));
+    assert!(
+        fx.pool
+            .log
+            .calls("PUT", "/v1/orgs/acme/cache-policy")
+            .is_empty()
+    );
+
+    // an edited change file is refused even when approved
+    let held = tool_ok(&server, "put_org_policy", json!({"org": "acme", "toml": "[[policy]]\nname = \"acme-limits\"\nmax_tunnels_per_org = 7"})).await;
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    store.approve(&id, "alice", None).expect("approve");
+    let path = fx.state_dir().join("changes").join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).expect("read").replace(
+        "\"max_tunnels_per_org\": 7",
+        "\"max_tunnels_per_org\": 7000",
+    );
+    std::fs::write(&path, text).expect("tamper");
+    let tampered = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert!(tampered.to_string().contains("edited"), "{tampered}");
+    assert!(
+        fx.pool
+            .log
+            .calls("PUT", "/v1/orgs/acme/cache-policy")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn confirm_tool_needs_the_separate_token() {
+    let fx = Fixture::start().await;
+    let cfg = format!(
+        "confirm_token_file = \"{}/confirm-token\"",
+        fx.dir.display()
+    );
+    let server = fx.server(
+        &format!("profile = \"admin\"\napproval = \"all\"\n{cfg}"),
+        "",
+    );
+    let listed = ask(&server, modern(1, "tools/list", json!({}))).await;
+    assert!(tool_names(&listed).contains(&"confirm_change".to_owned()));
+    let held = tool_ok(&server, "disable_org_keys", json!({"org": "acme"})).await;
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    let wrong = tool_err(
+        &server,
+        "confirm_change",
+        json!({"change_id": id, "token": "guess"}),
+    )
+    .await;
+    assert!(wrong.to_string().contains("token is wrong"));
+    for secret_token in [ADMIN, SERVICE_KEY, HTTP_TOKEN] {
+        let error = tool_err(
+            &server,
+            "confirm_change",
+            json!({"change_id": id, "token": secret_token}),
+        )
+        .await;
+        assert!(
+            error.to_string().contains("token is wrong"),
+            "other credentials are not the confirm token"
+        );
+    }
+    assert!(
+        tool_err(&server, "apply_config_change", json!({"change_id": id}))
+            .await
+            .to_string()
+            .contains("approval")
+    );
+    let ok = tool_ok(
+        &server,
+        "confirm_change",
+        json!({"change_id": id, "token": CONFIRM_TOKEN}),
+    )
+    .await;
+    assert_eq!(ok["status"], "approved");
+    assert!(
+        !audit_text(&fx).contains(CONFIRM_TOKEN),
+        "the confirmation token is redacted in the audit log"
+    );
+    let applied = tool_ok(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["result"]["disabled"], 2);
+    assert_eq!(fx.pool.log.calls("DELETE", "/v1/orgs/acme/keys").len(), 1);
+}
+
+#[tokio::test]
+async fn policy_changes_are_validated_diffed_and_applied() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let proposal = tool_ok(
+        &server,
+        "propose_config_change",
+        json!({"action": "put_org_policy", "arguments": {"org": "acme", "toml": "[[policy]]\nname = \"acme-limits\"\nmax_tunnels_per_org = 50\n[policy.limits]\norg_max_gb_per_day = 20\n"}}),
+    )
+    .await;
+    assert_eq!(proposal["status"], "proposed");
+    assert_eq!(proposal["diff"][0]["policy"], "org/acme-limits");
+    assert_eq!(proposal["diff"][0]["new"], true);
+    let paths: Vec<&str> = proposal["diff"][0]["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .filter_map(|c| c["path"].as_str())
+        .collect();
+    assert!(
+        paths.contains(&"max_tunnels_per_org") && paths.contains(&"limits.org_max_gb_per_day"),
+        "{paths:?}"
+    );
+    assert!(fx.pool.log.mutations().is_empty());
+    let id = proposal["change_id"].as_str().expect("id");
+    let applied = tool_ok(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    let sent = &fx.pool.log.calls("PUT", "/v1/orgs/acme/cache-policy")[0].body;
+    assert_eq!(sent["scope"], "org");
+    assert_eq!(sent["match"], "acme");
+    assert_eq!(sent["max_tunnels_per_org"], 50);
+    let stored = tool_ok(&server, "list_policies", json!({"name": "acme-limits"})).await;
+    assert_eq!(stored["items"][0]["doc"]["max_tunnels_per_org"], 50);
+
+    // a global policy written by git is flagged as an override
+    let override_ = tool_ok(
+        &server,
+        "put_policy",
+        json!({"policies": [{"name": "global", "scope": "global", "kinds": ["rotating"], "providers": ["p1"], "regions": ["fr"], "min_ready": 4}], "dry_run": true}),
+    )
+    .await;
+    assert!(
+        override_["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("written by git"))
+    );
+    let deleted = tool_err(
+        &server,
+        "delete_policy",
+        json!({"scope": "global", "name": "global"}),
+    )
+    .await;
+    assert!(deleted.to_string().contains("git wrote this policy"));
+    tool_ok(
+        &server,
+        "delete_policy",
+        json!({"scope": "org", "name": "acme-limits"}),
+    )
+    .await;
+    assert_eq!(
+        fx.pool
+            .log
+            .calls("DELETE", "/v1/policies/org/acme-limits")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn org_scope_and_engagement_limit_what_can_change() {
+    let fx = Fixture::start().await;
+    let server = fx.server(
+        "profile = \"admin\"",
+        "[scope]\nengagement = \"SOW-42\"\nallowed_orgs = [\"acme\"]",
+    );
+    let outside = tool_err(
+        &server,
+        "create_org_block",
+        json!({"org": "other", "scope": "pool", "value": "shared", "reason": "x"}),
+    )
+    .await;
+    assert!(
+        outside
+            .to_string()
+            .contains("outside this server's authorized scope")
+    );
+    let shared = tool_err(&server, "put_inventory", json!({"provider": "isp1", "entries": [{"provider": "isp1", "ip": "203.0.113.50", "host": "h.example", "port": 1}]})).await;
+    assert!(
+        shared.to_string().contains("scoped to specific orgs"),
+        "{shared}"
+    );
+    let global = tool_err(
+        &server,
+        "put_policy",
+        json!({"policies": [{"name": "g2", "scope": "global", "regions": ["fr"]}]}),
+    )
+    .await;
+    assert!(global.to_string().contains("scoped to specific orgs"));
+    let read_outside = tool_err(&server, "get_org", json!({"org": "other"})).await;
+    assert!(read_outside.to_string().contains("outside"));
+    let inside = tool_ok(
+        &server,
+        "create_org_block",
+        json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x"}),
+    )
+    .await;
+    assert_eq!(inside["status"], "applied");
+    assert!(audit_text(&fx).contains("\"engagement\":\"SOW-42\""));
+
+    let expired = fx.server(
+        "profile = \"admin\"",
+        "[scope]\nexpires = \"2020-01-01T00:00:00Z\"",
+    );
+    let late = tool_err(
+        &expired,
+        "create_org_block",
+        json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x"}),
+    )
+    .await;
+    assert!(late.to_string().contains("expired"));
+    let required = fx.server("profile = \"admin\"", "[scope]\nrequire_engagement = true");
+    assert!(
+        tool_err(
+            &required,
+            "create_org_block",
+            json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "x"})
+        )
+        .await
+        .to_string()
+        .contains("engagement")
+    );
+}
+
+#[tokio::test]
+async fn block_signals_use_the_org_key_route_or_the_operator_route() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let org_key = tool_ok(&server, "report_block_signal", json!({"exit_ip": "203.0.113.50", "target": "example.com:443", "type": "rate_limited", "session": "5f0a7c9e2b1d4c6f8a3e0b7d9c2a1f48"})).await;
+    assert_eq!(org_key["result"]["route"], "org_key");
+    assert_eq!(org_key["result"]["accepted"], 1);
+    let sent = &fx.pool.log.calls("POST", "/v1/block-signals")[0];
+    assert!(
+        sent.authorization
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Basic "))
+    );
+    assert_eq!(sent.body[0]["type"], "rate_limited");
+    assert_eq!(sent.body[0]["target"], "example.com:443");
+    let operator = tool_ok(
+        &server,
+        "report_block_signal",
+        json!({"exit_ip": "203.0.113.51", "target": "example.com", "type": "forbidden"}),
+    )
+    .await;
+    assert_eq!(operator["result"]["route"], "operator");
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/ips/203.0.113.51/block")[0].body["target"],
+        "example.com"
+    );
+    assert!(!audit_text(&fx).contains(ORG_KEY));
+}
+
+#[tokio::test]
+async fn sessions_can_be_extended_and_ended_and_inventory_diffed() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let alias = existing_session_handle(&server).await;
+    let extended = tool_ok(
+        &server,
+        "extend_session",
+        json!({"session_id": alias, "additional_secs": 300}),
+    )
+    .await;
+    assert_eq!(extended["status"], "applied");
+    assert_eq!(extended["result"]["session_id"], alias);
+    assert!(!extended.to_string().contains(SESSION_ID));
+    assert_eq!(
+        fx.control
+            .log
+            .calls("PATCH", &format!("/rpc/sessions/{SESSION_ID}"))[0]
+            .body,
+        json!({"additional_secs": 300})
+    );
+    let both = tool_err(
+        &server,
+        "extend_session",
+        json!({"session_id": alias, "additional_secs": 1, "new_ttl_secs": 1}),
+    )
+    .await;
+    assert!(both.to_string().contains("not both"));
+    let too_long = tool_err(
+        &server,
+        "extend_session",
+        json!({"session_id": alias, "additional_secs": 7200}),
+    )
+    .await;
+    assert!(too_long.to_string().contains("above this server's limit"));
+    let ended = tool_ok(&server, "end_session", json!({"session_id": alias})).await;
+    assert_eq!(ended["result"]["session_id"], alias);
+    assert!(!ended.to_string().contains(SESSION_ID));
+    assert_eq!(ended["result"]["released"], true);
+
+    let diff = tool_ok(
+        &server,
+        "put_inventory",
+        json!({"provider": "isp1", "dry_run": true, "entries": [
+            {"provider": "isp1", "ip": "203.0.113.10", "host": "isp.example", "port": 8001},
+            {"provider": "isp1", "ip": "203.0.113.99", "host": "isp.example", "port": 8001}
+        ]}),
+    )
+    .await;
+    assert_eq!(diff["diff"]["added"], json!(["203.0.113.99"]));
+    assert_eq!(diff["diff"]["retired"], json!(["203.0.113.11"]));
+    assert_eq!(diff["diff"]["unchanged"], 1);
+    let empty = tool_err(
+        &server,
+        "put_inventory",
+        json!({"provider": "isp1", "entries": []}),
+    )
+    .await;
+    assert!(empty.to_string().contains("entries"));
+}
+
+#[tokio::test]
+async fn mutation_budget_is_enforced_but_dry_runs_are_free() {
+    let fx = Fixture::start().await;
+    let server = fx.server(
+        "profile = \"admin\"",
+        "[limits]\nmax_mutations_per_hour = 2",
+    );
+    for _ in 0..5 {
+        tool_ok(
+            &server,
+            "set_org_rate_limit",
+            json!({"org": "acme", "requests_per_minute": 1, "burst": 1, "dry_run": true}),
+        )
+        .await;
+    }
+    tool_ok(
+        &server,
+        "set_org_rate_limit",
+        json!({"org": "acme", "requests_per_minute": 1, "burst": 1}),
+    )
+    .await;
+    tool_ok(
+        &server,
+        "set_org_rate_limit",
+        json!({"org": "acme", "requests_per_minute": 2, "burst": 2}),
+    )
+    .await;
+    let third = tool_err(
+        &server,
+        "set_org_rate_limit",
+        json!({"org": "acme", "requests_per_minute": 3, "burst": 3}),
+    )
+    .await;
+    assert!(third.to_string().contains("mutations in an hour"));
+    assert_eq!(
+        fx.control
+            .log
+            .calls("PUT", "/rpc/orgs/acme/rate-limit")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn audit_log_records_every_call_with_caller_and_a_valid_chain() {
+    let fx = Fixture::start().await;
+    let server = fx.admin();
+    let frames = converse(
+        &server,
+        &[
+            call(1, "health", json!({})),
+            call(2, "explain_refusal", json!({"code": "cache_empty"})),
+            call(
+                3,
+                "create_org_block",
+                json!({"org": "acme", "scope": "pool", "value": "shared", "reason": "audit test"}),
+            ),
+            call(4, "list_inventory", json!({"state": "bogus"})),
+        ],
+    )
+    .await;
+    assert_eq!(frames.len(), 4);
+    let entries: Vec<Value> = audit_text(&fx)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("jsonl"))
+        .collect();
+    let results: Vec<&Value> = entries.iter().filter(|e| e["phase"] == "result").collect();
+    assert_eq!(results.len(), 4);
+    for entry in &entries {
+        assert_eq!(entry["caller"]["transport"], "stdio");
+        assert_eq!(entry["caller"]["client_name"], "conformance-client");
+        assert_eq!(entry["caller"]["client_version"], "1.2.3");
+    }
+    let by_tool = |tool: &str| {
+        results
+            .iter()
+            .find(|e| e["tool"] == tool)
+            .copied()
+            .unwrap_or_else(|| panic!("{tool}"))
+    };
+    assert_eq!(by_tool("health")["outcome"], "ok");
+    assert_eq!(
+        by_tool("create_org_block")["arguments"]["reason"],
+        "audit test"
+    );
+    assert_eq!(by_tool("list_inventory")["outcome"], "error");
+    assert!(
+        by_tool("list_inventory")["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("invalid arguments")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["phase"] == "intent" && e["tool"] == "create_org_block")
+    );
+    let report = audit::verify(&fx.audit_path()).expect("verify");
+    assert_eq!(report.broken, None);
+    assert!(report.entries >= 5);
+    // an unknown tool is a protocol error and is not a tool call
+    let unknown = ask(&server, call(5, "nope", json!({}))).await;
+    assert_eq!(unknown["error"]["code"], -32602);
+}
+
+#[tokio::test]
+async fn pool_sessions_are_listed_and_rotated_behind_their_own_capability() {
+    let fx = Fixture::start().await;
+    // reads work on a read-only server
+    let read_only = fx.read_only();
+    let listed = tool_ok(
+        &read_only,
+        "list_pool_sessions",
+        json!({"org": "acme", "limit": 2}),
+    )
+    .await;
+    assert_eq!(listed["org"], "acme");
+    assert_eq!(
+        listed["sessions"].as_array().expect("sessions").len(),
+        2,
+        "rows are capped by the request"
+    );
+    assert_eq!(listed["total"], 3);
+    assert_eq!(listed["truncated"], true);
+    assert_eq!(listed["affinity"]["rotations"], 1);
+    assert_eq!(
+        fx.pool.log.calls("GET", "/v1/orgs/acme/sessions")[0]
+            .authorization
+            .as_deref(),
+        Some(format!("Bearer {ADMIN}").as_str())
+    );
+    let outside = fx.server("", "[scope]\nallowed_orgs = [\"acme\"]");
+    assert!(
+        tool_err(&outside, "list_pool_sessions", json!({"org": "other"}))
+            .await
+            .to_string()
+            .contains("outside")
+    );
+
+    // rotating is refused and not even listed without the capability
+    let names = tool_names(&ask(&read_only, modern(1, "tools/list", json!({}))).await);
+    assert!(!names.contains(&"rotate_pool_session".to_owned()));
+    let refused = tool_err(
+        &read_only,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42"}),
+    )
+    .await;
+    assert!(
+        refused.to_string().contains("pool_sessions")
+            && refused.to_string().contains("rotate sticky pool sessions")
+    );
+    let other_cap = fx.server("capabilities = [\"sessions\"]", "");
+    assert!(
+        tool_err(
+            &other_cap,
+            "rotate_pool_session",
+            json!({"org": "acme", "sid": "scan42"})
+        )
+        .await
+        .to_string()
+        .contains("pool_sessions")
+    );
+    assert!(fx.pool.log.mutations().is_empty());
+
+    let server = fx.server("capabilities = [\"pool_sessions\"]", "");
+    assert!(
+        tool_names(&ask(&server, modern(2, "tools/list", json!({}))).await)
+            .contains(&"rotate_pool_session".to_owned())
+    );
+    // the sid pattern is enforced locally
+    for bad in ["Scan42", "a-b", "", &"x".repeat(129)] {
+        assert!(
+            tool_err(
+                &server,
+                "rotate_pool_session",
+                json!({"org": "acme", "sid": bad})
+            )
+            .await
+            .to_string()
+            .contains("sid"),
+            "{bad:?}"
+        );
+    }
+    // dry run shows what would be dropped and calls nothing
+    let preview = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(preview["status"], "dry_run");
+    assert_eq!(preview["diff"]["drops"]["exit_ip"], "203.0.113.50");
+    assert_eq!(
+        preview["would_call"][0],
+        "DELETE /v1/orgs/{org}/sessions/{sid}"
+    );
+    assert!(fx.pool.log.mutations().is_empty());
+    // a sid that is not listed still validates, with a warning
+    let unknown = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "gone", "dry_run": true}),
+    )
+    .await;
+    assert!(unknown["warnings"].to_string().contains("expired already"));
+
+    // a sid the gateway no longer knows is its 404, passed on as a backend error
+    let gone = tool_err(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "gone"}),
+    )
+    .await;
+    assert!(
+        gone.to_string().contains("no live session with this sid"),
+        "{gone}"
+    );
+    let done = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42"}),
+    )
+    .await;
+    assert_eq!(done["status"], "applied");
+    assert_eq!(done["result"]["result"]["rotated"], true);
+    let calls = fx.pool.log.calls("DELETE", "/v1/orgs/acme/sessions/scan42");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].operator.as_deref(), Some("mcp-test"));
+    let log = audit_text(&fx);
+    assert!(
+        log.contains("\"tool\":\"rotate_pool_session\"") && log.contains("\"phase\":\"intent\"")
+    );
+}
+
+#[tokio::test]
+async fn rotating_a_pool_session_follows_the_approval_flow() {
+    let fx = Fixture::start().await;
+    let server = fx.server("capabilities = [\"pool_sessions\"]\napproval = \"all\"", "");
+    let held = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "job_7"}),
+    )
+    .await;
+    assert_eq!(held["status"], "pending_approval");
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    assert!(fx.pool.log.mutations().is_empty());
+    assert!(
+        tool_err(&server, "apply_config_change", json!({"change_id": id}))
+            .await
+            .to_string()
+            .contains("approval")
+    );
+    Store::open(fx.state_dir())
+        .expect("store")
+        .approve(&id, "alice", None)
+        .expect("approve");
+    let applied = tool_ok(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(
+        fx.pool
+            .log
+            .calls("DELETE", "/v1/orgs/acme/sessions/job_7")
+            .len(),
+        1
+    );
+    // it can also be proposed on a server that may not apply it
+    let read_only = fx.read_only();
+    let proposal = tool_ok(
+        &read_only,
+        "propose_config_change",
+        json!({"action": "rotate_pool_session", "arguments": {"org": "acme", "sid": "job_8"}}),
+    )
+    .await;
+    assert_eq!(proposal["status"], "proposed");
+    assert_eq!(proposal["can_apply_here"], false);
+}
+
+#[tokio::test]
+async fn generated_endpoints_never_carry_or_request_the_org_key() {
+    let fx = Fixture::start().await;
+    let server = fx.read_only();
+    let out = tool_ok(&server, "generate_pool_endpoints", json!({
+        "org": "acme", "gateway_host": "gw.example.net", "style": "socks5", "count": 3,
+        "country": "fr", "city": "paris", "kind": "rotating", "rotation": "sticky", "ttl": "5m", "strict": true, "socks5_port": 1080
+    })).await;
+    assert_eq!(out["total"], 3);
+    assert_eq!(
+        out["endpoints"][0]["url"], "socks5://px-cc-fr-sid-gen0@gw.example.net:8080",
+        "the field called url survives redaction"
+    );
+    assert_eq!(
+        out["username_pattern"],
+        "px-kind-rotating-cc-fr-city-paris-ttl-5m"
+    );
+    assert!(
+        out["credential_note"]
+            .as_str()
+            .expect("note")
+            .contains("org key")
+    );
+    let sent = &fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints")[0];
+    assert_eq!(sent.body["format"], "json");
+    assert_eq!(sent.body["style"], "socks5");
+    assert_eq!(sent.body["count"], 3);
+    assert_eq!(sent.body["strict"], true);
+    assert_eq!(sent.body["ttl"], "5m");
+    assert_eq!(sent.body["socks5_port"], 1080);
+    let text = sent.body.to_string();
+    assert!(
+        sent.body.get("org_key").is_none() && !text.contains(ORG_KEY) && !text.contains("ak_"),
+        "{text}"
+    );
+    assert_eq!(
+        sent.authorization.as_deref(),
+        Some(format!("Bearer {ADMIN}").as_str())
+    );
+    // an org_key argument is not part of the tool at all
+    let with_key = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"gateway_host": "gw.example.net", "org": "acme", "org_key": ORG_KEY}),
+    )
+    .await;
+    assert!(with_key.to_string().contains("unknown property"));
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints").len(),
+        1
+    );
+    assert!(!audit_text(&fx).contains(ORG_KEY));
+
+    // local validation: the gateway grammar and the server's row limit
+    let bad = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "city": "paris"}),
+    )
+    .await;
+    assert!(bad.to_string().contains("city_needs_cc"), "{bad}");
+    let dash = tool_err(&server, "generate_pool_endpoints", json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "provider": "vpn_pool", "ttl": "0"})).await;
+    assert!(dash.to_string().contains("ttl"), "{dash}");
+    let many = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "count": 101}),
+    )
+    .await;
+    assert!(many.to_string().contains("limits.max_rows"));
+    let host = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "http_port": 8080, "gateway_host": "https://gw.example.net/x"}),
+    )
+    .await;
+    assert!(host.to_string().contains("plain DNS name"));
+    let no_port = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "style": "socks5", "http_port": 8080}),
+    )
+    .await;
+    assert!(no_port.to_string().contains("socks5_port"), "{no_port}");
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints").len(),
+        1,
+        "invalid requests never reach the gateway"
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_that_carries_a_credential_is_refused() {
+    let fx = Fixture::start().await;
+    // an endpoint list that contains a password in the userinfo is never passed on
+    let (pool, _) = fake_pool().await;
+    drop(pool);
+    let app_url = {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/v1/orgs/{org}/endpoints",
+            post(|| async { axum::Json(json!({"endpoints": [{"url": "http://px:ak_leakedleakedleakedleaked@gw:8080"}]})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    };
+    let text = fx.config_text("", "").replace(&fx.pool.url(), &app_url);
+    let config = proxyx_mcp::config::Config::parse(&text).expect("config");
+    let server = std::sync::Arc::new(proxyx_mcp::server::Server::new(
+        proxyx_mcp::tools::Ctx::new(config).expect("ctx"),
+    ));
+    let error = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080}),
+    )
+    .await;
+    assert!(error.to_string().contains("carries a credential"));
+    assert!(!error.to_string().contains("leakedleaked"));
+}
+
+#[tokio::test]
+async fn nested_reporting_enforces_underlying_tool_allow_and_deny_lists() {
+    let fx = Fixture::start().await;
+    for rules in [
+        "deny_tools = [\"report_block_signal\"]",
+        "allow_tools = [\"classify_block_page\"]",
+    ] {
+        let server = fx.server(&format!("profile = \"admin\"\n{rules}"), "");
+        let classified = tool_ok(
+            &server,
+            "classify_block_page",
+            json!({
+                "status": 403, "host": "example.com", "exit_ip": "203.0.113.50", "report": true
+            }),
+        )
+        .await;
+        assert!(
+            classified["reported"].to_string().contains("disabled"),
+            "{classified}"
+        );
+        assert!(fx.pool.log.mutations().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stored_changes_obey_current_underlying_tool_policy_without_consumption() {
+    let fx = Fixture::start().await;
+    let admin = fx.admin();
+    let proposal = tool_ok(
+        &admin,
+        "propose_config_change",
+        json!({
+            "action": "set_org_rate_limit",
+            "arguments": {"org": "acme", "requests_per_minute": 100, "burst": 10}
+        }),
+    )
+    .await;
+    let id = proposal["change_id"].as_str().expect("id");
+    for rules in [
+        "deny_tools = [\"set_org_rate_limit\"]",
+        "allow_tools = [\"apply_config_change\"]",
+    ] {
+        let server = fx.server(&format!("profile = \"admin\"\n{rules}"), "");
+        let refused = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+        assert!(refused.to_string().contains("disabled"), "{refused}");
+        assert!(fx.control.log.mutations().is_empty());
+    }
+    let applied = tool_ok(&admin, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(fx.control.log.mutations().len(), 1);
+}
+
+#[tokio::test]
+async fn session_handles_are_server_local_and_recovered_by_listing() {
+    let fx = Fixture::start().await;
+    let first = fx.read_only();
+    let original = existing_session_handle(&first).await;
+    let restarted = fx.read_only();
+    let stale = tool_err(
+        &restarted,
+        "session_status",
+        json!({"session_id": original}),
+    )
+    .await;
+    assert!(stale.to_string().contains("session handle"));
+    let listed = tool_ok(&restarted, "list_sessions", json!({})).await;
+    let current = listed["sessions"][0]["session_id"]
+        .as_str()
+        .expect("handle");
+    assert_ne!(current, original);
+    let status = tool_ok(&restarted, "session_status", json!({"session_id": current})).await;
+    assert_eq!(status["session_id"], current);
+    assert!(!status.to_string().contains(SESSION_ID));
+}
+
+#[tokio::test]
+async fn approved_session_changes_survive_restart_with_private_credentials() {
+    for action in ["extend_session", "end_session"] {
+        let fx = Fixture::start().await;
+        let first = fx.server("profile = \"admin\"\napproval = \"all\"", "");
+        let handle = existing_session_handle(&first).await;
+        let mut arguments = json!({"session_id": handle});
+        if action == "extend_session" {
+            arguments["additional_secs"] = json!(60);
+        }
+        let held = tool_ok(&first, action, arguments).await;
+        assert_eq!(held["status"], "pending_approval");
+        assert!(!held.to_string().contains(SESSION_ID));
+        let id = held["change_id"].as_str().expect("change");
+        let stored = first.ctx.store.load(id).expect("stored change");
+        assert_eq!(stored.arguments["session_id"], SESSION_ID);
+        first
+            .ctx
+            .store
+            .approve(id, "operator", None)
+            .expect("approve");
+        let restarted = fx.server("profile = \"admin\"\napproval = \"all\"", "");
+        let preview = tool_ok(
+            &restarted,
+            "apply_config_change",
+            json!({"change_id": id, "dry_run": true}),
+        )
+        .await;
+        assert!(!preview.to_string().contains(SESSION_ID));
+        let applied = tool_ok(&restarted, "apply_config_change", json!({"change_id": id})).await;
+        assert_eq!(applied["status"], "applied");
+        assert!(!applied.to_string().contains(SESSION_ID));
+        assert!(
+            applied["result"]["session_id"]
+                .as_str()
+                .expect("handle")
+                .starts_with("session_")
+        );
+        assert!(!audit_text(&fx).contains(SESSION_ID));
+    }
+}

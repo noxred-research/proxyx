@@ -1,0 +1,78 @@
+# Dependency update pull requests, one weekly batch per ecosystem.
+#
+# Updates are grouped so a week produces a handful of pull requests rather than dozens, and a
+# 7-day cooldown keeps brand-new releases out of the proposals. Security updates are not
+# delayed by the cooldown.
+#
+# Dependabot pull requests never run the CI workflows: their actor and author are the bot, and
+# the `authorize` job in every workflow only admits code owners (see .github/CODEOWNERS). The
+# required `required` check therefore fails on them. A maintainer handles them as follows:
+#   1. Read the diff. For the github-actions ecosystem this includes the new commit SHA, which
+#      must also be added to the repository's allowed-actions list or every run fails to start.
+#   2. Bring the update onto a branch of your own (merge or cherry-pick it, adapt the code to
+#      any breaking change, keep Cargo.lock in step) and open a pull request from that branch.
+#      Its CI runs under your identity.
+#   3. Merge that pull request once it is green; GitHub then closes the Dependabot one.
+
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: pip
+    directory: /prober
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(pip)"
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      compose-images:
+        patterns: ["*"]

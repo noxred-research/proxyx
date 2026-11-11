@@ -1,0 +1,4 @@
+[[adapter]]
+id = "twin"
+kind = "static"
+subtype = "isp"

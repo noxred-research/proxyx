@@ -1,0 +1,17 @@
+# Static ISP rotating entry on port 8000: `-country-{CC}` picks the pool by region.
+
+[[adapter]]
+id = "isp_rotating_pool"
+kind = "static"
+subtype = "isp"
+host = "rotating.isp.example.net"
+port = 8000
+user_file = "isp_static_port_user"
+pass_file = "isp_static_port_pass"
+user = "user-{base_user}{opts}"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+case = "upper"

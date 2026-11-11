@@ -1,0 +1,403 @@
+# ProxyX development stack: Postgres, Valkey, ClickHouse and every ProxyX role.
+# The relational database defaults to PostgreSQL. Two profiles switch it, one env file each
+# (the env file sets the two database URLs; see docs/databases.md):
+#   docker compose --env-file docker/db-mariadb.env -f docker/docker-compose.yml --profile mariadb up -d --build --wait
+#   docker compose --env-file docker/db-sqlite.env  -f docker/docker-compose.yml --profile sqlite  up -d --build --wait
+# `mariadb` adds a MariaDB 13 server with the two databases; `sqlite` keeps one file per plane on
+# the shared `sqlite-data` volume (one host only: every role runs here). The Postgres container
+# starts in every mode and is idle under these two; `docker compose stop postgres` frees it after
+# `up`.
+#
+# An optional `opensearch` profile adds a single-node OpenSearch as the capture store:
+#   PROXYX_CAPTURE_STORE=opensearch docker compose -f docker/docker-compose.yml --profile opensearch up -d --build --wait
+#
+#   docker compose -f docker/docker-compose.yml up -d --build --wait
+#
+# The capture log travels over Redis Streams unless you pick another broker with a profile:
+#   PROXYX_BROKER=kafka    docker compose -f docker/docker-compose.yml --profile kafka    up -d --build --wait
+#   PROXYX_BROKER=rabbitmq docker compose -f docker/docker-compose.yml --profile rabbitmq up -d --build --wait
+#
+# Everything listens on 127.0.0.1 only. The secrets and the MITM CA are generated into named
+# volumes by the `init` service: the control API and the session proxy load the same CA from
+# the `ca` volume (`file` mode), so clients can trust the certificate a session returns. Do not use this file as a production deployment: it runs
+# single instances, disables TLS to the datastores and uses default passwords.
+#
+# Ports on the host:
+#   8080  pool gateway, HTTP CONNECT            1080  pool gateway, SOCKS5
+#   8081  pool control API (/v1)                8888  pool gateway ops (/healthz /readyz /metrics)
+#   8443  session proxy, HTTP CONNECT           1081  session proxy, SOCKS5
+#   8889  session proxy admin (/health /metrics)
+#   9000  control API (/rpc, /graphql)          9001  ingester health
+#   5432  Postgres   3306  MariaDB (profile `mariadb`)   6379  Valkey   8123  ClickHouse HTTP   9200  OpenSearch (profile `opensearch`)
+#   29092 Kafka (profile `kafka`)   5672 RabbitMQ AMQP, 15672 RabbitMQ management (profile `rabbitmq`)
+
+name: proxyx
+
+x-image: &image
+  image: proxyx:dev
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+
+x-pool-env: &pool-env
+  PROXYX_POOL_DATABASE_URL: ${PROXYX_POOL_DB_URL:-postgres://proxyx:proxyx@postgres:5432/proxyx_pool}
+  PROXYX_POOL_REDIS_URL: redis://valkey:6379/1
+  PROXYX_POOL_JSON_LOGS: "false"
+  PROXYX_POOL_MAX_CONNECTIONS: "2000"
+
+x-pool-data: &pool-data
+  # Adapters that need no provider secrets, the global policy and the probe targets.
+  # Add your own adapter files and an `inventory/` directory to bring real providers.
+  - ../data/adapters/customer.toml:/etc/proxyx/data/adapters/customer.toml:ro
+  - ../data/adapters/vpn-pool.toml:/etc/proxyx/data/adapters/vpn-pool.toml:ro
+  - ../data/policies:/etc/proxyx/data/policies:ro
+  - ../data/probe-targets.toml:/etc/proxyx/data/probe-targets.toml:ro
+  - secrets:/etc/proxyx/secrets:ro
+  # The SQLite files of the `sqlite` profile (unused with the other databases).
+  - sqlite-data:/var/lib/proxyx/sqlite
+
+x-control-env: &control-env
+  PROXYX_CONTROL_DATABASE_URL: ${PROXYX_CONTROL_DB_URL:-postgres://proxyx:proxyx@postgres:5432/proxyx_control}
+  PROXYX_CONTROL_REDIS_URL: redis://valkey:6379
+  PROXYX_CONTROL_CLICKHOUSE__URL: http://clickhouse:8123
+  PROXYX_CONTROL_CLICKHOUSE__DATABASE: proxyx
+  PROXYX_CONTROL_CLICKHOUSE__USER: proxyx
+  PROXYX_CONTROL_CLICKHOUSE__PASSWORD: proxyx
+  PROXYX_CONTROL_CA__TYPE: file
+  PROXYX_CONTROL_CA__CERT_PATH: /ca/ca.pem
+  # The dev ClickHouse is a single node without Keeper: rewrite Replicated* engines.
+  PROXYX_CONTROL_CLICKHOUSE__LOCAL_SINGLE_NODE: "1"
+  # Captures go to ClickHouse unless PROXYX_CAPTURE_STORE=opensearch (and the `opensearch`
+  # profile is enabled). The OpenSearch settings are ignored with the ClickHouse backend.
+  PROXYX_CONTROL_CAPTURE_STORE__BACKEND: ${PROXYX_CAPTURE_STORE:-clickhouse}
+  PROXYX_CONTROL_CAPTURE_STORE__OPENSEARCH__URL: http://opensearch:9200
+  PROXYX_CONTROL_CAPTURE_STORE__OPENSEARCH__NUMBER_OF_REPLICAS: "0"
+  # The captures log: Redis Streams unless PROXYX_BROKER=kafka or rabbitmq (with its profile).
+  # The kafka and rabbitmq settings are ignored under another broker. The session proxy must use
+  # the same broker, see below.
+  PROXYX_CONTROL_BROKER_KIND: ${PROXYX_BROKER:-redis_stream}
+  PROXYX_CONTROL_KAFKA__BROKERS: kafka:9092
+  PROXYX_CONTROL_KAFKA__TOPIC: proxyx.captures
+  PROXYX_CONTROL_KAFKA__PARTITIONS: "4"
+  PROXYX_CONTROL_KAFKA__REPLICATION_FACTOR: "1"
+  PROXYX_CONTROL_RABBITMQ__URL: amqp://proxyx:proxyx@rabbitmq:5672/%2f
+  PROXYX_CONTROL_RABBITMQ__PARTITIONS: "4"
+  PROXYX_CONTROL_RABBITMQ__QUORUM_GROUP_SIZE: "1"
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: proxyx
+      POSTGRES_PASSWORD: proxyx
+      POSTGRES_DB: proxyx
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      # Over TCP: the image runs a socket-only server while it creates the databases on first start,
+      # and a socket probe would report ready before the real server listens.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U proxyx -d proxyx_pool && pg_isready -h 127.0.0.1 -U proxyx -d proxyx_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Optional relational database (profile `mariadb`): MariaDB 13, development only. The root
+  # password is proxyx; the roles use the user proxyx / proxyx on `proxyx_pool` and `proxyx_control`.
+  mariadb:
+    profiles: ["mariadb"]
+    image: mariadb:13
+    environment:
+      MARIADB_ROOT_PASSWORD: proxyx
+      MARIADB_USER: proxyx
+      MARIADB_PASSWORD: proxyx
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./initdb-mariadb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  valkey:
+    image: valkey/valkey:9
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.10
+    environment:
+      CLICKHOUSE_USER: proxyx
+      CLICKHOUSE_PASSWORD: proxyx
+      CLICKHOUSE_DB: proxyx
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ports:
+      - "127.0.0.1:8123:8123"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Optional capture store (profile `opensearch`). Single node, security plugin off:
+  # development only. Traffic view exports are not available with this store.
+  opensearch:
+    profiles: ["opensearch"]
+    image: opensearchproject/opensearch:3
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # Optional captures-log broker (profile `kafka`): a single KRaft node, plaintext, development only.
+  kafka:
+    profiles: ["kafka"]
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  # Optional captures-log broker (profile `rabbitmq`): a single node with the management UI,
+  # development only. User proxyx / password proxyx.
+  rabbitmq:
+    profiles: ["rabbitmq"]
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: proxyx
+      RABBITMQ_DEFAULT_PASS: proxyx
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  init:
+    <<: *image
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/dev-init.sh"]
+    volumes:
+      - ./dev-init.sh:/dev-init.sh:ro
+      - secrets:/etc/proxyx/secrets
+      - ca:/ca
+    restart: "no"
+
+  migrate-pool:
+    <<: *image
+    command: ["proxyx", "migrate", "pool"]
+    environment: *pool-env
+    volumes: &sqlite-volume
+      - sqlite-data:/var/lib/proxyx/sqlite
+    depends_on:
+      postgres: {condition: service_healthy}
+      mariadb: {condition: service_healthy, required: false}
+    restart: "no"
+
+  migrate-control:
+    <<: *image
+    command: ["proxyx", "migrate", "control"]
+    environment: *control-env
+    volumes: *sqlite-volume
+    depends_on:
+      postgres: {condition: service_healthy}
+      mariadb: {condition: service_healthy, required: false}
+      clickhouse: {condition: service_healthy}
+      opensearch: {condition: service_healthy, required: false}
+      kafka: {condition: service_healthy, required: false}
+      rabbitmq: {condition: service_healthy, required: false}
+    restart: "no"
+
+  gateway:
+    <<: *image
+    command: ["proxyx", "gateway"]
+    environment: *pool-env
+    volumes: *pool-data
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:1080:1080"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:8888:8888"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      init: {condition: service_completed_successfully}
+      migrate-pool: {condition: service_completed_successfully}
+      valkey: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8888/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  warmer:
+    <<: *image
+    command: ["proxyx", "warmer"]
+    environment: *pool-env
+    volumes: *pool-data
+    depends_on:
+      init: {condition: service_completed_successfully}
+      migrate-pool: {condition: service_completed_successfully}
+      valkey: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8888/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  limiter:
+    <<: *image
+    command: ["proxyx", "limiter", "0.0.0.0:39091"]
+    environment:
+      PROXYX_LIMITER_MAX_BUCKETS: "100000"
+      PROXYX_LIMITER_METRICS_ADDR: 0.0.0.0:39092
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:39092/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  control-api:
+    <<: *image
+    command: ["proxyx", "control", "api"]
+    environment: *control-env
+    volumes:
+      - ca:/ca:ro
+      - sqlite-data:/var/lib/proxyx/sqlite
+    ports:
+      - "127.0.0.1:9000:9000"
+    depends_on:
+      init: {condition: service_completed_successfully}
+      migrate-control: {condition: service_completed_successfully}
+      valkey: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ingester:
+    <<: *image
+    command: ["proxyx", "control", "ingester"]
+    environment: *control-env
+    volumes: *sqlite-volume
+    ports:
+      - "127.0.0.1:9001:9001"
+    depends_on:
+      migrate-control: {condition: service_completed_successfully}
+      valkey: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  intercept:
+    <<: *image
+    command: ["proxyx-intercept"]
+    environment:
+      PROXYX_INTERCEPT_CONNECT_ADDR: 0.0.0.0:8443
+      PROXYX_INTERCEPT_REDIS_URL: redis://valkey:6379
+      PROXYX_INTERCEPT_CA__TYPE: file
+      PROXYX_INTERCEPT_CA__CERT_PATH: /ca/ca.der
+      PROXYX_INTERCEPT_CA__KEY_PATH: /ca/ca.key.der
+      PROXYX_INTERCEPT_RATELIMIT__BACKEND: limiter
+      PROXYX_INTERCEPT_RATELIMIT__LIMITER_ADDR: limiter:39091
+      # Must match the control plane's broker (see x-control-env).
+      PROXYX_INTERCEPT_BROKER_KIND: ${PROXYX_BROKER:-redis_stream}
+      PROXYX_INTERCEPT_KAFKA__BROKERS: kafka:9092
+      PROXYX_INTERCEPT_KAFKA__TOPIC: proxyx.captures
+      PROXYX_INTERCEPT_KAFKA__PARTITIONS: "4"
+      PROXYX_INTERCEPT_KAFKA__REPLICATION_FACTOR: "1"
+      PROXYX_INTERCEPT_RABBITMQ__URL: amqp://proxyx:proxyx@rabbitmq:5672/%2f
+      PROXYX_INTERCEPT_RABBITMQ__PARTITIONS: "4"
+      PROXYX_INTERCEPT_RABBITMQ__QUORUM_GROUP_SIZE: "1"
+    volumes:
+      - ca:/ca:ro
+    ports:
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:1081:1080"
+      - "127.0.0.1:8889:8888"
+    depends_on:
+      init: {condition: service_completed_successfully}
+      migrate-control: {condition: service_completed_successfully}
+      valkey: {condition: service_healthy}
+      limiter: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8888/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mariadb-data:
+  sqlite-data:
+  clickhouse-data:
+  opensearch-data:
+  kafka-data:
+  rabbitmq-data:
+  secrets:
+  ca:

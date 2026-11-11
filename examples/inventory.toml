@@ -1,0 +1,30 @@
+# A static inventory file: `<data_dir>/inventory/vpn-pool.toml`. Every `[[entry]]` is one
+# static IP or box that the adapter of the same provider id dials. This one points the
+# `vpn-pool` adapter at a local SOCKS5 sidecar (docker/Dockerfile.egress). `ip` is the
+# expected exit address of the sidecar's VPN; `credentials` names a file in the secrets
+# directory that holds `username:password` (leave it out for a sidecar without a login).
+
+[[entry]]
+provider = "vpn-pool"
+subtype = "datacenter"
+plan = "wireguard-fr"
+ip = "203.0.113.10"
+host = "egress-fr"
+port = 1080
+region = "fr"
+credentials = "vpn_fr_login"
+
+# The machine's own addresses (`data/adapters/local.toml`, `scheme = "local"`): this would be
+# `<data_dir>/inventory/local.toml`. `host` is the local address the tunnel binds as its source
+# and must be assigned to an interface of the machine; `ip` is the exit address the verification
+# expects (the same address on a plain server, the public address behind a 1:1 NAT); `port` is
+# not used. A unit takes no `credentials`. See docs/providers.md, "Local units".
+#
+# [[entry]]
+# provider = "local"
+# subtype = "datacenter"
+# plan = "server-a"
+# ip = "198.51.100.20"
+# host = "198.51.100.20"
+# port = 0
+# region = "fr"

@@ -1,0 +1,45 @@
+# Residential, generic zone grammar. Verified 2026-11-11.
+# Store the FULL dashboard-generated `<account>-zone-<zone>` username in res_zone_user.
+# Do not guess a product-specific account prefix.
+# Verify gateway host, port and enabled targeting against your zone's examples in the
+# provider dashboard.
+# `-const` binds the session peer; unavailable peers return 502, not a new IP.
+# No duration parameter is documented here; max_session_minutes is a local cap,
+# not a promise that the provider retains a live peer for that entire duration.
+
+[[adapter]]
+id = "res_zone"
+kind = "rotating"
+subtype = "residential"
+scheme = "http"
+host = "brd.superproxy.io" # wire-compat: the provider gateway
+port = 33335
+user_file = "res_zone_user"
+pass_file = "res_zone_pass"
+user = "{base_user}{opts}"
+pass = "{base_pass}"
+max_session_minutes = 30
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city-{v}"
+charset = "alpha"
+case = "lower"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+max_len = 32
+
+[[adapter.option]]
+name = "strict"
+to = "user"
+frag = "-const"

@@ -1,0 +1,31 @@
+# Pool gateway and warmer (`proxyx gateway`, `proxyx warmer`, `proxyx migrate pool`).
+# Pass it with `--config examples/pool.toml`, or install it as /etc/proxyx/pool.toml.
+# Every key is optional; the values below are the defaults except the connection URLs and
+# the paths, which assume a local checkout. Every key also has an environment variable
+# `PROXYX_POOL_<KEY>` (see docs/configuration.md). A key this file does not know is refused.
+
+database_url = "postgres://proxyx:proxyx@localhost:5432/proxyx_pool"
+# Other backends (docs/databases.md): MariaDB `mariadb://proxyx:proxyx@localhost:3306/proxyx_pool`,
+# SQLite (one host only) `sqlite:///var/lib/proxyx/pool.db?mode=rwc`.
+redis_url = "redis://localhost:6379/1"
+
+connect_listen = "0.0.0.0:8080"   # HTTP CONNECT
+socks_listen = "0.0.0.0:1080"     # SOCKS5
+probe_listen = "0.0.0.0:8082"     # prober only, signed probe tokens
+api_listen = "0.0.0.0:8081"       # /v1 control API
+ops_listen = "0.0.0.0:8888"       # /healthz /readyz /metrics
+
+# adapters/*.toml, policies/*.toml, inventory/*.toml and probe-targets.toml.
+data_dir = "data"
+# Files named by adapters (user_file, pass_file), inventory entries (credentials) and the
+# scorers (fraud_score_api_key, abuse_confidence_api_key, proxy_risk_api_key), plus `prober-token`.
+secrets_dir = "secrets"
+admin_token_file = "secrets/admin-token"
+probe_key_file = "secrets/probe-key"
+
+drain_timeout = "300s"
+reload_every = "30s"
+max_connections = 10000
+tunnel_idle_timeout = "10m"
+
+json_logs = false
