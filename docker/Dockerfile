@@ -8,7 +8,7 @@
 # Select a role with the command, for example `proxyx gateway` or `proxyx-intercept`.
 
 # Base images are pinned by manifest-list digest; Dependabot proposes digest updates.
-FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
+FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
 # cmake, clang and perl build BoringSSL (the session proxy's upstream TLS stack);
 # librdkafka needs libssl-dev, libsasl2-dev and zlib; protoc is vendored by the workspace.
 RUN apt-get update \

@@ -108,7 +108,7 @@ services:
   # password is proxyx; the roles use the user proxyx / proxyx on `proxyx_pool` and `proxyx_control`.
   mariadb:
     profiles: ["mariadb"]
-    image: mariadb:11
+    image: mariadb:13
     environment:
       MARIADB_ROOT_PASSWORD: proxyx
       MARIADB_USER: proxyx
@@ -125,7 +125,7 @@ services:
       retries: 30
 
   valkey:
-    image: valkey/valkey:8
+    image: valkey/valkey:9
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -135,7 +135,7 @@ services:
       retries: 10
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3
+    image: clickhouse/clickhouse-server:26.10
     environment:
       CLICKHOUSE_USER: proxyx
       CLICKHOUSE_PASSWORD: proxyx
@@ -159,7 +159,7 @@ services:
   # development only. Traffic view exports are not available with this store.
   opensearch:
     profiles: ["opensearch"]
-    image: opensearchproject/opensearch:2
+    image: opensearchproject/opensearch:3
     environment:
       discovery.type: single-node
       DISABLE_SECURITY_PLUGIN: "true"
@@ -184,7 +184,7 @@ services:
   # Optional captures-log broker (profile `kafka`): a single KRaft node, plaintext, development only.
   kafka:
     profiles: ["kafka"]
-    image: apache/kafka:3.9.0
+    image: apache/kafka:4.3.1
     environment:
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: broker,controller
