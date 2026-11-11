@@ -268,7 +268,7 @@ The outbound handshake approximates a browser's TLS ClientHello so destination s
 | `agent` contains | Profile | Notes |
 |---|---|---|
 | nothing (no `agent`), empty, or no match | `Chrome133` | default |
-| `chrome` or `chromium` | `Chrome133` | X25519MLKEM768 first, GREASE, extension order permuted per handshake, OCSP/SCT requests, ECH GREASE |
+| `chrome` or `chromium` | `Chrome133` | X25519MLKEM768 first, GREASE, extension order permuted per handshake, OCSP/SCT requests, ECH GREASE <!-- wire-compat: User-Agent token --> |
 | `firefox`, version `Firefox/N` with N >= 128, or no parsable version | `Firefox135` | X25519MLKEM768 first, no GREASE, OCSP request, ECH GREASE |
 | `firefox`, N < 128 | `Firefox120` | no post-quantum group, otherwise as `Firefox135` |
 | `safari` (and not chrome) | `Safari18` | AES-256 first in the TLS 1.2 suite list, GREASE, no OCSP/SCT/ECH extensions |
@@ -277,7 +277,7 @@ Chrome is tested first, so a Chrome user agent that also mentions Safari or Fire
 
 ### Verified scope and limits
 
-The profiles were checked by capturing the real ClientHello the proxy sends to a local raw TLS listener and comparing normalized fields (GREASE values, random, session ID, key-share bytes and, for Chrome, extension order are excluded) against two kinds of reference captured on the same host: utls parrots `HelloChrome_133` and `HelloFirefox_120`, and installed Chrome 157, Chromium 156 and Firefox 159. Those installed browsers are newer than the pinned profiles, so only the fields the profiles pin are compared.
+The profiles were checked by capturing the real ClientHello the proxy sends to a local raw TLS listener and comparing normalized fields (GREASE values, random, session ID, key-share bytes and, for Chrome, extension order are excluded) against two kinds of reference captured on the same host: utls parrots `HelloChrome_133` and `HelloFirefox_120`, and installed Chrome 157, a Chrome-family build 156 and Firefox 159. Those installed browsers are newer than the pinned profiles, so only the fields the profiles pin are compared.
 
 What the captures confirm:
 

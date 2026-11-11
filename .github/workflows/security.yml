@@ -1,19 +1,28 @@
 name: security
 
-# Scheduled supply-chain checks also run after main-branch pushes and on manual dispatch.
-# Unlike CI's working-tree scan, gitleaks checks every fetched branch and tag's full history.
-# No baseline hides historical findings; rotate any exposed credential before publication.
+# Supply-chain checks:
+#   - advisories and secret-history run after main-branch pushes, weekly and on dispatch.
+#     Unlike CI's working-tree scan, gitleaks checks every fetched branch and tag's full
+#     history. No baseline hides historical findings; rotate any exposed credential.
+#   - dependency-review runs on pull requests and fails when the change adds a dependency with
+#     a known vulnerability of high severity or worse.
+#   - scorecard runs the OpenSSF Scorecard on the default branch, uploads the result to code
+#     scanning and publishes it to the Scorecard API.
+# dependency-review and scorecard need the public dependency graph and code scanning, so they
+# only run once the repository is public.
 #
 # Every job needs authorize, which reads user owners of the default branch's CODEOWNERS
 # `*` rule through the API, never through the checkout under test. Both the actor and
-# rerun actor must be owners. GitHub's recorded schedule actor must remain an owner;
-# main-branch pushes authorize the pusher, not the authors of merged commits.
-# This gate does not replace fork-workflow restrictions and required code-owner review
-# in repository settings: a pull request can change its own workflow file.
+# rerun actor must be owners; pull requests also need an owner author and a same-repository
+# head. GitHub's recorded schedule actor must remain an owner; main-branch pushes authorize
+# the pusher, not the authors of merged commits. This gate does not replace fork-workflow
+# restrictions and required code-owner review in repository settings: a pull request can
+# change its own workflow file.
 
 on:
   push:
     branches: [main]
+  pull_request:
   schedule:
     - cron: "41 5 * * 2" # weekly (Tuesday)
   workflow_dispatch:
@@ -21,8 +30,8 @@ on:
 permissions: {}
 
 concurrency:
-  group: security-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: security-${{ github.event.pull_request.number || github.event.schedule || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   authorize:
@@ -40,6 +49,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
@@ -49,7 +60,7 @@ jobs:
             exit 0
           }
           case "$EVENT_NAME" in
-            push|schedule|workflow_dispatch) ;;
+            push|pull_request|schedule|workflow_dispatch) ;;
             *) deny "event ${EVENT_NAME} is not allowed" ;;
           esac
           # Resolve ownership from the trusted default branch, not the event checkout.
@@ -75,13 +86,17 @@ jobs:
           }
           is_owner "$ACTOR" || deny "actor is not a code owner"
           is_owner "$TRIGGERING_ACTOR" || deny "triggering actor is not a code owner"
+          if [ "$EVENT_NAME" = pull_request ]; then
+            is_owner "$PR_AUTHOR" || deny "pull request author is not a code owner"
+            [ "$PR_HEAD_REPO" = "$GITHUB_REPOSITORY" ] || deny "pull request comes from a fork"
+          fi
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
   advisories:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: authorize
-    if: needs.authorize.outputs.ok == 'true'
+    if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
     permissions:
       contents: read
     steps:
@@ -101,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: authorize
-    if: needs.authorize.outputs.ok == 'true'
+    if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
     permissions:
       contents: read
     env:
@@ -127,7 +142,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: authorize
-    if: needs.authorize.outputs.ok == 'true'
+    if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
     permissions:
       contents: read
     steps:
@@ -140,3 +155,43 @@ jobs:
           inputs: .github
           advanced-security: false
           annotations: true
+
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: authorize
+    if: needs.authorize.outputs.ok == 'true' && github.event_name == 'pull_request' && github.event.repository.private == false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+
+  scorecard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: authorize
+    if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # upload the SARIF result to code scanning
+      id-token: write # sign the published result
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

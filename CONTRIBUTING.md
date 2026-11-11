@@ -48,10 +48,12 @@ Test only against local services and systems you own. See [Responsible use](READ
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --no-fail-fast --workspace        # or: cargo test --workspace
+cargo test --workspace --no-fail-fast
 python3 ci/lint-provenance.py
 cargo deny --locked check licenses advisories bans sources
 ```
+
+Use `cargo test`, not `cargo nextest`: the PostgreSQL- and Redis-backed suites serialize their tests inside one test binary. `ci/lint-provenance.py` is the public-tree hygiene gate. Besides retired identifiers and internal ticket or design-record citations, it rejects names of third-party products, services and vendors, absolute developer paths and the privileged fork pull-request trigger. A line marked `wire-compat` (an exact string an external service or client needs) or `detection-data` (a string matched on target sites) may keep a vendor name; dependency manifests, imports and license notices are exempt.
 
 If you touch `prober/`:
 
@@ -80,7 +82,7 @@ All Rust follows the workspace lints in [`Cargo.toml`](Cargo.toml). On top of th
 - Tests are deterministic and use no external network. Use loopback fixtures and the stand-in services the test suites already provide.
 - A behavior change needs a test that fails without it. A bug fix needs a regression test.
 - Do not put real-format provider credentials or API tokens in tests or fixtures. Build synthetic values at runtime from split parts, with a comment that they are canaries, so secret scanners do not flag the repository (`gitleaks` runs in CI).
-- Provider fixture adapters name public vendor endpoints and secret-file identifiers, not usable accounts. `crates/provider/tests/golden.rs` supplies synthetic usernames and passwords through an in-memory resolver; do not replace them with live credentials.
+- Provider fixture adapters use example gateway hosts and secret-file identifiers, not usable accounts. `crates/provider/tests/golden.rs` supplies synthetic usernames and passwords through an in-memory resolver; do not replace them with live credentials.
 - TLS tests generate disposable keys and self-signed certificates at runtime (for example, `crates/edge/tests/common/tls_fixture.rs`). Certificate-shaped strings in client and MCP tests contain dummy payloads, not trusted roots or production keys. Never reuse test or Compose CA material outside an isolated local test, and never install it into a personal or system trust store.
 - Metric families have a catalogue: [`docs/metrics/pool.md`](docs/metrics/pool.md) is parsed by a unit test and compared with the registry. Adding, removing or relabeling a metric means updating the matching `### \`metric_name\`` heading and its `- **Labels:**` line.
 
@@ -108,7 +110,9 @@ The ignore files exclude local configurations, secret containers, database files
 
 Pull-request CI runs only when the actor, rerun actor and pull-request author are individual code owners, and the head branch belongs to this repository. The gate reads the wildcard rule from [`.github/CODEOWNERS`](.github/CODEOWNERS) on the trusted default branch. For external contributions, including forks and dependency-update pull requests, a maintainer runs the checks above with PostgreSQL and Valkey and reports the results on the pull request. A green local run from you does not replace that review.
 
-The [security workflow](.github/workflows/security.yml) checks current Rust advisories, all fetched Git history for secrets and workflow configuration with zizmor on main-branch pushes, weekly and on manual dispatch. [CodeQL](.github/workflows/codeql.yml) scans Rust and GitHub Actions on authorized pull requests, main-branch pushes, weekly and on manual dispatch, but analysis and upload stay disabled while the repository is private. Both workflows require an owner actor and rerun actor. Keep GitHub's CodeQL default setup disabled when using this advanced setup.
+Once a contribution is approved, a maintainer opens an integration pull request from a branch in this repository that contains the contributor's commits unchanged, plus any conflict resolution or review follow-ups as separate commits. CI runs on that branch. `main` takes squash merges only, so the squashed commit credits the contributor with a `Co-authored-by` trailer, and the maintainer closes the original pull request with a link to the merged one. Dependency-update pull requests follow the same path. An update to a GitHub Action also needs the new commit SHA added to the repository's allowed-actions list before it merges, or every workflow run fails to start.
+
+The [security workflow](.github/workflows/security.yml) checks current Rust advisories, all fetched Git history for secrets and workflow configuration with zizmor on main-branch pushes, weekly and on manual dispatch; on pull requests it reviews added dependencies for known vulnerabilities, and on `main` it runs the OpenSSF Scorecard. [CodeQL](.github/workflows/codeql.yml) scans Rust, the Python prober and GitHub Actions on authorized pull requests, main-branch pushes, weekly and on manual dispatch. Dependency review, Scorecard and CodeQL upload results only once the repository is public. Every workflow requires an owner actor and rerun actor. Keep GitHub's CodeQL default setup disabled when using this advanced setup.
 
 These workflow gates are defense in depth, not a sandbox: a pull request can change its own workflow. The repository settings are the authoritative control: workflows from forks need maintainer approval for every external contributor, Actions run only GitHub-owned and SHA-pinned allowlisted actions with a read-only default token, and `main` accepts only squash-merged pull requests with an approving code-owner review, approval of the last push, resolved review threads and a green, up-to-date `required` check. Release tags (`v*`) cannot be moved or deleted.
 

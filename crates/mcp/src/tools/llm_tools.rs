@@ -173,21 +173,21 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
 // --- classify_block_page -----------------------------------------------------------------------------
 
 const CHALLENGE_MARKERS: [&str; 15] = [
-    "cf-chl",
+    "cf-chl", // detection-data
     "challenge-platform",
     "just a moment",
     "attention required",
     "captcha",
-    "recaptcha",
-    "hcaptcha",
-    "px-captcha",
-    "datadome",
+    "recaptcha",  // detection-data
+    "hcaptcha",   // detection-data
+    "px-captcha", // detection-data
+    "datadome",   // detection-data
     "/sorry/",
     "unusual traffic",
     "verify you are human",
     "are you a robot",
-    "request unsuccessful. incapsula",
-    "access denied - sucuri",
+    "request unsuccessful. incapsula", // detection-data
+    "access denied - sucuri",          // detection-data
 ];
 
 /// A rule-based classification of a response.
@@ -230,6 +230,7 @@ pub fn classify_rules(status: u64, headers: &Value, body: &str) -> Verdict {
         .copied()
         .filter(|marker| lower.contains(marker) || header_text.contains(marker))
         .collect();
+    // detection-data: the challenge header of a CDN
     let challenge_header = header_text.contains("cf-mitigated: challenge");
     let sorry_redirect = (300..400).contains(&status) && header_text.contains("/sorry/");
     if status == 429 {
@@ -246,6 +247,7 @@ pub fn classify_rules(status: u64, headers: &Value, body: &str) -> Verdict {
     if challenge_header || sorry_redirect || (!markers.is_empty() && matches!(status, 403 | 503)) {
         evidence.push(format!("HTTP {status}"));
         if challenge_header {
+            // detection-data: the challenge header of a CDN
             evidence.push("cf-mitigated: challenge header".to_owned());
         }
         if sorry_redirect {
@@ -550,20 +552,21 @@ mod tests {
             classify_rules(429, &none, "").classification,
             "rate_limited"
         );
-        let cloudflare = classify_rules(
+        let challenge = classify_rules(
             403,
+            // detection-data: the challenge header of a CDN
             &json!({"cf-mitigated": "challenge"}),
             "<title>Just a moment...</title>",
         );
         assert_eq!(
-            (cloudflare.classification, cloudflare.confidence >= 0.9),
+            (challenge.classification, challenge.confidence >= 0.9),
             ("challenge", true)
         );
-        let captcha = classify_rules(503, &none, "<div class=\"g-recaptcha\">");
+        let captcha = classify_rules(503, &none, "<div class=\"captcha-widget\">");
         assert_eq!(captcha.classification, "challenge");
         let sorry = classify_rules(
             302,
-            &json!([["Location", "https://www.google.com/sorry/index"]]),
+            &json!([["Location", "https://search.example.test/sorry/index"]]),
             "",
         );
         assert_eq!(sorry.classification, "challenge");

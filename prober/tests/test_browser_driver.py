@@ -3,10 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeoutError
 
-from proxyx_prober import playwright_driver as driver_module
+from proxyx_prober import browser_driver as driver_module
+from proxyx_prober.browser_driver import BrowserDriver, browser_driver
 from proxyx_prober.detect import BODY_LIMIT
 from proxyx_prober.measure import (
     BrowserUnavailable,
@@ -15,7 +16,6 @@ from proxyx_prober.measure import (
     ProxyCredentialsRejected,
     ProxyLogin,
 )
-from proxyx_prober.playwright_driver import PlaywrightDriver, playwright_driver
 
 URL = "https://example.test/"
 LOGIN = ProxyLogin(
@@ -94,7 +94,7 @@ class FakeBrowser:
             raise self.close_error
 
 
-class FakeChromium:
+class FakeEngine:
     def __init__(
         self, browser: FakeBrowser, launch_error: Exception | None = None
     ) -> None:
@@ -109,32 +109,32 @@ class FakeChromium:
         return self.browser
 
 
-class FakePlaywright:
-    """Stands in for ``async_playwright()``: an async context manager."""
+class FakeAutomation:
+    """Stands in for ``start_automation()``: an async context manager."""
 
-    def __init__(self, chromium: FakeChromium) -> None:
-        self.chromium = chromium
+    def __init__(self, engine: FakeEngine) -> None:
+        self.chromium = engine  # wire-compat: the library names its browser engines
         self.stopped = False
 
-    def __call__(self) -> "FakePlaywright":
+    def __call__(self) -> "FakeAutomation":
         return self
 
-    async def __aenter__(self) -> "FakePlaywright":
+    async def __aenter__(self) -> "FakeAutomation":
         return self
 
     async def __aexit__(self, *_: object) -> None:
         self.stopped = True
 
 
-def driver_for(browser: FakeBrowser) -> PlaywrightDriver:
-    return PlaywrightDriver(browser, LOGIN)  # type: ignore[arg-type]
+def driver_for(browser: FakeBrowser) -> BrowserDriver:
+    return BrowserDriver(browser, LOGIN)  # type: ignore[arg-type]
 
 
 def install(
-    monkeypatch: pytest.MonkeyPatch, browser: FakeBrowser, **chromium: Exception
-) -> FakePlaywright:
-    fake = FakePlaywright(FakeChromium(browser, **chromium))
-    monkeypatch.setattr(driver_module, "async_playwright", fake)
+    monkeypatch: pytest.MonkeyPatch, browser: FakeBrowser, **engine: Exception
+) -> FakeAutomation:
+    fake = FakeAutomation(FakeEngine(browser, **engine))
+    monkeypatch.setattr(driver_module, "start_automation", fake)
     return fake
 
 
@@ -167,7 +167,7 @@ async def test_navigation_timeout_is_a_load_timeout(
     monkeypatch.setattr(
         driver_module, "_proxy_credentials_rejected", AsyncMock(return_value=False)
     )
-    browser = FakeBrowser(FakePage(goto_error=PlaywrightTimeoutError("Timeout 5000ms")))
+    browser = FakeBrowser(FakePage(goto_error=BrowserTimeoutError("Timeout 5000ms")))
 
     with pytest.raises(LoadTimeout, match="within 5s"):
         await driver_for(browser).load(URL, 5.0)
@@ -175,7 +175,7 @@ async def test_navigation_timeout_is_a_load_timeout(
 
 
 async def test_navigation_error_is_a_load_failure_with_the_first_line() -> None:
-    error = PlaywrightError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x/\nlog")
+    error = BrowserError("net::ERR_TUNNEL_CONNECTION_FAILED at https://x/\nlog")
     browser = FakeBrowser(FakePage(goto_error=error))
 
     with pytest.raises(LoadFailed) as raised:
@@ -185,7 +185,7 @@ async def test_navigation_error_is_a_load_failure_with_the_first_line() -> None:
 
 
 async def test_a_refused_probe_token_is_not_a_route_failure() -> None:
-    error = PlaywrightError("net::ERR_INVALID_AUTH_CREDENTIALS at https://x/\nlog")
+    error = BrowserError("net::ERR_INVALID_AUTH_CREDENTIALS at https://x/\nlog")
     browser = FakeBrowser(FakePage(goto_error=error))
 
     with pytest.raises(ProxyCredentialsRejected):
@@ -193,7 +193,7 @@ async def test_a_refused_probe_token_is_not_a_route_failure() -> None:
 
 
 async def test_error_after_navigation_on_a_live_browser_is_a_load_failure() -> None:
-    browser = FakeBrowser(FakePage(evaluate_error=PlaywrightError("Target crashed")))
+    browser = FakeBrowser(FakePage(evaluate_error=BrowserError("Target crashed")))
 
     with pytest.raises(LoadFailed, match="Target crashed"):
         await driver_for(browser).load(URL, 5.0)
@@ -202,23 +202,24 @@ async def test_error_after_navigation_on_a_live_browser_is_a_load_failure() -> N
 
 async def test_failure_to_open_a_context_on_a_dead_browser_is_unavailable() -> None:
     browser = FakeBrowser(
-        connected=False, open_error=PlaywrightError("Browser has been closed")
+        connected=False, open_error=BrowserError("Browser has been closed")
     )
 
     with pytest.raises(BrowserUnavailable, match="disconnected"):
         await driver_for(browser).load(URL, 5.0)
 
 
-async def test_chromium_is_launched_with_the_probe_login(
+async def test_browser_is_launched_with_the_probe_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     browser = FakeBrowser()
     fake = install(monkeypatch, browser)
 
-    async with playwright_driver(LOGIN) as driver:
+    async with browser_driver(LOGIN) as driver:
         load = await driver.load(URL, 5.0)
 
     assert load.status == 200
+    # wire-compat: the library names its browser engines
     assert fake.chromium.launch_kwargs["proxy"] == {
         "server": "http://127.0.0.1:8082",
         "username": "px-prov-p-cc-fr-sid-abc",
@@ -228,17 +229,17 @@ async def test_chromium_is_launched_with_the_probe_login(
     assert fake.stopped
 
 
-async def test_failed_launch_is_unavailable_and_stops_playwright(
+async def test_failed_launch_is_unavailable_and_stops_automation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake = install(
         monkeypatch,
         FakeBrowser(),
-        launch_error=PlaywrightError("Executable doesn't exist"),
+        launch_error=BrowserError("Executable doesn't exist"),
     )
 
     with pytest.raises(BrowserUnavailable, match="browser launch failed"):
-        async with playwright_driver(LOGIN):
+        async with browser_driver(LOGIN):
             pytest.fail("the launch must not succeed")
     assert fake.stopped
 
@@ -246,10 +247,10 @@ async def test_failed_launch_is_unavailable_and_stops_playwright(
 async def test_close_failure_after_the_loads_does_not_discard_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    browser = FakeBrowser(close_error=PlaywrightError("connection closed"))
+    browser = FakeBrowser(close_error=BrowserError("connection closed"))
     install(monkeypatch, browser)
 
-    async with playwright_driver(LOGIN) as driver:
+    async with browser_driver(LOGIN) as driver:
         load = await driver.load(URL, 5.0)
 
     assert load.status == 200
@@ -292,7 +293,7 @@ async def test_only_explicit_proxy_407_reclassifies_a_navigation_timeout(
     monkeypatch: pytest.MonkeyPatch, head: bytes | Exception
 ) -> None:
     _, writer, connector = proxy_connection(monkeypatch, head)
-    browser = FakeBrowser(FakePage(goto_error=PlaywrightTimeoutError("Timeout")))
+    browser = FakeBrowser(FakePage(goto_error=BrowserTimeoutError("Timeout")))
     rejected = (
         isinstance(head, bytes)
         and head.startswith(b"HTTP/1.1 407")

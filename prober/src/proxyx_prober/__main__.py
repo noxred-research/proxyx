@@ -8,8 +8,8 @@ import signal
 
 from prometheus_client import start_http_server
 
+from .browser_driver import browser_driver
 from .client import ProxyXClient
-from .playwright_driver import playwright_driver
 from .prober import Prober
 from .settings import ProberSettings
 
@@ -29,7 +29,7 @@ async def _run(settings: ProberSettings) -> None:
         backoff_s=settings.request_backoff_s,
         timeout_s=settings.request_timeout_s,
     )
-    prober = Prober(settings=settings, api=api, driver_factory=playwright_driver)
+    prober = Prober(settings=settings, api=api, driver_factory=browser_driver)
     log.info(
         "proxyx prober started: max_concurrent_probes=%d canary_interval_s=%g",
         settings.max_concurrent_probes,

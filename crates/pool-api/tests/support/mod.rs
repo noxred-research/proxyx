@@ -576,9 +576,9 @@ pub fn exit_ip_config() -> ExitIpConfig {
     };
     ExitIpConfig {
         services: vec![
-            svc(ServiceKind::Ipify, "ipify?format=json"),
-            svc(ServiceKind::Cloudflare, "cloudflare"),
-            svc(ServiceKind::Ipinfo, "ipinfo"),
+            svc(ServiceKind::IpJson, "ip_json?format=json"),
+            svc(ServiceKind::TraceLines, "trace_lines"),
+            svc(ServiceKind::IpCountryJson, "ip_country_json"),
         ],
         min_agree: 2,
         timeout: Duration::from_secs(3),
@@ -666,9 +666,9 @@ pub async fn answer_proxied(
             .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
             .await;
     }
-    let (content_type, body) = if uri.contains("/cloudflare") {
+    let (content_type, body) = if uri.contains("/trace_lines") {
         ("text/plain", format!("ip={exit}\nloc=FR\n"))
-    } else if uri.contains("/ipinfo") {
+    } else if uri.contains("/ip_country") {
         (
             "application/json",
             format!(r#"{{"ip":"{exit}","country":"FR"}}"#),

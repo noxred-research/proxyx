@@ -68,7 +68,7 @@ The gateway authenticates a key against an in-memory cache first. A key that Pos
 
 ### Verification
 
-The warmer and the gateway check an exit IP before it serves traffic: several public services must agree on the address (and, for providers that report it, the country), and reputation scorers (IPQS, AbuseIPDB, Scamalytics) that you enable with API keys add a risk score. A static IP that keeps failing checks or collects block signals is quarantined and replaced under the policy's replacement rule. The optional Python [prober](../prober/README.md) measures candidates with a real browser through the probe listener, which opens only the hosts listed in `probe-targets.toml`.
+The warmer and the gateway check an exit IP before it serves traffic: several public services must agree on the address (and, for providers that report it, the country), and reputation scorers (`fraud_score`, `abuse_confidence`, `proxy_risk`) that you enable with API keys add a risk score. A static IP that keeps failing checks or collects block signals is quarantined and replaced under the policy's replacement rule. The optional Python [prober](../prober/README.md) measures candidates with a real browser through the probe listener, which opens only the hosts listed in `probe-targets.toml`.
 
 ## Session plane
 

@@ -18,7 +18,7 @@ ops_listen = "0.0.0.0:8888"       # /healthz /readyz /metrics
 # adapters/*.toml, policies/*.toml, inventory/*.toml and probe-targets.toml.
 data_dir = "data"
 # Files named by adapters (user_file, pass_file), inventory entries (credentials) and the
-# scorers (ipqs_api_key, abuseipdb_api_key, scamalytics_api_key), plus `prober-token`.
+# scorers (fraud_score_api_key, abuse_confidence_api_key, proxy_risk_api_key), plus `prober-token`.
 secrets_dir = "secrets"
 admin_token_file = "secrets/admin-token"
 probe_key_file = "secrets/probe-key"

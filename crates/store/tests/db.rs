@@ -199,7 +199,7 @@ async fn policies_get_a_new_version_only_when_they_change() -> TestResult {
     let mut doc = PolicyDoc {
         name: name.clone(),
         scope: Scope::RouteClass,
-        target: Some("oxylabs_isp".into()),
+        target: Some("isp_static_port".into()),
         lease_ttl: Some(Duration::from_secs(600)),
         orgs_hard: Some(2),
         pool: Some(Pool::Shared),
@@ -248,7 +248,7 @@ async fn policy_history_is_capped_and_stored_documents_carry_only_what_is_set() 
     let mut doc = PolicyDoc {
         name: name.clone(),
         scope: Scope::RouteClass,
-        target: Some("oxylabs_isp".into()),
+        target: Some("isp_static_port".into()),
         orgs_hard: Some(1),
         ..PolicyDoc::default()
     };
@@ -532,9 +532,14 @@ async fn scores_and_blocks_keep_history_for_the_rules() -> TestResult {
     };
     let ip = uniq_ip();
     let now = OffsetDateTime::now_utc();
-    for (i, (source, risk)) in [("ipqs", 80), ("ipqs", 90), ("ipqs", 85), ("abuse", 10)]
-        .into_iter()
-        .enumerate()
+    for (i, (source, risk)) in [
+        ("fraud_score", 80),
+        ("fraud_score", 90),
+        ("fraud_score", 85),
+        ("abuse", 10),
+    ]
+    .into_iter()
+    .enumerate()
     {
         db.record_score(&proxyx_store::ScoreRow {
             ip,
@@ -546,13 +551,13 @@ async fn scores_and_blocks_keep_history_for_the_rules() -> TestResult {
         .await?;
     }
     let recent = db.recent_scores(ip, 2).await?;
-    let ipqs: Vec<_> = recent
+    let fraud_score: Vec<_> = recent
         .iter()
-        .filter(|s| s.source == "ipqs")
+        .filter(|s| s.source == "fraud_score")
         .map(|s| s.risk)
         .collect();
     assert_eq!(
-        ipqs,
+        fraud_score,
         [85, 90],
         "the newest two of one service, newest first"
     );
@@ -574,19 +579,19 @@ async fn scores_and_blocks_keep_history_for_the_rules() -> TestResult {
     let until = now + time::Duration::minutes(30);
     let blocks = [
         (
-            Some("Google.com"),
+            Some("Example.com"),
             SignalSource::Probe,
             SignalType::Challenge,
             Some(until),
         ),
         (
-            Some("bing.com"),
+            Some("example.net"),
             SignalSource::Client,
             SignalType::RateLimited,
             Some(until),
         ),
         (
-            Some("google.com"),
+            Some("example.com"),
             SignalSource::Probe,
             SignalType::Challenge,
             Some(until),

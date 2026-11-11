@@ -380,7 +380,7 @@ impl Default for MetricsConfig {
     }
 }
 
-/// An OpenAI-compatible chat completions endpoint.
+/// A chat-completions compatible endpoint.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
@@ -704,6 +704,6 @@ mod tests {
         assert!(!is_org_id(""));
         assert!(is_operator("proxyx-mcp"));
         assert!(!is_operator("with space"));
-        assert!(is_provider_id("oxylabs_isp"));
+        assert!(is_provider_id("isp_static_port"));
     }
 }

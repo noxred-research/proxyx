@@ -17,12 +17,12 @@ async fn the_latest_risk_per_ip_takes_the_newest_check_of_each_source() -> TestR
     let (a, b) = (uniq_ip(), uniq_ip());
     let now = OffsetDateTime::now_utc();
     let rows = [
-        // a: ipqs got better (90 then 20); abuse says 35 -> highest of the latest is 35.
-        (a, "ipqs", 90, -3),
-        (a, "ipqs", 20, -1),
+        // a: fraud_score got better (90 then 20); abuse says 35 -> highest of the latest is 35.
+        (a, "fraud_score", 90, -3),
+        (a, "fraud_score", 20, -1),
         (a, "abuse", 35, -2),
         // b: one check.
-        (b, "ipqs", 60, -1),
+        (b, "fraud_score", 60, -1),
     ];
     for (ip, source, risk, minutes) in rows {
         db.record_score(&ScoreRow {

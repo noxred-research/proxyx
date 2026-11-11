@@ -148,7 +148,7 @@ mod tests {
     fn job(phase: Phase) -> SessionJob {
         SessionJob {
             partition: Partition {
-                provider: "oxylabs_res".parse().expect("provider"),
+                provider: "res_user_suffix".parse().expect("provider"),
                 region: "fr/paris".parse().expect("region"),
             },
             session: "AbC123xyz".into(),

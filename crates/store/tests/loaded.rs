@@ -19,13 +19,13 @@ use support::{TestResult, fresh_db};
 
 const ADAPTER: &str = r#"
 [[adapter]]
-id = "oxylabs_isp"
+id = "isp_static_port"
 kind = "static"
 subtype = "isp"
 scheme = "http"
-host = "disp.oxylabs.io"
-user_file = "oxylabs_isp_user"
-pass_file = "oxylabs_isp_pass"
+host = "rotating.isp.example.net"
+user_file = "isp_static_port_user"
+pass_file = "isp_static_port_pass"
 user = "user-{base_user}"
 pass = "{base_pass}"
 "#;
@@ -38,21 +38,21 @@ fn policy(min_ready: u32) -> String {
 
 fn entry(ip: &str, port: u16) -> String {
     format!(
-        "[[entry]]\nprovider = \"oxylabs_isp\"\nsubtype = \"isp\"\nip = \"{ip}\"\n\
-         host = \"disp.oxylabs.io\"\nport = {port}\nregion = \"fr\"\n"
+        "[[entry]]\nprovider = \"isp_static_port\"\nsubtype = \"isp\"\nip = \"{ip}\"\n\
+         host = \"rotating.isp.example.net\"\nport = {port}\nregion = \"fr\"\n"
     )
 }
 
 const BROKEN_ADAPTER: &str = "[[adapter]]\nid = ";
 
 fn adapter_on_other_host() -> String {
-    ADAPTER.replace("disp.oxylabs.io", "other.example")
+    ADAPTER.replace("rotating.isp.example.net", "other.example")
 }
 
-/// A git policy file of the `route_class` scope for the oxylabs provider.
+/// A git policy file of the `route_class` scope for the static ISP provider.
 fn route_class(name: &str, min_ready: u32) -> String {
     format!(
-        "[[policy]]\nname = \"{name}\"\nscope = \"route_class\"\nmatch = \"oxylabs_isp\"\nmin_ready = {min_ready}\n"
+        "[[policy]]\nname = \"{name}\"\nscope = \"route_class\"\nmatch = \"isp_static_port\"\nmin_ready = {min_ready}\n"
     )
 }
 
@@ -118,9 +118,9 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(dir.join(sub))?;
         }
-        std::fs::write(dir.join("secrets/oxylabs_isp_user"), "u")?;
-        std::fs::write(dir.join("secrets/oxylabs_isp_pass"), "p")?;
-        std::fs::write(dir.join("data/adapters/oxylabs_isp.toml"), ADAPTER)?;
+        std::fs::write(dir.join("secrets/isp_static_port_user"), "u")?;
+        std::fs::write(dir.join("secrets/isp_static_port_pass"), "p")?;
+        std::fs::write(dir.join("data/adapters/isp_static_port.toml"), ADAPTER)?;
         let settings = Settings {
             data_dir: dir.join("data"),
             secrets_dir: dir.join("secrets"),
@@ -226,13 +226,13 @@ async fn the_first_load_syncs_git_into_postgres_as_gitops() -> TestResult {
         return Ok(());
     };
     let f = Fixture::with_policy(10)?;
-    f.write("inventory/oxylabs_isp.toml", &two_entries());
+    f.write("inventory/isp_static_port.toml", &two_entries());
 
     let run = start(&db, &f, true).await?;
     assert_eq!(run.min_ready(), 10);
     let loaded = run.rx.borrow().clone();
     assert_eq!(loaded.snapshot.inventory.len(), 2);
-    assert!(loaded.adapters.get(&"oxylabs_isp".parse()?).is_some());
+    assert!(loaded.adapters.get(&"isp_static_port".parse()?).is_some());
     let audit = db.audit_for("203.0.113.1", 5).await?;
     assert!(
         audit
@@ -329,9 +329,9 @@ async fn a_broken_adapter_keeps_the_last_adapters_until_it_is_fixed() -> TestRes
     };
     let f = Fixture::with_policy(10)?;
     let run = start(&db, &f, true).await?;
-    let id = "oxylabs_isp".parse()?;
+    let id = "isp_static_port".parse()?;
 
-    f.write("adapters/oxylabs_isp.toml", BROKEN_ADAPTER);
+    f.write("adapters/isp_static_port.toml", BROKEN_ADAPTER);
     run.until("the adapter failure", |r| r.failed("adapters") == 1)
         .await;
     assert!(
@@ -339,7 +339,7 @@ async fn a_broken_adapter_keeps_the_last_adapters_until_it_is_fixed() -> TestRes
         "the last good adapters still serve"
     );
 
-    f.write("adapters/oxylabs_isp.toml", &adapter_on_other_host());
+    f.write("adapters/isp_static_port.toml", &adapter_on_other_host());
     run.until("the fix to clear the failure", |r| {
         r.failed("adapters") == 0
     })
@@ -358,7 +358,7 @@ async fn first_load_fails_when_an_adapter_does_not_load() -> TestResult {
         return Ok(());
     };
     let f = Fixture::with_policy(10)?;
-    f.write("adapters/oxylabs_isp.toml", BROKEN_ADAPTER);
+    f.write("adapters/isp_static_port.toml", BROKEN_ADAPTER);
     let Err(err) = start(&db, &f, true).await else {
         panic!("there are no good adapters to fall back to");
     };
@@ -428,11 +428,14 @@ async fn inventory_files_retire_removed_ips_and_an_emptied_file_retires_its_prov
         return Ok(());
     };
     let f = Fixture::with_policy(10)?;
-    f.write("inventory/oxylabs_isp.toml", &two_entries());
+    f.write("inventory/isp_static_port.toml", &two_entries());
     let run = start(&db, &f, true).await?;
     assert_eq!(run.state_of("203.0.113.2"), Some(IpState::Candidate));
 
-    f.write("inventory/oxylabs_isp.toml", &entry("203.0.113.1", 8001));
+    f.write(
+        "inventory/isp_static_port.toml",
+        &entry("203.0.113.1", 8001),
+    );
     run.until(".2 to be retired", |r| {
         r.state_of("203.0.113.2") == Some(IpState::Retired)
     })
@@ -440,14 +443,17 @@ async fn inventory_files_retire_removed_ips_and_an_emptied_file_retires_its_prov
     assert_eq!(run.state_of("203.0.113.1"), Some(IpState::Candidate));
 
     // no entries left: the file named after the provider still owns it
-    f.write("inventory/oxylabs_isp.toml", "entry = []\n");
+    f.write("inventory/isp_static_port.toml", "entry = []\n");
     run.until(".1 to be retired", |r| {
         r.state_of("203.0.113.1") == Some(IpState::Retired)
     })
     .await;
 
     // a duplicate IP across files is refused as a whole: nothing changes
-    f.write("inventory/oxylabs_isp.toml", &entry("203.0.113.1", 8001));
+    f.write(
+        "inventory/isp_static_port.toml",
+        &entry("203.0.113.1", 8001),
+    );
     f.write("inventory/second.toml", &entry("203.0.113.1", 8009));
     run.until("the duplicate to be refused", |r| {
         r.failed("inventory") == 1
@@ -472,14 +478,17 @@ async fn a_deleted_inventory_file_retires_its_ips_and_bad_inventory_is_refused()
         return Ok(());
     };
     let f = Fixture::with_policy(10)?;
-    f.write("inventory/oxylabs_isp.toml", &entry("203.0.113.1", 8001));
+    f.write(
+        "inventory/isp_static_port.toml",
+        &entry("203.0.113.1", 8001),
+    );
     let run = start(&db, &f, true).await?;
     assert_eq!(run.state_of("203.0.113.1"), Some(IpState::Candidate));
 
     // a provider without an adapter: nothing of the file is stored
     f.write(
         "inventory/ghost.toml",
-        &entry("203.0.113.9", 8009).replace("oxylabs_isp", "ghost"),
+        &entry("203.0.113.9", 8009).replace("isp_static_port", "ghost"),
     );
     run.until("the ghost provider to be refused", |r| {
         r.failed("inventory") == 1
@@ -490,15 +499,15 @@ async fn a_deleted_inventory_file_retires_its_ips_and_bad_inventory_is_refused()
 
     // a rental_end that is not a date: refused, nothing changes
     let dated = |end: &str| format!("{}rental_end = \"{end}\"\n", entry("203.0.113.1", 8001));
-    f.write("inventory/oxylabs_isp.toml", &dated("2026-02-30"));
+    f.write("inventory/isp_static_port.toml", &dated("2026-02-30"));
     run.until("the bad date to be refused", |r| r.failed("inventory") == 1)
         .await;
-    f.write("inventory/oxylabs_isp.toml", &dated("2030-02-28"));
+    f.write("inventory/isp_static_port.toml", &dated("2030-02-28"));
     run.until("the good date to apply", |r| r.failed("inventory") == 0)
         .await;
 
     // the file is deleted: the IP is retired
-    f.remove("inventory/oxylabs_isp.toml");
+    f.remove("inventory/isp_static_port.toml");
     run.until(".1 to be retired", |r| {
         r.state_of("203.0.113.1") == Some(IpState::Retired)
     })
@@ -515,7 +524,10 @@ async fn the_warmer_role_reads_postgres_and_never_applies_git() -> TestResult {
     // the gateway seeds Postgres, then the warmer starts on the same data dir
     drop(start(&db, &f, true).await?);
     f.write("policies/global.toml", &policy(7));
-    f.write("inventory/oxylabs_isp.toml", &entry("203.0.113.1", 8001));
+    f.write(
+        "inventory/isp_static_port.toml",
+        &entry("203.0.113.1", 8001),
+    );
 
     let warmer = start(&db, &f, false).await?;
     tokio::time::sleep(Duration::from_millis(2_500)).await;
@@ -530,7 +542,7 @@ async fn the_warmer_role_reads_postgres_and_never_applies_git() -> TestResult {
             .rx
             .borrow()
             .adapters
-            .get(&"oxylabs_isp".parse()?)
+            .get(&"isp_static_port".parse()?)
             .is_some(),
         "adapters still come from the files"
     );
@@ -638,7 +650,7 @@ async fn age_keeps_growing_while_a_source_is_rejected(
 async fn the_snapshot_age_keeps_growing_while_the_adapters_are_rejected() -> TestResult {
     age_keeps_growing_while_a_source_is_rejected(
         "loaded_age_adapters",
-        "adapters/oxylabs_isp.toml",
+        "adapters/isp_static_port.toml",
         "adapters",
         BROKEN_ADAPTER,
         &adapter_on_other_host(),
@@ -709,7 +721,7 @@ async fn a_git_route_class_applies_once_the_api_one_for_the_provider_is_deleted(
     put_global(&db, 5, "gitops").await?;
     db.put_policies(
         &[doc(
-            "name = \"api-rc\"\nscope = \"route_class\"\nmatch = \"oxylabs_isp\"\nmin_ready = 2\n",
+            "name = \"api-rc\"\nscope = \"route_class\"\nmatch = \"isp_static_port\"\nmin_ready = 2\n",
         )],
         "ops@example.com",
     )

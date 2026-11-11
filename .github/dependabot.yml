@@ -52,3 +52,27 @@ updates:
     groups:
       pip-minor-patch:
         update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      docker-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(docker)"
+    groups:
+      compose-images:
+        patterns: ["*"]

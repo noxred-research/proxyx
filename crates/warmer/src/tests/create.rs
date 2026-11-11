@@ -52,7 +52,7 @@ fn counter(h: &Harness, outcome: &str) -> u64 {
 async fn reconcile_creates_exactly_need_and_never_more_than_the_concurrency() -> TestResult {
     let h = harness!(rotating(rot_policy(6, 6, 2, 600, 600)));
     let p = h.partition("rot")?;
-    h.fake.set_ipify_delay(150);
+    h.fake.set_ip_json_delay(150);
 
     h.reconcile_tick().await;
     assert_eq!(
@@ -73,11 +73,15 @@ async fn reconcile_creates_exactly_need_and_never_more_than_the_concurrency() ->
     }
     let counts = h.counts(&p).await?;
     assert_eq!(counts.ready_free, 6, "{counts:?}");
-    assert_eq!(h.fake.hits("/ipify"), 6, "exactly need creates, no spare");
+    assert_eq!(h.fake.hits("/ip_json"), 6, "exactly need creates, no spare");
     assert!(h.fake.peak_creates() <= 2, "peak {}", h.fake.peak_creates());
 
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 6, "a full partition starts nothing");
+    assert_eq!(
+        h.fake.hits("/ip_json"),
+        6,
+        "a full partition starts nothing"
+    );
     assert_eq!(counter(&h, "ok"), 6);
     Ok(())
 }
@@ -88,7 +92,7 @@ async fn the_rate_bucket_limits_creates_per_minute() -> TestResult {
     let p = h.partition("rot")?;
     h.reconcile().await;
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 2, "refill_rate 2 a minute");
+    assert_eq!(h.fake.hits("/ip_json"), 2, "refill_rate 2 a minute");
     assert_eq!(h.counts(&p).await?.ready_free, 2);
     Ok(())
 }
@@ -98,12 +102,12 @@ async fn the_create_budget_stops_at_one_hundred_percent_and_resumes_next_window(
     let mut h = harness!(rotating(rot_policy(8, 8, 8, 100, 3)));
     h.reconcile().await;
     assert_eq!(
-        h.fake.hits("/ipify"),
+        h.fake.hits("/ip_json"),
         3,
         "three creates an hour pay for three"
     );
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 3, "stopped at 100%");
+    assert_eq!(h.fake.hits("/ip_json"), 3, "stopped at 100%");
     assert!(counter(&h, "budget") >= 1);
 
     // The window ends: the hour counter is gone.
@@ -118,7 +122,7 @@ async fn the_create_budget_stops_at_one_hundred_percent_and_resumes_next_window(
         .await?;
     h.reconcile().await;
     assert_eq!(
-        h.fake.hits("/ipify"),
+        h.fake.hits("/ip_json"),
         6,
         "creates resume with the new window"
     );
@@ -133,11 +137,11 @@ async fn a_budget_at_eighty_percent_slows_creates_to_one_at_a_time() -> TestResu
         .cost_add(&p.provider, 0, 8, OffsetDateTime::now_utc())
         .await?;
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 1, "slow: one create, not four");
+    assert_eq!(h.fake.hits("/ip_json"), 1, "slow: one create, not four");
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 2, "9 of 10 is still slow");
+    assert_eq!(h.fake.hits("/ip_json"), 2, "9 of 10 is still slow");
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 2, "10 of 10 is stopped");
+    assert_eq!(h.fake.hits("/ip_json"), 2, "10 of 10 is stopped");
     Ok(())
 }
 
@@ -156,7 +160,7 @@ async fn a_slow_budget_keeps_one_create_in_flight_per_region_across_ticks() -> T
     h.hot
         .cost_add(&fr.provider, 0, 480, OffsetDateTime::now_utc())
         .await?;
-    h.fake.set_ipify_delay(250);
+    h.fake.set_ip_json_delay(250);
 
     h.w.locks_tick().await;
     let mut most = 0;
@@ -199,10 +203,10 @@ async fn an_open_breaker_stops_creates_and_closes_after_passes() -> TestResult {
             .get(),
         2
     );
-    let attempts = h.fake.hits("/ipify") + counter(&h, "failed");
+    let attempts = h.fake.hits("/ip_json") + counter(&h, "failed");
     h.reconcile().await;
     assert_eq!(
-        h.fake.hits("/ipify") + counter(&h, "failed"),
+        h.fake.hits("/ip_json") + counter(&h, "failed"),
         attempts,
         "an open breaker starts no create"
     );
@@ -249,7 +253,7 @@ async fn max_ready_caps_leased_sessions_too() -> TestResult {
         (1, 1),
         "min_ready 2 = max_ready 2: a leased session fills a slot, no third create: {counts:?}"
     );
-    assert_eq!(h.fake.hits("/ipify"), 2);
+    assert_eq!(h.fake.hits("/ip_json"), 2);
     Ok(())
 }
 
@@ -294,7 +298,7 @@ async fn a_paused_route_class_starts_no_creates_until_resumed() -> TestResult {
     let p = h.partition("rot")?;
     h.hot.warm_pause(&p, Duration::from_secs(60)).await?;
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 0, "a failed canary pauses warming");
+    assert_eq!(h.fake.hits("/ip_json"), 0, "a failed canary pauses warming");
     assert!(h.hot.warm_resume(&p).await?);
     h.reconcile().await;
     assert_eq!(h.counts(&p).await?.ready_free, 2);
@@ -311,7 +315,7 @@ async fn a_partition_locked_by_another_replica_is_left_alone() -> TestResult {
             .await?
     );
     h.reconcile().await;
-    assert_eq!(h.fake.hits("/ipify"), 0);
+    assert_eq!(h.fake.hits("/ip_json"), 0);
     assert!(h.hot.lock_release(&p, "other-replica").await?);
     h.reconcile().await;
     assert_eq!(

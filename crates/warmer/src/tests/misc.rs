@@ -564,11 +564,11 @@ fn score(source: &str, risk: u8, secs: i64) -> ScoreRow {
 fn score_rows_become_checks_oldest_first() {
     // The store returns each service's newest first.
     let rows = [
-        score("abuseipdb", 30, 3),
-        score("abuseipdb", 20, 2),
-        score("ipqs", 90, 3),
-        score("ipqs", 80, 2),
-        score("ipqs", 70, 1),
+        score("abuse_confidence", 30, 3),
+        score("abuse_confidence", 20, 2),
+        score("fraud_score", 90, 3),
+        score("fraud_score", 80, 2),
+        score("fraud_score", 70, 1),
         score("nonsense", 99, 3),
     ];
     let checks = checks_from(&rows, 3);

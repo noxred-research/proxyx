@@ -188,11 +188,11 @@ mod tests {
             let (sql, binds) = lower(
                 col,
                 &StringFilter::Contains {
-                    value: "Stripe".to_string(),
+                    value: "Spayco".to_string(),
                 },
             );
             assert_eq!(sql, format!("lower({name}) LIKE lower(?)"));
-            assert_eq!(binds, vec!["%Stripe%"]);
+            assert_eq!(binds, vec!["%Spayco%"]);
         }
     }
 
@@ -264,18 +264,18 @@ mod tests {
             &StringFilter::All {
                 filters: NonEmpty(vec![
                     StringFilter::Contains {
-                        value: "stripe".to_string(),
+                        value: "spayco".to_string(),
                     },
                     StringFilter::Not {
                         filter: Box::new(StringFilter::Exact {
-                            value: "test.stripe.com".to_string(),
+                            value: "test.spayco.example".to_string(),
                         }),
                     },
                 ]),
             },
         );
         assert_eq!(sql, "(lower(host) LIKE lower(?) AND NOT (host = ?))");
-        assert_eq!(binds, vec!["%stripe%", "test.stripe.com"]);
+        assert_eq!(binds, vec!["%spayco%", "test.spayco.example"]);
     }
 
     #[test]

@@ -426,7 +426,7 @@ async fn the_replacement_rule_emits_one_report_per_ip_per_day() -> TestResult {
     let mut h = harness!(start_scored());
     let log = LogCapture::start();
     available(&h, 70).await?;
-    seed_scores(&h, 70, &["ipqs", "abuseipdb"], 90).await?;
+    seed_scores(&h, 70, &["fraud_score", "abuse_confidence"], 90).await?;
     h.static_tick().await;
     let row = h.row(ip(70)).await?;
     assert_eq!(row.state, IpState::ReplaceRequested);
@@ -560,7 +560,7 @@ async fn a_failed_read_does_not_use_up_the_days_replacement_report() -> TestResu
 async fn one_noisy_service_does_not_replace_an_ip() -> TestResult {
     let h = harness!(start_scored());
     available(&h, 80).await?;
-    seed_scores(&h, 80, &["ipqs"], 99).await?;
+    seed_scores(&h, 80, &["fraud_score"], 99).await?;
     h.static_tick().await;
     assert_eq!(h.row(ip(80)).await?.state, IpState::Available);
     Ok(())

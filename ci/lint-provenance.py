@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provenance gate: fail when a tracked file names a retired identifier.
+"""Provenance gate: fail when a tracked file carries a reference that must not be public.
 
 ProxyX does not reference the names of systems or organisations its code came from. Those
 names cannot be listed here without defeating the rule, so the gate stores only the SHA-256
@@ -7,9 +7,23 @@ of each lowercase token and compares every word of every tracked file against th
 split on non-alphanumerics and on lower-to-upper camel-case boundaries, so `foo_bar`,
 `FooBar`, `foo-bar` and `FOO_BAR` are all checked.
 
-Two more rules reject internal ticket identifiers (`ABC-123` style references with the known
-tracker prefixes) and citations of internal design records or review findings, which carry no
-meaning for readers of the public repository.
+Further rules reject:
+
+* internal ticket identifiers (`ABC-123` style references with the known tracker prefixes) and
+  citations of internal design records or review findings, which carry no meaning for readers
+  of the public repository;
+* `third-party-name`: names of third-party products, services and vendors (proxy providers, IP
+  reputation and echo services, anti-bot and CAPTCHA vendors, LLM vendors and tools, browser
+  automation libraries, search engines). Integrations keep working under neutral names. A line
+  carrying the marker `wire-compat` (an exact string an external service or client needs: a
+  default host, a request or reply field, a command) or `detection-data` (a string matched on
+  target sites) is allowed, and so is the line directly below a marked line, for a statement a
+  raw string or formatter keeps from carrying a trailing comment. Dependency manifests, `use`
+  and `import` lines, license attributions, `deny.toml`, lock files and this file are exempt;
+* `host-path`: absolute paths of a developer machine (a tmp, cache or workspace directory
+  under `/data`, or a user's home directory);
+* `privileged-pr-trigger`: the privileged fork-PR workflow trigger, which this repository does
+  not use.
 
 Usage: ci/lint-provenance.py [PATH ...]   (default: every file `git ls-files` lists)
 Exit status: 0 clean, 1 on any hit. Hits print as `file:line: [rule]` without the matched
@@ -40,6 +54,36 @@ CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 SKIP_SUFFIXES = {".png", ".jpg", ".ico", ".der", ".woff", ".woff2", ".gz", ".zip"}
 SKIP_NAMES = {"Cargo.lock", "package-lock.json", "uv.lock"}
 
+# Third-party products, services and vendors (matched case-insensitively, anywhere in a line).
+THIRD_PARTY = re.compile(
+    r"oxylabs|bright[ _-]?data|luminati|iproyal|webshare|decodo|smartproxy|soax|netnut|geonode"
+    r"|rayobyte|zyte|scrapingbee|scraperapi|apify"
+    r"|ipqs|ipqualityscore|abuseipdb|scamalytics|x4bnet|ipinfo|ifconfig\.co|ifconfig_co|ipify"
+    r"|maxmind|ip2location"
+    r"|cloudflare|datadome|perimeterx|akamai|imperva|incapsula|sucuri|kasada"
+    r"|recaptcha|hcaptcha|turnstile|capsolver|2captcha"
+    r"|openai|anthropic|chatgpt|claude|ollama|vllm|openrouter|gemini|mistral|deepseek|windsurf"
+    r"|playwright|puppeteer|selenium|patchright|chromium"
+    r"|cf-mitigated|cf-chl|px-captcha|captcha-delivery|superproxy|cdn-cgi"
+    r"|google|gstatic|stripe",
+    re.IGNORECASE,
+)
+MARKER = re.compile(r"wire-compat|detection-data")
+# `use` and `import` lines name the dependency they load.
+IMPORT = re.compile(r"^\s*(?:(?:pub(?:\([a-z]+\))?\s+)?use\s|extern\s+crate\s|import\s|from\s+\S+\s+import\s)")
+# Dependency manifests, license attributions and this file.
+EXEMPT_NAMES = {
+    "THIRD_PARTY_NOTICES.md",
+    "CODE_OF_CONDUCT.md",
+    "deny.toml",
+    "Cargo.toml",
+    "pyproject.toml",
+    "package.json",
+    "lint-provenance.py",
+}
+HOST_PATH = re.compile(r"/data/(?:tmp|cache|workspace)|/home/[a-z]")
+PRIVILEGED_TRIGGER = re.compile(r"pull_request_targe[t]")
+
 
 def tokens(line: str):
     for word in WORD.findall(line):
@@ -50,6 +94,11 @@ def tokens(line: str):
 
 def retired(token: str) -> bool:
     return hashlib.sha256(token.encode()).hexdigest() in RETIRED
+
+
+def third_party_exempt(path: Path) -> bool:
+    name = path.name
+    return name in EXEMPT_NAMES or name.startswith("LICENSE") or re.fullmatch(r"requirements.*\.txt", name) is not None
 
 
 def files(args: list[str]) -> list[Path]:
@@ -68,7 +117,20 @@ def main(argv: list[str]) -> int:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        for number, line in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        marked = [bool(MARKER.search(line)) for line in lines]
+        check_third_party = not third_party_exempt(path)
+        for number, line in enumerate(lines, 1):
+            if check_third_party and THIRD_PARTY.search(line) and not IMPORT.match(line):
+                if not (marked[number - 1] or (number > 1 and marked[number - 2])):
+                    print(f"{path}:{number}: [third-party-name]")
+                    hits += 1
+            if HOST_PATH.search(line):
+                print(f"{path}:{number}: [host-path]")
+                hits += 1
+            if PRIVILEGED_TRIGGER.search(line):
+                print(f"{path}:{number}: [privileged-pr-trigger]")
+                hits += 1
             if any(retired(t) for t in tokens(line)):
                 print(f"{path}:{number}: [retired-name]")
                 hits += 1
@@ -80,6 +142,9 @@ def main(argv: list[str]) -> int:
                 hits += 1
         if any(retired(t) for t in tokens(str(path))):
             print(f"{path}: [retired-name in path]")
+            hits += 1
+        if check_third_party and THIRD_PARTY.search(str(path)):
+            print(f"{path}: [third-party-name in path]")
             hits += 1
     if hits:
         print(f"lint-provenance: {hits} hit(s)", file=sys.stderr)

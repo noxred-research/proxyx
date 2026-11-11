@@ -423,7 +423,7 @@ async fn rentals_scores_blocks_budget_and_leases_are_read_from_the_stores() -> T
     for (ip, risk) in f.ips.iter().zip([90u8, 80, 85, 10]) {
         f.db.record_score(&ScoreRow {
             ip: *ip,
-            source: "ipqs".into(),
+            source: "fraud_score".into(),
             risk,
             flags: vec![],
             checked_at: now,

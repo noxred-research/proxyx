@@ -1024,7 +1024,7 @@ impl Session {
         Ok(ProxyEnv::new(self.proxy_url(), path))
     }
 
-    /// Chromium arguments: `--proxy-server=<proxy url>`. See [`env::browser_args`].
+    /// Chrome-family browser arguments: `--proxy-server=<proxy url>`. See [`env::browser_args`].
     pub fn browser_args(&self) -> Vec<String> {
         env::browser_args(self.proxy_url())
     }

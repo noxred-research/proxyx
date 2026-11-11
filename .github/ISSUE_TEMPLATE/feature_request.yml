@@ -6,9 +6,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the idea. Check the [roadmap](https://github.com/noxred-research/proxyx/blob/main/CHANGELOG.md) first; the item may already be
-        planned. Features that change what the crawler may fetch, click, submit or store are reviewed against
-        the [security policy](https://github.com/noxred-research/proxyx/blob/main/SECURITY.md).
+        Thanks for the idea. Check the [changelog](https://github.com/noxred-research/proxyx/blob/main/CHANGELOG.md) and existing issues
+        first; it may already exist or be planned. Features that change what ProxyX routes, intercepts, stores or
+        sends to a third party are reviewed against the [security policy](https://github.com/noxred-research/proxyx/blob/main/SECURITY.md).
   - type: textarea
     id: problem
     attributes:

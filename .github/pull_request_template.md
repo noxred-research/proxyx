@@ -4,7 +4,7 @@
 
 ## How it was verified
 
-<!-- Exact commands and their result, e.g. `cargo nextest run -p proxyx-gateway`. -->
+<!-- Exact commands and their result, e.g. `cargo test -p proxyx-gateway`. -->
 
 ## Checklist
 

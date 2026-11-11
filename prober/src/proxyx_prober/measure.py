@@ -22,7 +22,7 @@ class LoadFailed(Exception):
     """The navigation failed before a document loaded (proxy, DNS, TLS, reset)."""
 
 
-#: Chromium's names for a proxy that refused the credentials: the probe
+#: The browser's names for a proxy that refused the credentials: the probe
 #: listener answers a key it does not know with ``407``.
 _PROXY_AUTH_ERRORS = (
     "ERR_INVALID_AUTH_CREDENTIALS",
@@ -105,7 +105,7 @@ def result_from_load(target: str, run: int, load: PageLoad) -> RunResult:
     """Classify a loaded document: blocked, an HTTP error, or ok."""
 
     # Plain HTTP proxy authentication can load a 407 document instead of
-    # raising Chromium's proxy-auth navigation error. Neither measures a route.
+    # raising the browser's proxy-auth navigation error. Neither measures a route.
     if load.status == 407:
         raise ProxyCredentialsRejected("proxy refused probe token: HTTP 407")
     reason = detect_block(load.status, load.final_url, load.headers, load.body)

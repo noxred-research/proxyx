@@ -32,7 +32,7 @@ that need them are behind features of the crate (see [Commands](#commands)).
 | File | Group | What it times |
 |---|---|---|
 | `pool_micro` | `username_parse` | `InboundOptions::parse`: the `px-...` username grammar of [gateway.md](gateway.md#username-grammar), for a bare name, a region, a full option set, a sticky static name and two refusals. |
-| `pool_micro` | `recipe_render` | `Adapter::recipe`: the shipped `oxylabs_res` adapter for a rotating country and a strict rotating city lease, and the shipped `oxylabs_isp` adapter for an inventory entry ([providers.md](providers.md#the-deterministic-recipe)). |
+| `pool_micro` | `recipe_render` | `Adapter::recipe`: the shipped `res_user_suffix` adapter for a rotating country and a strict rotating city lease, and the shipped `isp_static_port` adapter for an inventory entry ([providers.md](providers.md#the-deterministic-recipe)). |
 | `pool_micro` | `destination_denial` | `is_denied_destination`: the rule that refuses private, loopback, link-local and internal targets ([gateway.md](gateway.md#denied-destinations)), for public and denied names and for IP spellings. |
 | `limiter_micro` | `token_bucket` | `TokenBucket::consume` in process, allowed and denied. |
 | `limiter_micro` | `limiter_loopback` | The limiter client against a real `proxyx-limiter-server` started in the bench process on loopback: one consume per round trip through the pooled client, and batches of 1, 32 and 256 consumes by handle on one connection. |

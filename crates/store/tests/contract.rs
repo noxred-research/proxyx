@@ -78,7 +78,7 @@ blocks.newest first: true
 blocks.targets lowercased: 0
 blocks.window excludes the future: 0
 blocks.window includes its own start: 5
-scores.two newest per source: abuse:50,abuse:40,ipqs:30,ipqs:20
+scores.two newest per source: abuse:50,abuse:40,fraud_score:30,fraud_score:20
 scores.flags round trip: true
 scores.highest of the latest per source: 50
 scores.over 100: invalid
@@ -355,7 +355,7 @@ fn doc(name: &str, min_ready: u32) -> PolicyDoc {
     PolicyDoc {
         name: name.to_owned(),
         scope: Scope::RouteClass,
-        target: Some("oxylabs_isp".into()),
+        target: Some("isp_static_port".into()),
         min_ready: Some(min_ready),
         ..PolicyDoc::default()
     }
@@ -581,9 +581,9 @@ async fn blocks_and_scores(db: &Db, t: &mut Transcript) -> TestResult {
     let sip = uniq_ip();
     let same = now - Duration::from_secs(10);
     for (source, risk, at) in [
-        ("ipqs", 10, same - Duration::from_secs(60)),
-        ("ipqs", 20, same),
-        ("ipqs", 30, same),
+        ("fraud_score", 10, same - Duration::from_secs(60)),
+        ("fraud_score", 20, same),
+        ("fraud_score", 30, same),
         ("abuse", 40, same),
         ("abuse", 50, same),
     ] {
@@ -788,7 +788,7 @@ async fn audit(db: &Db, raw: &Raw, t: &mut Transcript) -> TestResult {
         .await?;
     }
     raw.execute(
-        "INSERT INTO ip_scores (ip, source, risk, checked_at) VALUES (?, 'ipqs', 10, ?)",
+        "INSERT INTO ip_scores (ip, source, risk, checked_at) VALUES (?, 'fraud_score', 10, ?)",
         &[ip.as_str().into(), old.into()],
     )
     .await?;

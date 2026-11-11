@@ -2,25 +2,25 @@
 //!
 //! A scorer is on when its key file exists in `secrets_dir`. With none on,
 //! `Reputation` has no slots and the policy's `on_score_unavailable` applies.
-//! Each scorer calls the vendor origin unless `ipqs_base_url`,
-//! `abuseipdb_base_url` or `scamalytics_base_url` points it at a stand-in.
-//! Scamalytics also needs `scamalytics_customer`, its account name.
+//! Each scorer calls its service origin unless `fraud_score_base_url`,
+//! `abuse_confidence_base_url` or `proxy_risk_base_url` points it at a stand-in.
+//! The proxy-risk scorer also needs `proxy_risk_customer`, its account name.
 
 use anyhow::Context as _;
 use common::Secret;
 use common::config::Settings;
 use verify::{Scorer, ScorerAccount, ScorerSlot};
 
-const IPQS_KEY_FILE: &str = "ipqs_api_key";
-const ABUSEIPDB_KEY_FILE: &str = "abuseipdb_api_key";
-const SCAMALYTICS_KEY_FILE: &str = "scamalytics_api_key";
+const FRAUD_SCORE_KEY_FILE: &str = "fraud_score_api_key";
+const ABUSE_CONFIDENCE_KEY_FILE: &str = "abuse_confidence_api_key";
+const PROXY_RISK_KEY_FILE: &str = "proxy_risk_api_key";
 
 /// Lookups per UTC day, kept under the free plans of both services.
-/// Assumption: IPQS free is about 1000 a month, AbuseIPDB free 1000 a day.
-const IPQS_DAILY_BUDGET: u32 = 30;
-const ABUSEIPDB_DAILY_BUDGET: u32 = 900;
-/// Assumption: the Scamalytics entry plan is about 500 lookups a month.
-const SCAMALYTICS_DAILY_BUDGET: u32 = 15;
+/// Assumption: the fraud-score free plan is about 1000 a month, the abuse-confidence free plan 1000 a day.
+const FRAUD_SCORE_DAILY_BUDGET: u32 = 30;
+const ABUSE_CONFIDENCE_DAILY_BUDGET: u32 = 900;
+/// Assumption: the proxy-risk entry plan is about 500 lookups a month.
+const PROXY_RISK_DAILY_BUDGET: u32 = 15;
 
 /// The scorers whose key file is present.
 ///
@@ -28,39 +28,39 @@ const SCAMALYTICS_DAILY_BUDGET: u32 = 15;
 /// is a startup error, not a silently missing scorer.
 pub(crate) fn slots(settings: &Settings) -> anyhow::Result<Vec<ScorerSlot>> {
     let mut slots = Vec::new();
-    if let Some(key) = key(settings, IPQS_KEY_FILE)? {
+    if let Some(key) = key(settings, FRAUD_SCORE_KEY_FILE)? {
         slots.push(ScorerSlot {
-            scorer: Scorer::Ipqs(ScorerAccount {
-                base_url: settings.ipqs_base_url.clone(),
+            scorer: Scorer::FraudScore(ScorerAccount {
+                base_url: settings.fraud_score_base_url.clone(),
                 key,
             }),
-            daily_budget: IPQS_DAILY_BUDGET,
+            daily_budget: FRAUD_SCORE_DAILY_BUDGET,
         });
     }
-    if let Some(key) = key(settings, ABUSEIPDB_KEY_FILE)? {
+    if let Some(key) = key(settings, ABUSE_CONFIDENCE_KEY_FILE)? {
         slots.push(ScorerSlot {
-            scorer: Scorer::AbuseIpdb(ScorerAccount {
-                base_url: settings.abuseipdb_base_url.clone(),
+            scorer: Scorer::AbuseConfidence(ScorerAccount {
+                base_url: settings.abuse_confidence_base_url.clone(),
                 key,
             }),
-            daily_budget: ABUSEIPDB_DAILY_BUDGET,
+            daily_budget: ABUSE_CONFIDENCE_DAILY_BUDGET,
         });
     }
-    if let Some(key) = key(settings, SCAMALYTICS_KEY_FILE)? {
+    if let Some(key) = key(settings, PROXY_RISK_KEY_FILE)? {
         let customer = settings
-            .scamalytics_customer
+            .proxy_risk_customer
             .as_deref()
             .filter(|name| !name.is_empty())
-            .context("scamalytics_api_key exists but scamalytics_customer is not set")?;
+            .context("proxy_risk_api_key exists but proxy_risk_customer is not set")?;
         slots.push(ScorerSlot {
-            scorer: Scorer::Scamalytics {
+            scorer: Scorer::ProxyRisk {
                 account: ScorerAccount {
-                    base_url: settings.scamalytics_base_url.clone(),
+                    base_url: settings.proxy_risk_base_url.clone(),
                     key,
                 },
                 customer: customer.to_owned(),
             },
-            daily_budget: SCAMALYTICS_DAILY_BUDGET,
+            daily_budget: PROXY_RISK_DAILY_BUDGET,
         });
     }
     Ok(slots)
@@ -96,14 +96,14 @@ mod tests {
 
     #[test]
     fn only_scorers_with_a_key_file_are_on() {
-        let (settings, dir) = settings_with(&[("abuseipdb_api_key", "k\n")]);
+        let (settings, dir) = settings_with(&[("abuse_confidence_api_key", "k\n")]);
         let kinds: Vec<_> = slots(&settings)
             .expect("slots")
             .iter()
             .map(|s| s.scorer.kind())
             .collect();
         std::fs::remove_dir_all(dir).expect("clean up");
-        assert_eq!(kinds, [ScorerKind::AbuseIpdb]);
+        assert_eq!(kinds, [ScorerKind::AbuseConfidence]);
     }
 
     #[test]
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn an_empty_key_file_is_a_startup_error() {
-        let (settings, dir) = settings_with(&[("ipqs_api_key", "\n")]);
+        let (settings, dir) = settings_with(&[("fraud_score_api_key", "\n")]);
         let got = slots(&settings);
         std::fs::remove_dir_all(dir).expect("clean up");
         assert!(got.is_err());
@@ -127,36 +127,41 @@ mod tests {
             .expect("slots")
             .into_iter()
             .map(|slot| match slot.scorer {
-                Scorer::Ipqs(account) | Scorer::AbuseIpdb(account) => account.base_url,
-                Scorer::Scamalytics { account, .. } => account.base_url,
+                Scorer::FraudScore(account) | Scorer::AbuseConfidence(account) => account.base_url,
+                Scorer::ProxyRisk { account, .. } => account.base_url,
             })
             .collect()
     }
 
     #[test]
     fn scorers_call_the_vendors_unless_an_origin_is_configured() {
-        let (mut settings, dir) =
-            settings_with(&[("ipqs_api_key", "k1\n"), ("abuseipdb_api_key", "k2\n")]);
+        let (mut settings, dir) = settings_with(&[
+            ("fraud_score_api_key", "k1\n"),
+            ("abuse_confidence_api_key", "k2\n"),
+        ]);
         let default = base_urls(&settings);
-        settings.ipqs_base_url = "http://127.0.0.1:9".to_owned();
-        settings.abuseipdb_base_url = "http://stand-in.test".to_owned();
+        settings.fraud_score_base_url = "http://127.0.0.1:9".to_owned();
+        settings.abuse_confidence_base_url = "http://stand-in.test".to_owned();
         let configured = base_urls(&settings);
         std::fs::remove_dir_all(dir).expect("clean up");
 
         assert_eq!(
             default,
-            ["https://ipqualityscore.com", "https://api.abuseipdb.com"]
+            [
+                "https://ipqualityscore.com", // wire-compat: public origin
+                "https://api.abuseipdb.com"   // wire-compat: public origin
+            ]
         );
         assert_eq!(configured, ["http://127.0.0.1:9", "http://stand-in.test"]);
     }
 
-    /// `check=scamalytics` used to be impossible to produce.
+    /// `check=proxy_risk` used to be impossible to produce.
     #[test]
-    fn scamalytics_is_on_with_a_key_file_and_a_customer() {
-        let (mut settings, dir) = settings_with(&[("scamalytics_api_key", "k3\n")]);
-        settings.scamalytics_customer = Some("acme".to_owned());
+    fn proxy_risk_is_on_with_a_key_file_and_a_customer() {
+        let (mut settings, dir) = settings_with(&[("proxy_risk_api_key", "k3\n")]);
+        settings.proxy_risk_customer = Some("acme".to_owned());
         let default = slots(&settings).expect("slots");
-        settings.scamalytics_base_url = "http://127.0.0.1:9".to_owned();
+        settings.proxy_risk_base_url = "http://127.0.0.1:9".to_owned();
         let configured = slots(&settings).expect("slots");
         std::fs::remove_dir_all(dir).expect("clean up");
 
@@ -164,15 +169,15 @@ mod tests {
             slots
                 .into_iter()
                 .map(|slot| match slot.scorer {
-                    Scorer::Scamalytics { account, customer } => (account.base_url, customer),
-                    other => panic!("not a Scamalytics slot: {:?}", other.kind()),
+                    Scorer::ProxyRisk { account, customer } => (account.base_url, customer),
+                    other => panic!("not a proxy-risk slot: {:?}", other.kind()),
                 })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
             parts(default),
             [(
-                "https://api12.scamalytics.com".to_owned(),
+                "https://api12.scamalytics.com".to_owned(), // wire-compat: public origin
                 "acme".to_owned()
             )]
         );
@@ -183,12 +188,12 @@ mod tests {
     }
 
     #[test]
-    fn a_scamalytics_key_without_a_customer_is_a_startup_error() {
-        let (settings, dir) = settings_with(&[("scamalytics_api_key", "k3\n")]);
+    fn a_proxy_risk_key_without_a_customer_is_a_startup_error() {
+        let (settings, dir) = settings_with(&[("proxy_risk_api_key", "k3\n")]);
         let got = slots(&settings);
         std::fs::remove_dir_all(dir).expect("clean up");
         let error = format!("{:#}", got.expect_err("no customer"));
-        assert!(error.contains("scamalytics_customer"), "{error}");
+        assert!(error.contains("proxy_risk_customer"), "{error}");
     }
 
     #[tokio::test]
@@ -212,8 +217,8 @@ mod tests {
             String::from_utf8_lossy(&head[..read]).into_owned()
         });
 
-        let (mut settings, dir) = settings_with(&[("ipqs_api_key", "stand-in-key\n")]);
-        settings.ipqs_base_url = origin;
+        let (mut settings, dir) = settings_with(&[("fraud_score_api_key", "stand-in-key\n")]);
+        settings.fraud_score_base_url = origin;
         let slot = slots(&settings).expect("slots").remove(0);
         std::fs::remove_dir_all(dir).expect("clean up");
         let score = slot

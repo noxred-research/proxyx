@@ -85,11 +85,11 @@ Clients choose per lease with the username options `ttl` (session lifetime, boun
 | `tcp_keepalive_retries` | `PROXYX_POOL_TCP_KEEPALIVE_RETRIES` | `4` | Unanswered probes before disconnect; positive when enabled. |
 | `handshake_timeout` | `PROXYX_POOL_HANDSHAKE_TIMEOUT` | `10s` | Deadline to complete the client HTTP head or SOCKS negotiation; positive. |
 | `first_byte_timeout` | `PROXYX_POOL_FIRST_BYTE_TIMEOUT` | `3s` | New client silence limit; positive and no greater than `handshake_timeout`. |
-| `exit_ip_services` | `PROXYX_POOL_EXIT_IP_SERVICES` | unset (public services) | Comma list of `kind=url` that replaces the public exit-IP check services, for an isolated environment. It needs at least one of `cloudflare`, `ipinfo`, `ifconfig_co`, because only those report the exit country. |
-| `ipqs_base_url` | `PROXYX_POOL_IPQS_BASE_URL` | `https://ipqualityscore.com` | Origin of the IPQS reputation API. |
-| `abuseipdb_base_url` | `PROXYX_POOL_ABUSEIPDB_BASE_URL` | `https://api.abuseipdb.com` | Origin of the AbuseIPDB reputation API. |
-| `scamalytics_base_url` | `PROXYX_POOL_SCAMALYTICS_BASE_URL` | `https://api12.scamalytics.com` | Origin of the Scamalytics API. |
-| `scamalytics_customer` | `PROXYX_POOL_SCAMALYTICS_CUSTOMER` | unset | Scamalytics account name. Required when the `scamalytics_api_key` secret exists. |
+| `exit_ip_services` | `PROXYX_POOL_EXIT_IP_SERVICES` | unset (public services) | Comma list of `kind=url` that replaces the public exit-IP check services, for an isolated environment. It needs at least one of `trace_lines`, `ip_country_json`, `ip_country_iso_json`, because only those report the exit country. |
+| `fraud_score_base_url` | `PROXYX_POOL_FRAUD_SCORE_BASE_URL` | the service's public origin | Origin of the fraud-score reputation API. |
+| `abuse_confidence_base_url` | `PROXYX_POOL_ABUSE_CONFIDENCE_BASE_URL` | the service's public origin | Origin of the abuse-confidence reputation API. |
+| `proxy_risk_base_url` | `PROXYX_POOL_PROXY_RISK_BASE_URL` | the service's public origin | Origin of the proxy-risk API. |
+| `proxy_risk_customer` | `PROXYX_POOL_PROXY_RISK_CUSTOMER` | unset | ProxyRisk account name. Required when the `proxy_risk_api_key` secret exists. |
 | `json_logs` | `PROXYX_POOL_JSON_LOGS` | `true` | JSON log lines; plain text when false. |
 | `sentry.dsn` | `PROXYX_POOL_SENTRY__DSN` | unset (off) | Sentry DSN. A malformed DSN is refused at start. |
 | `sentry.environment` | `PROXYX_POOL_SENTRY__ENVIRONMENT` | `development` | Environment tag of events. |
@@ -108,7 +108,7 @@ The gateway publishes readiness only after its first configuration snapshot and 
 | `admin-token` (path from `admin_token_file`) | gateway | Bearer token of the operator routes of the control API. |
 | `prober-token` | gateway | Bearer token of the prober, for `/v1/probe/*`. A separate secret from the admin token. |
 | `probe-key` (path from `probe_key_file`) | gateway | HMAC key for probe tokens. |
-| `ipqs_api_key`, `abuseipdb_api_key`, `scamalytics_api_key` | gateway, warmer | Each file that exists turns on that reputation scorer. With no file, no scorer runs. |
+| `fraud_score_api_key`, `abuse_confidence_api_key`, `proxy_risk_api_key` | gateway, warmer | Each file that exists turns on that reputation scorer. With no file, no scorer runs. |
 | files named by adapters and inventory entries | gateway, warmer | Provider logins. A missing or empty file fails the whole adapter load. |
 
 ### Environment outside the settings

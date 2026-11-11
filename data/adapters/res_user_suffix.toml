@@ -1,26 +1,25 @@
-# Oxylabs Residential. Grammar verified 2026-11-11; conservative 30-minute cap:
+# Residential, username suffix with a country, city, session id and session minutes.
+# Grammar verified 2026-11-11; conservative 30-minute cap:
 #   customer-{user}-cc-{CC}[-city-{city}]-sessid-{id}-sesstime-{min}
 # `sessid_oneip` replaces `sessid` for a strict session (502 instead of a new IP).
-# https://developers.oxylabs.io/products/proxies/residential-proxies/session-control
 # Target ports are limited to 80 and 443 (answer: 403 port_not_allowed).
-# https://developers.oxylabs.io/products/proxies/residential-proxies/protocols
 
 [[adapter]]
-id = "oxylabs_res"
+id = "res_user_suffix"
 kind = "rotating"
 subtype = "residential"
 scheme = "http"
-host = "pr.oxylabs.io"
+host = "pr.oxylabs.io" # wire-compat: the provider gateway
 port = 7777
-user_file = "oxylabs_res_user"
-pass_file = "oxylabs_res_pass"
+user_file = "res_user_suffix_user"
+pass_file = "res_user_suffix_pass"
 user = "customer-{base_user}{opts}"
 pass = "{base_pass}"
 allowed_ports = [80, 443]
 # Explicitly cap local/provider sessions at 30 minutes. The provider's current
 # plan-specific maximum can be higher; this example intentionally stays shorter.
 max_session_minutes = 30
-echo_url = "https://ip.oxylabs.io"
+echo_url = "https://ip.oxylabs.io" # wire-compat: the provider echo
 
 [[adapter.option]]
 name = "country"

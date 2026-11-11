@@ -159,7 +159,7 @@ async fn the_sweep_prunes_scores_past_their_retention() -> TestResult {
     for age_days in [400, 1] {
         h.db.record_score(&ScoreRow {
             ip: subject,
-            source: "ipqs".into(),
+            source: "fraud_score".into(),
             risk: 10,
             flags: vec![],
             checked_at: OffsetDateTime::now_utc() - time::Duration::days(age_days),

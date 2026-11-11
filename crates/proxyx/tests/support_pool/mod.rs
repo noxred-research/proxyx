@@ -225,9 +225,9 @@ async fn serve(
         }
     }
     // Plain HTTP through the proxy: the IP-check stub services.
-    let (content_type, body) = if uri.contains("/cloudflare") {
+    let (content_type, body) = if uri.contains("/trace_lines") {
         ("text/plain", format!("ip={ip}\nloc=FR\n"))
-    } else if uri.contains("/ipinfo") {
+    } else if uri.contains("/ip_country") {
         (
             "application/json",
             format!(r#"{{"ip":"{ip}","country":"FR"}}"#),

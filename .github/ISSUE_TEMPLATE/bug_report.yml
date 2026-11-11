@@ -29,7 +29,11 @@ body:
         - Providers, policies or inventory
         - Session proxy (interception, capture)
         - Control plane (sessions API, query, GraphQL, exports)
-        - Capture ingest (broker, ClickHouse)
+        - Capture ingest and stores (broker, ClickHouse, OpenSearch)
+        - Edge proxy
+        - MCP server or AI tools
+        - Prober
+        - Rust client library
         - Rate-limit service
         - Authentication, destination denial or secrets
         - Deployment (Docker, Compose)
@@ -44,7 +48,8 @@ body:
       options:
         - From source
         - Docker Compose
-        - Helm or Kubernetes
+        - Kubernetes or another orchestrator
+        - systemd (edge proxy)
         - Other
     validations:
       required: true
@@ -75,14 +80,14 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS and architecture, Rust version if built from source, Chromium build if the browser plane is involved, PostgreSQL version if the API or worker is involved.
+      description: OS and architecture, Rust version if built from source, the database (PostgreSQL, MariaDB or SQLite) and Redis or Valkey versions, the capture store and broker if capture is involved, and the browser version if the prober is involved.
     validations:
       required: false
   - type: textarea
     id: logs
     attributes:
       label: Relevant logs
-      description: Redacted log lines. Run with `--verbose` or `RUST_LOG=debug` for more detail.
+      description: Redacted log lines. Run with `RUST_LOG=debug` for more detail.
       render: shell
     validations:
       required: false

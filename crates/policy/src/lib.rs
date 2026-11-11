@@ -11,9 +11,9 @@
 //! [[policy]]
 //! name = "fr-web"                  # unique across all files
 //! scope = "route_class"            # global (default) | route_class | org
-//! match = "oxylabs_isp"            # provider id (route_class) or org id (org)
+//! match = "isp_static_port"            # provider id (route_class) or org id (org)
 //! kinds = ["static", "rotating"]   # preference order
-//! providers = ["oxylabs_isp"]      # priority order; unset: every configured provider
+//! providers = ["isp_static_port"]      # priority order; unset: every configured provider
 //! regions = ["fr/paris", "fr"]     # fallback order; required after merging
 //! pool = "shared"                  # only "shared": "private" is refused (use a customer upstream)
 //! min_ready = 10                   # per region; static: healthy IPs

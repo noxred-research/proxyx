@@ -75,7 +75,7 @@ fn table_of_usernames() {
         "px-cc-fr",
         "px-cc-fr-city-paris",
         "px-city-paris-cc-fr",
-        "px-prov-oxylabs_isp",
+        "px-prov-isp_static_port",
         "px-ttl-30",
         "px-ttl-30s",
         "px-ttl-5m",

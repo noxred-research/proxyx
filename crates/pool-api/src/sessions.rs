@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn sticky_options_round_trip_with_unique_uuid_ids() {
         let body = body(json!({"kind":"rotating","country":"US","city":"New_York",
-            "provider":"webshare","rotation":"sticky","ttl":"5m","strict":true}));
+            "provider":"res_zone","rotation":"sticky","ttl":"5m","strict":true}));
         let generator = Generator::new(&body).expect("generator");
         let sid = Uuid::new_v4().simple().to_string();
         let username = generator.username(Some(&sid));

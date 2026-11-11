@@ -61,12 +61,12 @@ Git remains the source of truth for `global` and `route_class` policies: the dif
 
 ## LLM-assisted operations
 
-Nothing needs a model. The statistics, rules and explanations above work without one. When an operator configures an OpenAI-compatible endpoint (OpenAI, an Anthropic-compatible gateway, Ollama, vLLM), three tools use it for the part only a model does:
+Nothing needs a model. The statistics, rules and explanations above work without one. When an operator configures a chat-completions compatible endpoint (a hosted service, a gateway or a local inference server), three tools use it for the part only a model does:
 
 | Tool | Without the model | With the model |
 |---|---|---|
 | `summarize_traffic` | Counts by host, method and status, error and rate-limit shares, slowest and largest exchanges, block-page suspects | A short narrative and the next tools to try |
-| `classify_block_page` | Rules for 429, challenge markers (Cloudflare, reCAPTCHA, hCaptcha, `/sorry/`, ...) and plain 403 | The model decides pages the rules cannot (confidence under 0.9); the answer feeds `report_block_signal` |
+| `classify_block_page` | Rules for 429, challenge and captcha markers of common anti-bot services, `/sorry/` redirects, ... and plain 403 | The model decides pages the rules cannot (confidence under 0.9); the answer feeds `report_block_signal` |
 | `suggest_policy` | not listed | A policy draft for a natural-language request |
 
 The model is held to a contract. It is asked for JSON that matches a schema (`json_schema`, with a `json_object` fallback), at temperature 0, with a timeout and a size cap. The answer is validated against the same schema, and a mismatch is an error. A policy draft is parsed and merged by `proxyx-policy` before it is returned, with the validation result and the effective policy it would produce. Nothing is applied: a draft becomes a change only when someone calls `propose_config_change`, and applying it needs the `policy` capability and, if configured, approval. A block classification reports a signal only when the caller asks (`report`) and the server has the `signals` capability, because a wrong report cools a healthy IP. Captured content is given to the model inside `<untrusted_data>` tags with a system prompt that says it is data; the output schema, not the prompt, is what limits an injected instruction.

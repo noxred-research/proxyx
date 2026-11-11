@@ -93,7 +93,7 @@ mod tests {
                 job_id: "0b9f4c1e".into(),
                 subject,
                 partition: Partition {
-                    provider: "oxylabs_isp".parse().expect("provider"),
+                    provider: "isp_static_port".parse().expect("provider"),
                     region: "fr".parse().expect("region"),
                 },
                 unit: "203.0.113.9".into(),
@@ -111,7 +111,7 @@ mod tests {
         }
         let session = SessionJob {
             partition: Partition {
-                provider: "oxylabs_isp".parse().expect("provider"),
+                provider: "isp_static_port".parse().expect("provider"),
                 region: "fr".parse().expect("region"),
             },
             session: "AbC123xyz".into(),

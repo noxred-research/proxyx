@@ -506,18 +506,18 @@ pub fn check_session_life(
 // --- Probe targets ---
 
 /// The light-probe and prober pages: global (`*`) and per region
-/// (`google.fr` for `fr`). Loaded from `<data_dir>/probe-targets.toml` when
+/// (`search.example.fr` for `fr`). Loaded from `<data_dir>/probe-targets.toml` when
 /// it exists, else one default page. The prober's browsers reach the
 /// internet through the probe listener, which opens only these pages' hosts
 /// and `extra_hosts` (the hosts of their subresources, subdomains included),
 /// on ports 80 and 443 ([`ProbeTargets::allows`]).
 ///
 /// ```toml
-/// global = ["https://www.google.com/"]
-/// extra_hosts = ["gstatic.com"]
+/// global = ["https://www.example.com/"]
+/// extra_hosts = ["static.example.com"]
 /// [region]
-/// fr = ["https://www.google.fr/"]
-/// "fr/paris" = ["https://www.google.fr/maps"]
+/// fr = ["https://www.example.fr/"]
+/// "fr/paris" = ["https://www.example.fr/maps"]
 /// ```
 #[derive(Debug, Clone)]
 pub struct ProbeTargets {
@@ -555,6 +555,7 @@ fn urls(list: &[String], what: &str) -> anyhow::Result<Vec<Url>> {
 impl Default for ProbeTargets {
     fn default() -> Self {
         Self {
+            // detection-data: the default page, a search-engine front page
             global: vec![Url::parse("https://www.google.com/").expect("static url is valid")],
             by_region: HashMap::new(),
             extra_hosts: Vec::new(),
@@ -640,7 +641,7 @@ impl ProbeTargets {
 
     /// Global targets, then those of the region's country, then of the city,
     /// each URL once: a country page that repeats a global one (`us` and
-    /// `google.com`) is not probed twice.
+    /// `example.com`) is not probed twice.
     pub fn for_region(&self, region: &Region) -> Vec<Url> {
         let country = self.by_region.get(region.country());
         let city = region
@@ -1070,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_targets_give_each_country_its_google_site_once() {
+    fn the_shipped_targets_give_each_country_its_own_site_once() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let t = ProbeTargets::load(&dir).expect("data/probe-targets.toml loads");
         let hosts = |r: &str| -> Vec<String> {
@@ -1079,16 +1080,16 @@ mod tests {
                 .map(|u| u.host_str().unwrap_or_default().to_owned())
                 .collect()
         };
-        assert_eq!(hosts("us"), ["www.google.com"], "us is the baseline site");
-        assert_eq!(hosts("gb"), ["www.google.com", "www.google.co.uk"]);
-        assert_eq!(hosts("jp"), ["www.google.com", "www.google.co.jp"]);
-        assert_eq!(hosts("de"), ["www.google.com", "www.google.de"]);
+        assert_eq!(hosts("us"), ["www.google.com"], "us is the baseline site"); // detection-data
+        assert_eq!(hosts("gb"), ["www.google.com", "www.google.co.uk"]); // detection-data
+        assert_eq!(hosts("jp"), ["www.google.com", "www.google.co.jp"]); // detection-data
+        assert_eq!(hosts("de"), ["www.google.com", "www.google.de"]); // detection-data
         for cc in ["fr", "nl", "es", "it", "ca", "au", "br", "in"] {
             assert_eq!(hosts(cc).len(), 2, "{cc}: baseline and its own site");
         }
         assert_eq!(
             hosts("pt"),
-            ["www.google.com"],
+            ["www.google.com"], // detection-data
             "an unlisted country: baseline only"
         );
     }
@@ -1134,14 +1135,14 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_targets_allow_the_consent_and_static_hosts_of_google() {
+    fn the_shipped_targets_allow_the_consent_and_static_hosts() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
         let t = ProbeTargets::load(&dir).expect("data/probe-targets.toml loads");
         for host in [
-            "www.google.com",
-            "www.google.co.uk",
-            "consent.google.com",
-            "www.gstatic.com",
+            "www.google.com",     // detection-data
+            "www.google.co.uk",   // detection-data
+            "consent.google.com", // detection-data
+            "www.gstatic.com",    // detection-data
         ] {
             assert!(t.allows(host, 443), "{host}");
         }
@@ -1189,8 +1190,8 @@ mod tests {
 
     fn entry(ip: &str) -> String {
         format!(
-            "[[entry]]\nprovider = \"oxylabs_isp\"\nsubtype = \"isp\"\nip = \"{ip}\"\n\
-             host = \"disp.oxylabs.io\"\nport = 8001\nregion = \"fr\"\n"
+            "[[entry]]\nprovider = \"isp_static_port\"\nsubtype = \"isp\"\nip = \"{ip}\"\n\
+             host = \"rotating.isp.example.net\"\nport = 8001\nregion = \"fr\"\n"
         )
     }
 
@@ -1216,14 +1217,14 @@ mod tests {
         let dir = temp_dir();
         write(
             &dir,
-            "oxylabs_isp.toml",
+            "isp_static_port.toml",
             format!("{}{}", entry("203.0.113.1"), entry("203.0.113.2")),
         );
         write(&dir, "emptied_provider.toml", "entry = []\n");
         write(&dir, "notes.txt", "ignored");
 
         let source = read_inventory(&dir).expect("read").expect("source");
-        let ox: ProviderId = "oxylabs_isp".parse().expect("id");
+        let ox: ProviderId = "isp_static_port".parse().expect("id");
         let emptied: ProviderId = "emptied_provider".parse().expect("id");
         assert_eq!(source.providers[&ox].len(), 2);
         assert!(source.providers[&emptied].is_empty());

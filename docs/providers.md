@@ -6,8 +6,12 @@ target ports are allowed and how to reset a SIM box. The same adapter is used by
 warmer to create and check units, and by the control API to validate a customer's upstream.
 
 ProxyX bundles no provider accounts. The shipped adapters in `data/adapters/` are **worked examples**: the
-vendor ones (Oxylabs, IPRoyal, Webshare and Bright Data) show how a real grammar is expressed, and you bring
-your own accounts and verify the current grammar with your provider before use. Everything is configured in
+ones for commercial providers show how a real grammar is expressed, and you bring your own accounts and verify
+the current grammar with your provider before use. Adapter ids name the product type and where the options go
+in the credential, never a provider: `res_user_suffix` (residential, options appended to the username),
+`res_pass_suffix` (residential, options in the password), `res_zone` (residential, a full zone username),
+`res_numeric_*` (residential, a numeric session id) and `isp_static_port` (static ISP, one port per IP). Their
+`host` and `echo_url` values are the providers' public gateway addresses, the exact strings a provider needs. Everything is configured in
 data files and secret files; see [configuration.md](configuration.md) for process settings,
 [policies.md](policies.md) for what a lease may use, and [gateway.md](gateway.md) for how a request reaches an
 adapter.
@@ -32,7 +36,7 @@ adapter.
 
 | Term | Meaning |
 | --- | --- |
-| Provider | One adapter, identified by its id (`[a-z0-9_-]{1,48}`, for example `oxylabs_isp`). |
+| Provider | One adapter, identified by its id (`[a-z0-9_-]{1,48}`, for example `isp_static_port`). |
 | Kind | `static` or `rotating`, which drives the cache, the warmer and the lease. |
 | Subtype | The product family. Each subtype belongs to exactly one kind. |
 | Route class / partition | A provider plus a region. The unit of warming, locking, breakers and Redis keys. |
@@ -141,7 +145,7 @@ the other.
 
 `UnitSpec::Rotating` carries `session_id`, `ttl: Duration`, `region` and `strict`. Use
 `Adapter::normalize_session_ttl` before comparing recipe options: a 61-second request becomes 120 seconds for a
-minute-based provider, while IPRoyal retains 61 seconds. Zero and fractional-second durations are refused.
+minute-based provider, while a seconds-based provider (`res_pass_suffix`) retains 61 seconds. Zero and fractional-second durations are refused.
 `Adapter::encode_session` persists the normalized duration and strict flag with the upstream session id as
 `sid~seconds~0` or `sid~seconds~1`. `decode_session` reconstructs those exact inputs; legacy bare ids mean the
 adapter's default lifetime and non-strict mode. Malformed identities are errors, never legacy fallbacks.
@@ -189,36 +193,36 @@ Files in `data/adapters/`:
 
 | File | `id` | Kind and subtype | Role |
 | --- | --- | --- | --- |
-| `oxylabs_isp.toml` | `oxylabs_isp` | static, `isp` | Rented ISP IPs, one port per IP. Example of a static adapter. |
-| `oxylabs_res.toml` | `oxylabs_res` | rotating, `residential` | Options in the username. Example of a rotating adapter with a city option and a strict fragment. |
-| `iproyal_res.toml` | `iproyal_res` | rotating, `residential` | Options in the password. Example of a rotating adapter without a city option. |
+| `isp_static_port.toml` | `isp_static_port` | static, `isp` | Rented ISP IPs, one port per IP. Example of a static adapter. |
+| `res_user_suffix.toml` | `res_user_suffix` | rotating, `residential` | Options in the username. Example of a rotating adapter with a city option and a strict fragment. |
+| `res_pass_suffix.toml` | `res_pass_suffix` | rotating, `residential` | Options in the password. Example of a rotating adapter without a city option. |
 | `customer.toml` | `customer`, `customer_https`, `customer_socks5` | static, `datacenter` | An org's own upstream over HTTP, TLS-protected HTTP or SOCKS5. See [Customer upstreams](#customer-upstreams). |
 | `vpn-pool.toml` | `vpn-pool` | static, `datacenter` | A local SOCKS5 egress proxy per VPN exit, for upstreams you operate. |
 | `local.toml` | `local` | static, `datacenter` | The machine's own IP addresses, dialed straight from a bound source address. See [Local units](#local-units). |
-| `webshare_res.toml` | `webshare_sticky_http`, `webshare_sticky_socks5`, `webshare_rotating_http`, `webshare_rotating_socks5` | rotating, `residential` | Numeric sticky sessions and genuine per-request rotation over HTTP or SOCKS5. Per-request endpoints are not reusable pooled exits. |
-| `brightdata_zone.toml` | `brightdata_zone` | rotating, `residential` | Full dashboard-generated zone username, geographic parameters, session id and optional strict peer binding. |
+| `res_numeric_session.toml` | `res_numeric_sticky_http`, `res_numeric_sticky_socks5`, `res_numeric_rotating_http`, `res_numeric_rotating_socks5` | rotating, `residential` | Numeric sticky sessions and genuine per-request rotation over HTTP or SOCKS5. Per-request endpoints are not reusable pooled exits. |
+| `res_zone.toml` | `res_zone` | rotating, `residential` | Full dashboard-generated zone username, geographic parameters, session id and optional strict peer binding. |
 
-The vendor grammars were read from the vendors' documentation on the dates in each file's header comment and are
+The grammars were read from the providers' documentation on the dates in each file's header comment and are
 shown as examples; confirm them against your own account. Rendered examples below use made-up secrets and
 session ids.
 
-### Rotating, options in the username: `oxylabs_res`
+### Rotating, options in the username: `res_user_suffix`
 
 ```toml
 [[adapter]]
-id = "oxylabs_res"
+id = "res_user_suffix"
 kind = "rotating"
 subtype = "residential"
 scheme = "http"
-host = "pr.oxylabs.io"
+host = "gateway.example.net"
 port = 7777
-user_file = "oxylabs_res_user"
-pass_file = "oxylabs_res_pass"
+user_file = "res_user_suffix_user"
+pass_file = "res_user_suffix_pass"
 user = "customer-{base_user}{opts}"
 pass = "{base_pass}"
 allowed_ports = [80, 443]
 max_session_minutes = 30
-echo_url = "https://ip.oxylabs.io"
+echo_url = "https://echo.example.net"
 
 [[adapter.option]]
 name = "country"
@@ -233,19 +237,19 @@ For region `fr/paris`, secret user `acct`, session id `Ab3dEf6hIj9kLm2n`, the us
 `customer-acct-cc-FR-city-paris-sessid-Ab3dEf6hIj9kLm2n-sesstime-30`, and the password is the base password.
 The destination port must be 80 or 443; any other port answers `403 port_not_allowed`. The default `ttl` is
 30 minutes. This example intentionally caps both `sessid` and `sessid_oneip` at 30 minutes; do not interpret
-that conservative configured cap as a claim about every current Oxylabs product's maximum.
+that conservative configured cap as a claim about every current maximum of the provider's products.
 
-### Rotating, options in the password: `iproyal_res`
+### Rotating, options in the password: `res_pass_suffix`
 
 ```toml
 [[adapter]]
-id = "iproyal_res"
+id = "res_pass_suffix"
 kind = "rotating"
 subtype = "residential"
-host = "geo.iproyal.com"
+host = "gateway.example.net"
 port = 12321
-user_file = "iproyal_res_user"
-pass_file = "iproyal_res_pass"
+user_file = "res_pass_suffix_user"
+pass_file = "res_pass_suffix_pass"
 user = "{base_user}"
 pass = "{base_pass}{opts}"
 max_session_minutes = 10080
@@ -269,59 +273,52 @@ options. For region `fr`, session `Ab3dEf6h` and a 61-second lifetime, the passw
 `<base password>_country-fr_session-Ab3dEf6h_lifetime-61s`. Bounds are exactly 1 second through 7 days,
 inclusive. There is no `city` option, so this provider serves country-level regions only.
 
-### Webshare sticky and per-request HTTP/SOCKS5 endpoints
+### Numeric sticky and per-request HTTP/SOCKS5 endpoints: `res_numeric_*`
 
-The [primary connection reference](https://apidocs.webshare.io/proxy-connection) documents
-`{username}-{country_code}-{geo_params}-{session_id}`, numeric sticky ids, and the mutually exclusive
-`-rotate` suffix. The shipped examples use `p.webshare.io:80` for HTTP and `p.webshare.io:1080` for SOCKS5.
-With base username `acct`, country `us`, city `los_angeles` and sticky id `1234567890123456`, both transports
-render `acct-us-city_los_angeles-1234567890123456`; rotating mode renders `acct-us-city_los_angeles-rotate`.
-Cities allow ASCII letters and underscores, not digits or hyphens.
+The grammar is `{username}-{country_code}-{geo_params}-{session_id}`: numeric sticky ids, and a mutually
+exclusive `-rotate` suffix. The shipped examples use port 80 for HTTP and port 1080 for SOCKS5 on the
+provider's gateway host. With base username `acct`, country `us`, city `los_angeles` and sticky id
+`1234567890123456`, both transports render `acct-us-city_los_angeles-1234567890123456`; rotating mode renders
+`acct-us-city_los_angeles-rotate`. Cities allow ASCII letters and underscores, not digits or hyphens.
 
-The [Endpoint Generator documentation](https://help.webshare.io/en/articles/16310718-endpoint-generator-rotating-residential)
-sets sticky duration in the dashboard, from 1 minute to 24 hours. There is no documented username lifetime
-parameter. Set each sticky adapter's `max_session_minutes` to the actual dashboard timer before use; the
-1440-minute example is valid only with a 24-hour dashboard timer. A shorter client TTL bounds the local lease;
-it does not change that dashboard timer or guarantee the peer remains available. No strict replacement-blocking
-flag is documented, so strict recipes fail.
+The provider sets the sticky duration in its dashboard, from 1 minute to 24 hours. There is no documented
+username lifetime parameter. Set each sticky adapter's `max_session_minutes` to the actual dashboard timer
+before use; the 1440-minute example is valid only with a 24-hour dashboard timer. A shorter client TTL bounds
+the local lease; it does not change that dashboard timer or guarantee the peer remains available. No strict
+replacement-blocking flag is documented, so strict recipes fail.
 
-`webshare_rotating_http` and `webshare_rotating_socks5` explicitly set `session_mode = "per_request"`.
+`res_numeric_rotating_http` and `res_numeric_rotating_socks5` explicitly set `session_mode = "per_request"`.
 Their tracking id and local TTL are not sent upstream. These direct recipe examples do not preserve a stable
 exit between requests, so the stable-IP warmer and pooled session allocator exclude them. Use the sticky
 adapters for pooled sessions; do not relabel a `-rotate` endpoint as sticky.
 
-### Bright Data generic zone username
+### Full zone username: `res_zone`
 
-The [current zone configuration reference](https://docs.brightdata.com/proxy-networks/config-options)
-documents `brd-customer-[customerID]-zone-[zone name]-[optional parameters]`. Put the complete username from
-your zone's dashboard in `brightdata_zone_user`, not just a customer id or a guessed product prefix.
-Confirm host, port, zone product and targeting against the zone's
-[generated examples](https://brightdata.com/cp/zones/proxy_examples) before enabling the adapter.
-The generic example uses `brd.superproxy.io:33335` with `-country-us`, optional `-city-sanfrancisco`,
-`-session-scan42`, and strict `-const`. `-const` returns 502 when the bound peer is unavailable instead of
-silently choosing another peer. Dedicated-IP `-ip-` targeting belongs to a matching dedicated zone, not this
-residential example. This reference supplies no session duration parameter; local TTL is not a remote uptime
-guarantee.
+The grammar is `<account>-zone-<zone name>-[optional parameters]`. Put the complete username from your zone's
+dashboard in `res_zone_user`, not just a customer id or a guessed product prefix. Confirm host, port, zone
+product and targeting against the zone's generated examples in the provider dashboard before enabling the
+adapter. The example uses port 33335 with `-country-us`, optional `-city-sanfrancisco`, `-session-scan42`, and
+strict `-const`. `-const` returns 502 when the bound peer is unavailable instead of silently choosing another
+peer. Dedicated-IP `-ip-` targeting belongs to a matching dedicated zone, not this residential example. The
+provider documents no session duration parameter; local TTL is not a remote uptime guarantee.
 
-Session syntax and capabilities above were checked on 2026-11-11 against those primary references,
-[Oxylabs session control](https://developers.oxylabs.io/products/proxies/residential-proxies/session-control),
-and [IPRoyal rotation](https://docs.iproyal.com/proxies/residential/proxy/rotation).
+Session syntax and capabilities above were checked on 2026-11-11 against the providers' documentation.
 
-### Static, per-IP port: `oxylabs_isp`
+### Static, per-IP port: `isp_static_port`
 
 ```toml
 [[adapter]]
-id = "oxylabs_isp"
+id = "isp_static_port"
 kind = "static"
 subtype = "isp"
 scheme = "http"
-host = "isp.oxylabs.io"
-user_file = "oxylabs_isp_user"
-pass_file = "oxylabs_isp_pass"
+host = "gateway.example.net"
+user_file = "isp_static_port_user"
+pass_file = "isp_static_port_pass"
 user = "{base_user}"
 pass = "{base_pass}"
 max_conns_per_ip = 100
-echo_url = "https://ip.oxylabs.io"
+echo_url = "https://echo.example.net"
 ```
 
 There is no `port` and no options: each inventory entry carries the port of its IP (the IP, not the port, is
@@ -381,17 +378,17 @@ Static IPs, SIM boxes and the like are listed in `<data_dir>/inventory/*.toml`. 
 tables; unknown keys are errors.
 
 ```toml
-# inventory/oxylabs_isp.toml
+# inventory/isp_static_port.toml
 [[entry]]
-provider = "oxylabs_isp"
+provider = "isp_static_port"
 subtype = "isp"
 plan = "isp-10"
 ip = "203.0.113.50"
-host = "isp.oxylabs.io"
+host = "isp.example.net"
 port = 8001
 region = "fr/paris"
 asn = 12345
-credentials = "oxylabs_isp_203-0-113-50"
+credentials = "isp_static_port_203-0-113-50"
 rental_end = "2027-01-31"
 ```
 
@@ -654,12 +651,15 @@ state.
 
 Several echo services are asked, through the upstream, which IP they see. The result must satisfy a quorum.
 
-| Service | Reads |
+The service kinds are named for the response format they read. The default list asks one public service of
+each of the four formats.
+
+| Kind | Reads |
 | --- | --- |
-| `ipify` | `https://api.ipify.org?format=json`: IPv4 only, no country. |
-| `cloudflare` | `https://www.cloudflare.com/cdn-cgi/trace`: `ip=` and `loc=` lines. |
-| `ipinfo` | `https://ipinfo.io/json`: `ip` and `country`. |
-| `ifconfig_co` | `https://ifconfig.co/json`: `ip` and `country_iso`. |
+| `ip_json` | JSON `{"ip": "..."}`: IPv4 only, no country. |
+| `trace_lines` | Plain text lines `ip=` and `loc=` (the country). |
+| `ip_country_json` | JSON with `ip` and `country`. |
+| `ip_country_iso_json` | JSON with `ip` and `country_iso`. |
 | provider echo | The adapter's `echo_url`: the IP as plain text, no country. Added per call. |
 
 Rules:
@@ -689,15 +689,15 @@ minutes for a static IP, 30 s for a rotating session, 3 s limit, serving unverif
 reached); and the control API when validating a customer upstream.
 
 To replace the public services (a benchmark or an isolated environment with a stub provider), set
-`PROXYX_POOL_EXIT_IP_SERVICES` (`exit_ip_services`) to a comma list of `kind=url`, where `kind` is `ipify`,
-`cloudflare`, `ipinfo` or `ifconfig_co`:
+`PROXYX_POOL_EXIT_IP_SERVICES` (`exit_ip_services`) to a comma list of `kind=url`, where `kind` is `ip_json`,
+`trace_lines`, `ip_country_json` or `ip_country_iso_json`:
 
 ```sh
-PROXYX_POOL_EXIT_IP_SERVICES='cloudflare=http://stub.test/trace,ipinfo=http://stub.test/json'
+PROXYX_POOL_EXIT_IP_SERVICES='trace_lines=http://stub.test/trace,ip_country_json=http://stub.test/json'
 ```
 
-The list must contain at least one of `cloudflare`, `ipinfo` or `ifconfig_co`, because only they report the exit
-country; the provider echo and `ipify` return the IP only. An unknown kind, a URL that is not http(s), or an empty
+The list must contain at least one of `trace_lines`, `ip_country_json` or `ip_country_iso_json`, because only
+they report the exit country; the provider echo and `ip_json` return the IP only. An unknown kind, a URL that is not http(s), or an empty
 list fails startup.
 
 ## Reputation scorers
@@ -706,18 +706,20 @@ The reputation rule scores the exit IP with third-party services. A scorer is **
 `secrets_dir`; with none on, the policy's `on_score_unavailable` decides. A scorer receives only the exit IP and
 the API key: no target, org or client data, and the raw reply is never kept.
 
-| Scorer | Key file | Origin setting (default) | Daily budget |
-| --- | --- | --- | --- |
-| IPQS | `ipqs_api_key` | `ipqs_base_url` (`https://ipqualityscore.com`) | 30 lookups |
-| AbuseIPDB | `abuseipdb_api_key` | `abuseipdb_base_url` (`https://api.abuseipdb.com`) | 900 lookups |
-| Scamalytics | `scamalytics_api_key` | `scamalytics_base_url` (`https://api12.scamalytics.com`) | 15 lookups |
+Scorers are named for what they measure.
 
-The origin settings are `PROXYX_POOL_IPQS_BASE_URL`, `PROXYX_POOL_ABUSEIPDB_BASE_URL` and
-`PROXYX_POOL_SCAMALYTICS_BASE_URL`. They exist for benchmarks and isolated environments with a stand-in; leave
-them alone otherwise. Scamalytics also needs its account name, `scamalytics_customer`
-(`PROXYX_POOL_SCAMALYTICS_CUSTOMER`): a `scamalytics_api_key` without it fails startup. A key file that exists
+| Scorer | Measures | Key file | Origin setting (default: the service's public origin) | Daily budget |
+| --- | --- | --- | --- | --- |
+| `fraud_score` | A fraud score with a Tor flag. | `fraud_score_api_key` | `fraud_score_base_url` | 30 lookups |
+| `abuse_confidence` | The confidence that the IP was reported for abuse in the last 90 days, with a Tor flag. | `abuse_confidence_api_key` | `abuse_confidence_base_url` | 900 lookups |
+| `proxy_risk` | A proxy and anonymizer risk score with VPN, datacenter and residential-proxy flags. | `proxy_risk_api_key` | `proxy_risk_base_url` | 15 lookups |
+
+The origin settings are `PROXYX_POOL_FRAUD_SCORE_BASE_URL`, `PROXYX_POOL_ABUSE_CONFIDENCE_BASE_URL` and
+`PROXYX_POOL_PROXY_RISK_BASE_URL`. They exist for benchmarks and isolated environments with a stand-in; leave
+them alone otherwise. `proxy_risk` also needs its account name, `proxy_risk_customer`
+(`PROXYX_POOL_PROXY_RISK_CUSTOMER`): a `proxy_risk_api_key` without it fails startup. A key file that exists
 but is empty or unreadable also fails startup. Budgets are lookups per UTC day per process and are
-conservative figures under the vendors' free plans; an exhausted scorer is skipped for the day.
+conservative figures under the free plans of the services; an exhausted scorer is skipped for the day.
 
 Rule:
 
@@ -735,17 +737,17 @@ Rule:
 ## Probe targets
 
 The pages the light probe and the browser prober load through a candidate are listed in
-`<data_dir>/probe-targets.toml`. If the file does not exist, the one default page `https://www.google.com/` is
-used.
+`<data_dir>/probe-targets.toml`. If the file does not exist, the one default page, the front page of a
+search engine, is used.
 
 ```toml
 # Pages of a region are: global, then its country, then its city, each URL once.
-global = ["https://www.google.com/"]
-extra_hosts = ["google.com", "gstatic.com"]
+global = ["https://www.example.com/"]
+extra_hosts = ["example.com", "static.example.com"]
 
 [region]
-fr = ["https://www.google.fr/"]
-"fr/paris" = ["https://www.google.fr/maps"]
+fr = ["https://www.example.fr/"]
+"fr/paris" = ["https://www.example.fr/maps"]
 ```
 
 | Key | Meaning |
@@ -769,8 +771,8 @@ the probe credential to the page's origin.
 The **light probe** makes 3 GETs per target through the upstream, reads the status, the time to first byte and
 the first 16 KiB, follows up to 3 redirects and uses a 10 s limit per request. A final status that is neither
 2xx nor a block is a failure that counts against `criteria.min_success` but is not a block. A block is a 429,
-a 403 or 503 with a challenge marker in the body (captcha, `cf-chl`, `just a moment` and similar), or Google's
-`/sorry/` redirect. A target counts as blocked when a strict majority of its samples were blocked. A sample is
+a 403 or 503 with a challenge marker in the body (captcha, `just a moment` and similar), or a search
+engine's `/sorry/` redirect. A target counts as blocked when a strict majority of its samples were blocked. A sample is
 good when it was clean and its first byte arrived within `criteria.max_ttfb_ms`.
 
 ## Secrets directory
@@ -783,7 +785,7 @@ secret manager. Adapters and inventory entries name a file; no secret value live
 | `admin-token` (path `admin_token_file`) | Admin bearer token of the control API. Required for the gateway. |
 | `prober-token` | Prober bearer token. Required for the gateway. |
 | `probe-key` (path `probe_key_file`) | Secret that signs probe tokens. Optional; without it the probe listener refuses every login. |
-| `ipqs_api_key`, `abuseipdb_api_key`, `scamalytics_api_key` | [Reputation scorers](#reputation-scorers). |
+| `fraud_score_api_key`, `abuse_confidence_api_key`, `proxy_risk_api_key` | [Reputation scorers](#reputation-scorers). |
 | the `user_file` and `pass_file` names of an adapter | The base username and password of that adapter. |
 | the `bearer_file` of an adapter's `rotate` | Bearer token of the SIM box reset. |
 | the `credentials` names of inventory entries | `username:password` of one static unit. |
@@ -797,5 +799,5 @@ Rules:
   contain `:`; the username may not be empty. The values are cached for a minute by the gateway.
 - Adapter secret files are read when adapters load; rotate a secret by changing the file and waiting for the next
   reload (`reload_every`, default 30 s).
-- Name files for what they hold, for example `oxylabs_isp_user` and `oxylabs_isp_203-0-113-50` (a per-IP
+- Name files for what they hold, for example `isp_static_port_user` and `isp_static_port_203-0-113-50` (a per-IP
   credential), so an inventory file reads on its own.

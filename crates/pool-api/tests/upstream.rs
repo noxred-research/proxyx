@@ -668,13 +668,13 @@ const ORG_POLICIES: &str = r#"
 name = "org-warnexcl"
 scope = "org"
 match = "warnexcl"
-providers = ["oxylabs_isp"]
+providers = ["isp_static_port"]
 
 [[policy]]
 name = "org-warnallow"
 scope = "org"
 match = "warnallow"
-providers = ["oxylabs_isp", "customer"]
+providers = ["isp_static_port", "customer"]
 "#;
 
 /// PUT then validate the upstream of the org `name` on a harness of its own

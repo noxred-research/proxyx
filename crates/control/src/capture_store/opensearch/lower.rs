@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn single_branch_contains_and_status() {
         let q = query(vec![QueryBranch {
-            host: contains("Stripe*?"),
+            host: contains("Spayco*?"),
             status_code: Some(IntFilter::Gte { value: 500 }),
             ..Default::default()
         }]);
@@ -790,7 +790,7 @@ mod tests {
     fn two_branches_are_ored() {
         let q = query(vec![
             QueryBranch {
-                host: contains("stripe"),
+                host: contains("spayco"),
                 status_code: Some(IntFilter::Gte { value: 500 }),
                 ..Default::default()
             },

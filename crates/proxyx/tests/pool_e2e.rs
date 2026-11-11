@@ -44,9 +44,9 @@ fn exit_ip_config() -> ExitIpConfig {
     };
     ExitIpConfig {
         services: vec![
-            svc(ServiceKind::Ipify, "ipify"),
-            svc(ServiceKind::Cloudflare, "cloudflare"),
-            svc(ServiceKind::Ipinfo, "ipinfo"),
+            svc(ServiceKind::IpJson, "ip_json"),
+            svc(ServiceKind::TraceLines, "trace_lines"),
+            svc(ServiceKind::IpCountryJson, "ip_country_json"),
         ],
         min_agree: 2,
         timeout: Duration::from_secs(5),

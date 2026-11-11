@@ -7,10 +7,8 @@
 #
 # Select a role with the command, for example `proxyx gateway` or `proxyx-intercept`.
 
-ARG RUST_IMAGE=rust:1.97-bookworm
-ARG DEBIAN_IMAGE=debian:bookworm-slim
-
-FROM ${RUST_IMAGE} AS builder
+# Base images are pinned by manifest-list digest; Dependabot proposes digest updates.
+FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 # cmake, clang and perl build BoringSSL (the session proxy's upstream TLS stack);
 # librdkafka needs libssl-dev, libsasl2-dev and zlib; protoc is vendored by the workspace.
 RUN apt-get update \
@@ -28,7 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -D -m 0755 target/release/proxyx /out/proxyx \
     && install -D -m 0755 target/release/proxyx-intercept /out/proxyx-intercept
 
-FROM ${DEBIAN_IMAGE} AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 # openssl and curl are used by the dev compose stack (CA generation, health checks);
 # libssl3 is linked by the control plane's Kafka client.
 RUN apt-get update \

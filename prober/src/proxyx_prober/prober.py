@@ -5,7 +5,7 @@ A job is one browser on one ``(route class, region)``: it loads every target
 ``ProbeResults``. At most ``max_concurrent_probes`` browsers are open at once.
 
 A failure of the *route* (timeout, reset, block page) is a result; a failure of
-the *measuring equipment* (Chromium does not launch or dies, no probe token) is
+the *measuring equipment* (the browser does not launch or dies, no probe token) is
 never reported: it pauses every worker with exponential backoff and the job
 reruns once the browser works again.
 """

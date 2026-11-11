@@ -27,7 +27,7 @@ pub trait ProxyHandle: Send + Sync {
     /// handle.
     async fn proxy_env(&self) -> Result<ProxyEnv>;
 
-    /// Chromium arguments. Empty for a direct handle.
+    /// Chrome-family browser arguments. Empty for a direct handle.
     fn browser_args(&self) -> Vec<String>;
 
     /// Release the session. Idempotent.
