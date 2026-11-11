@@ -48,7 +48,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(ready))
         .route("/metrics", get(metrics))
         .layer(middleware::from_fn_with_state(
-            limits::Limits::new(state.config.http),
+            limits::Limits::new(state.config.http, state.config.auth_mode),
             limits::enforce,
         ))
         .layer(middleware::from_fn(request_metrics))

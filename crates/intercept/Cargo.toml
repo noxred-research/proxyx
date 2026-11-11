@@ -53,6 +53,9 @@ flate2.workspace = true
 pprof.workspace = true
 socket2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = [

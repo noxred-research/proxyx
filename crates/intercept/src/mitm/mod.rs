@@ -53,6 +53,8 @@ pub struct MitmParams<'a> {
     pub egress_proxy: Option<&'a common::types::EgressProxy>,
     /// Whether the proxy-to-upstream leg performs TLS. Session overrides use plain HTTP.
     pub upstream_tls: bool,
+    /// Explicit session opt-out for authorized testing of self-signed origins.
+    pub insecure_upstream_tls: bool,
 }
 
 /// Trait alias for an upstream stream that can be returned from the
@@ -86,6 +88,8 @@ pub struct WsCaptureSink {
     pub tx: mpsc::Sender<crate::pipeline::WsPipelineEvent>,
     /// Per-message captured-payload byte cap.
     pub max_payload_capture: usize,
+    /// Maximum compressed frame and fragmented-message bytes before rejection.
+    pub max_compressed_message_bytes: usize,
     /// Capture PING/PONG too. CLOSE is always captured.
     pub capture_control_frames: bool,
     pub session_id: common::types::SessionId,
@@ -169,6 +173,7 @@ pub struct MitmHandler {
     egress: crate::egress::Egress,
     /// Timeouts and limits of the HTTP loops.
     limits: HttpLimits,
+    upstream_tls_policy: crate::config::TlsConfig,
 }
 
 impl MitmHandler {
@@ -196,10 +201,11 @@ impl MitmHandler {
         max_header_capture: usize,
         egress: crate::egress::Egress,
         network: &crate::config::NetworkConfig,
+        upstream_tls_policy: &crate::config::TlsConfig,
     ) -> anyhow::Result<Self> {
         let connectors: Vec<boring::ssl::SslConnector> = TlsProfile::ALL
             .iter()
-            .map(|&p| build_connector(p))
+            .map(|&p| build_connector(p, upstream_tls_policy.ca_bundle.as_deref()))
             .collect::<anyhow::Result<_>>()?;
         let error_server_config = tls::make_error_server_config(&ca)?;
         let server_config = make_server_config(ca)?;
@@ -211,6 +217,7 @@ impl MitmHandler {
             max_header_capture,
             egress,
             limits: HttpLimits::from(network),
+            upstream_tls_policy: upstream_tls_policy.clone(),
         })
     }
 
@@ -248,6 +255,7 @@ impl MitmHandler {
             serial_lock,
             egress_proxy,
             upstream_tls,
+            insecure_upstream_tls,
         } = params;
 
         // 1. Accept TLS from client (rustls — inbound does not affect the
@@ -256,9 +264,10 @@ impl MitmHandler {
         //    CertResolver generates hostname certs on demand via SNI.
         let acceptor = tokio_rustls::TlsAcceptor::from(self.server_config.clone());
         let handshake_start = std::time::Instant::now();
-        let client_tls = tokio::time::timeout(self.limits.tls_handshake, acceptor.accept(client))
-            .await
-            .with_context(|| format!("client TLS handshake for {host} timed out"))??;
+        let mut client_tls =
+            tokio::time::timeout(self.limits.tls_handshake, acceptor.accept(client))
+                .await
+                .with_context(|| format!("client TLS handshake for {host} timed out"))??;
         observe_tls_handshake("client", handshake_start);
         if !upstream_tls {
             let exit = proxy_http_keepalive(
@@ -284,18 +293,46 @@ impl MitmHandler {
         //    The connector for this profile was pre-built at startup; configure()
         //    derives a per-connection ConnectConfiguration from the shared context.
         let connector = &self.connectors[tls_profile as usize];
-        // verify_hostname is a no-op when set_verify(NONE) is set on the
-        // connector, but configure() returns a ConnectConfiguration for any
-        // additional per-connection overrides.
-        let config = connector.configure()?;
+        let insecure = !self.upstream_tls_policy.verify_upstream
+            || insecure_upstream_tls
+            || self
+                .upstream_tls_policy
+                .insecure_upstream_hosts
+                .iter()
+                .any(|allowed| {
+                    allowed
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(host.trim_end_matches('.'))
+                });
+        let config = tls::configure_upstream(connector, insecure)?;
         let handshake_start = std::time::Instant::now();
-        let upstream_tls = tokio::time::timeout(
+        let handshake = tokio::time::timeout(
             self.limits.tls_handshake,
             tokio_boring::connect(config, host, upstream),
         )
-        .await
-        .with_context(|| format!("TLS handshake to {host} timed out"))?
-        .map_err(|e| anyhow::anyhow!("TLS handshake to {}: {}", host, e))?;
+        .await;
+        let upstream_tls = match handshake {
+            Ok(Ok(stream)) => stream,
+            result => {
+                client_tls
+                    .write_all(&crate::listener::common::proxy_error_response(
+                        502,
+                        "Bad Gateway",
+                        "upstream TLS verification or handshake failed",
+                        &[
+                            ("Connection", "close"),
+                            (PROXY_ERROR_HEADER, "upstream_tls"),
+                        ],
+                    ))
+                    .await?;
+                client_tls.shutdown().await?;
+                return match result {
+                    Err(error) => Err(error).context("upstream TLS handshake timed out"),
+                    Ok(Err(error)) => Err(anyhow::anyhow!("upstream TLS handshake: {error}")),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+            }
+        };
         observe_tls_handshake("upstream", handshake_start);
 
         // 3. Check negotiated ALPN to select upstream HTTP protocol.
@@ -338,8 +375,7 @@ impl MitmHandler {
                         .with_context(|| {
                             format!("h1 fallback connect to {dial_host}:{dial_port}")
                         })?;
-                    let mut config = connector
-                        .configure()
+                    let mut config = tls::configure_upstream(&connector, insecure)
                         .context("h1 fallback connector configure failed")?;
                     // Force ALPN to http/1.1 only (length-prefixed wire format).
                     config
@@ -354,6 +390,7 @@ impl MitmHandler {
                     .with_context(|| format!("h1 fallback TLS handshake to {dial_host} timed out"))?
                     .map_err(|e| {
                         anyhow::anyhow!("h1 fallback TLS handshake to {dial_host}: {e}")
+                            .context(tls::UpstreamTlsFailure)
                     })?;
                     observe_tls_handshake("upstream", handshake_start);
                     let boxed: BoxedUpstream = Box::new(stream);
@@ -517,6 +554,7 @@ where
                 host: ws_host.clone(),
                 capture_tx: sink.tx.clone(),
                 max_payload_capture: sink.max_payload_capture,
+                max_compressed_message_bytes: sink.max_compressed_message_bytes,
                 deflate,
                 capture_control_frames: sink.capture_control_frames,
                 exchange_ratelimit: sink.exchange_ratelimit.clone(),
@@ -1373,6 +1411,10 @@ enum BodyFraming {
 /// Working buffer size for streaming a body reader→writer. Bounds memory.
 const STREAM_CHUNK: usize = 64 * 1024;
 
+/// Wire-byte limits, including CRLF, for chunk extensions and trailer fields.
+const MAX_CHUNK_LINE: usize = 8 * 1024;
+const MAX_CHUNK_TRAILERS: usize = 64 * 1024;
+
 fn request_body_framing(headers: &[(String, String)]) -> BodyFraming {
     if is_chunked(headers) {
         BodyFraming::Chunked
@@ -1453,6 +1495,40 @@ async fn body_read<T>(idle: Duration, read: impl Future<Output = std::io::Result
         .await
         .context("body read idle timeout")?;
     result.context("read body")
+}
+
+/// Read one framing line without letting extensions or trailers grow the buffer
+/// without bound. A fixed deadline prevents trickled bytes from renewing it.
+async fn read_chunk_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> Result<usize> {
+    loop {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "chunk framing read timeout"
+        );
+        if let Some(end) = find_crlf(&buf[..buf.len().min(max_bytes)]) {
+            return end.checked_add(2).context("chunk line length overflow");
+        }
+        anyhow::ensure!(buf.len() < max_bytes, "chunk framing line too large");
+        let available = tokio::time::timeout_at(deadline, reader.fill_buf())
+            .await
+            .context("chunk framing read timeout")??;
+        anyhow::ensure!(!available.is_empty(), "unexpected EOF in chunk framing");
+        // Do not consume bytes after this line; the buffered H2 path must leave
+        // subsequent request bytes in the reader.
+        let line_bytes = if buf.last() == Some(&b'\r') && available[0] == b'\n' {
+            1
+        } else {
+            find_crlf(available).map_or(available.len(), |end| end + 2)
+        };
+        let take = line_bytes.min(max_bytes - buf.len());
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+    }
 }
 
 /// Stream a body from `reader` to `writer` in bounded pieces, capturing up to
@@ -1558,20 +1634,15 @@ where
     let mut buf = Vec::from(extra);
 
     loop {
-        // Ensure we have a complete chunk size line (\r\n terminated).
-        while find_crlf(&buf).is_none() {
-            let available = body_read(body_idle, reader.fill_buf()).await?;
-            if available.is_empty() {
-                anyhow::bail!("unexpected EOF in chunked body");
-            }
-            buf.extend_from_slice(available);
-            let len = available.len();
-            reader.consume(len);
-        }
-
-        // Parse chunk size line.
-        let line_end = find_crlf(&buf).expect("loop ensures CRLF present");
-        let size_line = &buf[..line_end];
+        // Include extensions in the size-line limit.
+        let line_len = read_chunk_line(
+            reader,
+            &mut buf,
+            MAX_CHUNK_LINE,
+            tokio::time::Instant::now() + body_idle,
+        )
+        .await?;
+        let size_line = &buf[..line_len - 2];
         let size_str = std::str::from_utf8(size_line).context("invalid chunk size line")?;
         let size_str = size_str.trim();
         // Handle chunk extensions (;ext=value).
@@ -1579,43 +1650,36 @@ where
         let chunk_size = usize::from_str_radix(size_hex, 16).context("invalid chunk size hex")?;
 
         // Forward the raw size line + CRLF.
-        writer.write_all(&buf[..line_end + 2]).await?;
-        buf.drain(..line_end + 2);
+        writer.write_all(&buf[..line_len]).await?;
+        buf.drain(..line_len);
 
         if chunk_size == 0 {
-            // Terminal chunk. Read + forward trailing CRLF (and any trailers
-            // up to the final CRLF pair).
-            // Minimal approach: read until we get a \r\n after the 0-chunk line.
-            // Trailers end with a blank \r\n line, but the simple case (no
-            // trailers) is just \r\n immediately.
+            // Bound individual trailers and the whole trailer section. All
+            // trailers share one deadline, including the final blank line.
+            let deadline = tokio::time::Instant::now() + body_idle;
+            let mut trailer_bytes = 0usize;
             loop {
-                if let Some(crlf_pos) = find_crlf(&buf) {
-                    let line = &buf[..crlf_pos];
-                    // Forward this line + CRLF.
-                    writer.write_all(&buf[..crlf_pos + 2]).await?;
-                    let is_empty_line = line.is_empty();
-                    buf.drain(..crlf_pos + 2);
-                    if is_empty_line {
-                        // Final blank line — end of chunked message.
-                        break;
-                    }
-                    // Otherwise it was a trailer line; keep going.
-                } else {
-                    let available = body_read(body_idle, reader.fill_buf()).await?;
-                    if available.is_empty() {
-                        // EOF before final CRLF — tolerate.
-                        break;
-                    }
-                    buf.extend_from_slice(available);
-                    let len = available.len();
-                    reader.consume(len);
+                let line_len = read_chunk_line(
+                    reader,
+                    &mut buf,
+                    MAX_CHUNK_LINE.min(MAX_CHUNK_TRAILERS - trailer_bytes),
+                    deadline,
+                )
+                .await?;
+                trailer_bytes = trailer_bytes
+                    .checked_add(line_len)
+                    .context("chunk trailer length overflow")?;
+                writer.write_all(&buf[..line_len]).await?;
+                buf.drain(..line_len);
+                if line_len == 2 {
+                    break;
                 }
             }
             break;
         }
 
         // Read + forward exactly chunk_size data bytes + trailing CRLF.
-        let need = chunk_size + 2; // data + \r\n
+        let need = chunk_size.checked_add(2).context("chunk size overflow")?;
         // Stream data from buf first, then from reader, in <=STREAM_CHUNK pieces.
         let mut forwarded = 0usize;
         while forwarded < need {
@@ -1673,8 +1737,17 @@ async fn read_full_body<R: AsyncRead + Unpin>(
     framing: BodyFraming,
     extra: &[u8],
     max_body_capture: usize,
+    body_idle: Duration,
 ) -> Result<(Bytes, Bytes, bool)> {
-    read_full_body_bounded(reader, framing, extra, max_body_capture, MAX_BUFFERED_BODY).await
+    read_full_body_bounded(
+        reader,
+        framing,
+        extra,
+        max_body_capture,
+        MAX_BUFFERED_BODY,
+        body_idle,
+    )
+    .await
 }
 
 async fn read_full_body_bounded<R: AsyncRead + Unpin>(
@@ -1683,6 +1756,7 @@ async fn read_full_body_bounded<R: AsyncRead + Unpin>(
     extra: &[u8],
     max_body_capture: usize,
     max_body: usize,
+    body_idle: Duration,
 ) -> Result<(Bytes, Bytes, bool)> {
     match framing {
         BodyFraming::None => {
@@ -1719,7 +1793,7 @@ async fn read_full_body_bounded<R: AsyncRead + Unpin>(
         }
 
         BodyFraming::Chunked => {
-            read_full_chunked_body(reader, extra, max_body_capture, max_body).await
+            read_full_chunked_body(reader, extra, max_body_capture, max_body, body_idle).await
         }
 
         BodyFraming::CloseDelimited => {
@@ -1754,45 +1828,64 @@ async fn read_full_chunked_body<R: AsyncRead + Unpin>(
     extra: &[u8],
     max_body_capture: usize,
     max_body: usize,
+    body_idle: Duration,
 ) -> Result<(Bytes, Bytes, bool)> {
     let mut decoded = Vec::new();
     let mut buf = Vec::from(extra);
 
     loop {
-        // Ensure we have a complete chunk size line.
-        while find_crlf(&buf).is_none() {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                anyhow::bail!("unexpected EOF in chunked body");
-            }
-            buf.extend_from_slice(available);
-            let len = available.len();
-            reader.consume(len);
-        }
-
-        let line_end = find_crlf(&buf).expect("loop ensures CRLF present");
-        let size_str = std::str::from_utf8(&buf[..line_end]).context("invalid chunk size line")?;
+        let line_len = read_chunk_line(
+            reader,
+            &mut buf,
+            MAX_CHUNK_LINE,
+            tokio::time::Instant::now() + body_idle,
+        )
+        .await?;
+        let size_str =
+            std::str::from_utf8(&buf[..line_len - 2]).context("invalid chunk size line")?;
         let size_str = size_str.trim();
         let size_hex = size_str.split(';').next().unwrap_or("").trim();
         let chunk_size = usize::from_str_radix(size_hex, 16).context("invalid chunk size hex")?;
-        buf.drain(..line_end + 2);
+        buf.drain(..line_len);
 
         if chunk_size == 0 {
+            let deadline = tokio::time::Instant::now() + body_idle;
+            let mut trailer_bytes = 0usize;
+            loop {
+                let line_len = read_chunk_line(
+                    reader,
+                    &mut buf,
+                    MAX_CHUNK_LINE.min(MAX_CHUNK_TRAILERS - trailer_bytes),
+                    deadline,
+                )
+                .await?;
+                trailer_bytes = trailer_bytes
+                    .checked_add(line_len)
+                    .context("chunk trailer length overflow")?;
+                buf.drain(..line_len);
+                if line_len == 2 {
+                    break;
+                }
+            }
             break;
         }
-        if chunk_size > max_body.saturating_sub(decoded.len()) {
+        let decoded_len = decoded
+            .len()
+            .checked_add(chunk_size)
+            .context("decoded chunk length overflow")?;
+        if decoded_len > max_body {
             return Err(BodyTooLarge.into());
         }
 
-        let need = chunk_size + 2;
+        let need = chunk_size.checked_add(2).context("chunk size overflow")?;
         while buf.len() < need {
-            let available = reader.fill_buf().await?;
+            let available = body_read(body_idle, reader.fill_buf()).await?;
             if available.is_empty() {
                 anyhow::bail!("unexpected EOF reading chunk data");
             }
-            buf.extend_from_slice(available);
-            let len = available.len();
-            reader.consume(len);
+            let take = available.len().min(need - buf.len());
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
         }
 
         decoded.extend_from_slice(&buf[..chunk_size]);
@@ -2283,6 +2376,7 @@ where
                 host: host.clone(),
                 capture_tx: sink.tx.clone(),
                 max_payload_capture: sink.max_payload_capture,
+                max_compressed_message_bytes: sink.max_compressed_message_bytes,
                 deflate,
                 capture_control_frames: sink.capture_control_frames,
                 exchange_ratelimit: sink.exchange_ratelimit.clone(),
@@ -2314,6 +2408,7 @@ where
             req_framing,
             &req_header_buf[req_header_len..],
             max_body_capture,
+            limits.body_idle,
         )
         .await
         {
@@ -2765,13 +2860,19 @@ where
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = ?e, host = %target_host, port = target_port, "h1 fallback dial failed");
+            let tls_headers = [(PROXY_ERROR_HEADER, "upstream_tls")];
+            let headers = if e.downcast_ref::<tls::UpstreamTlsFailure>().is_some() {
+                tls_headers.as_slice()
+            } else {
+                &[]
+            };
             let _ = client
                 .get_mut()
                 .write_all(&crate::listener::common::proxy_error_response(
                     502,
                     "Bad Gateway",
                     "h1.1 fallback dial failed",
-                    &[],
+                    headers,
                 ))
                 .await;
             let _ = client.get_mut().flush().await;
@@ -2949,6 +3050,7 @@ where
         host: host.clone(),
         capture_tx: sink.tx.clone(),
         max_payload_capture: sink.max_payload_capture,
+        max_compressed_message_bytes: sink.max_compressed_message_bytes,
         deflate,
         capture_control_frames: sink.capture_control_frames,
         exchange_ratelimit: sink.exchange_ratelimit.clone(),
@@ -3941,6 +4043,7 @@ Connection: keep-alive\r\n\r\n";
                 &crate::breaker::BreakerConfig::default(),
             ),
             &crate::config::NetworkConfig::default(),
+            &crate::config::TlsConfig::default(),
         )
         .unwrap();
 
@@ -3966,6 +4069,7 @@ Connection: keep-alive\r\n\r\n";
                     serial_lock: None,
                     egress_proxy: None,
                     upstream_tls: true,
+                    insecure_upstream_tls: false,
                 },
             )
             .await
@@ -4169,6 +4273,226 @@ Connection: keep-alive\r\n\r\n";
         }
     }
 
+    async fn assert_chunked_framing_rejected(raw: &[u8], expected: &str) {
+        // Exercise fragmented reads and framing already read with the headers.
+        for from_extra in [false, true] {
+            let (input, extra) = if from_extra {
+                (&b""[..], raw)
+            } else {
+                (raw, &b""[..])
+            };
+            let idle = HttpLimits::default().body_idle;
+            let err = stream_body(
+                &mut BufReader::with_capacity(17, input),
+                &mut tokio::io::sink(),
+                BodyFraming::Chunked,
+                extra,
+                16,
+                idle,
+            )
+            .await
+            .err()
+            .expect("streaming parser must reject invalid framing");
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            let err = read_full_body_bounded(
+                &mut BufReader::with_capacity(17, input),
+                BodyFraming::Chunked,
+                extra,
+                16,
+                1024,
+                idle,
+            )
+            .await
+            .expect_err("buffered parser must reject invalid framing");
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_reject_oversized_extensions() {
+        let mut raw = b"1;".to_vec();
+        raw.extend(std::iter::repeat_n(b'e', MAX_CHUNK_LINE));
+        assert_chunked_framing_rejected(&raw, "chunk framing line too large").await;
+        raw.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+        assert_chunked_framing_rejected(&raw, "chunk framing line too large").await;
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_reject_oversized_individual_trailers() {
+        let mut raw = b"0\r\nX-Trailer: ".to_vec();
+        raw.extend(std::iter::repeat_n(b't', MAX_CHUNK_LINE));
+        assert_chunked_framing_rejected(&raw, "chunk framing line too large").await;
+        raw.extend_from_slice(b"\r\n\r\n");
+        assert_chunked_framing_rejected(&raw, "chunk framing line too large").await;
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_reject_oversized_aggregate_trailers() {
+        let mut raw = b"0\r\n".to_vec();
+        let mut trailer = b"X:".to_vec();
+        trailer.extend(std::iter::repeat_n(b't', 1020));
+        trailer.extend_from_slice(b"\r\n");
+        for _ in 0..MAX_CHUNK_TRAILERS / trailer.len() {
+            raw.extend_from_slice(&trailer);
+        }
+        // The final blank line also counts against the aggregate limit.
+        raw.extend_from_slice(b"\r\n");
+        assert_chunked_framing_rejected(&raw, "chunk framing line too large").await;
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_accept_framing_at_limits() {
+        let mut raw = b"1;".to_vec();
+        raw.extend(std::iter::repeat_n(b'e', MAX_CHUNK_LINE - 4));
+        raw.extend_from_slice(b"\r\nx\r\n0\r\n");
+        for index in 0..MAX_CHUNK_TRAILERS / MAX_CHUNK_LINE {
+            let line_len = if index == MAX_CHUNK_TRAILERS / MAX_CHUNK_LINE - 1 {
+                MAX_CHUNK_LINE - 2
+            } else {
+                MAX_CHUNK_LINE
+            };
+            raw.extend_from_slice(b"X:");
+            raw.extend(std::iter::repeat_n(b't', line_len - 4));
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"\r\n");
+        let idle = HttpLimits::default().body_idle;
+        let mut forwarded = Vec::new();
+        let streamed = stream_body(
+            &mut BufReader::with_capacity(17, raw.as_slice()),
+            &mut forwarded,
+            BodyFraming::Chunked,
+            &[],
+            16,
+            idle,
+        )
+        .await
+        .unwrap();
+        assert_eq!(streamed.captured.as_ref(), b"x");
+        assert!(streamed.leftover.is_empty());
+        assert_eq!(forwarded, raw);
+        let mut reader = BufReader::with_capacity(17, raw.as_slice());
+        let (full, captured, truncated) =
+            read_full_body_bounded(&mut reader, BodyFraming::Chunked, &[], 16, 1024, idle)
+                .await
+                .unwrap();
+        assert_eq!(full.as_ref(), b"x");
+        assert_eq!(captured, full);
+        assert!(!truncated);
+        assert!(reader.fill_buf().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_reject_chunk_size_overflow() {
+        let raw = format!("{:x}\r\n", usize::MAX);
+        let err = stream_body(
+            &mut BufReader::new(raw.as_bytes()),
+            &mut tokio::io::sink(),
+            BodyFraming::Chunked,
+            &[],
+            16,
+            HttpLimits::default().body_idle,
+        )
+        .await
+        .err()
+        .expect("chunk wire length must not wrap");
+        assert!(
+            format!("{err:#}").contains("chunk size overflow"),
+            "{err:#}"
+        );
+        let err = read_full_chunked_body(
+            &mut BufReader::new(raw.as_bytes()),
+            &[],
+            16,
+            usize::MAX,
+            HttpLimits::default().body_idle,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("chunk size overflow"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_parsers_require_complete_trailers() {
+        assert_chunked_framing_rejected(b"0\r\nX:y\r\n", "unexpected EOF in chunk framing").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunked_framing_deadlines_do_not_reset_on_trickled_bytes() {
+        for buffered in [false, true] {
+            for (prefix, payload) in [
+                (&b"1;"[..], &b"x"[..]),
+                (&b"0\r\nX:"[..], &b"x"[..]),
+                // Complete fields must not renew the aggregate deadline either.
+                (&b"0\r\n"[..], &b"X:y\r\n"[..]),
+            ] {
+                let (mut peer, stream) = tokio::io::duplex(64);
+                let trickle = tokio::spawn(async move {
+                    for _ in 0..3 {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        peer.write_all(payload).await.unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let idle = Duration::from_millis(100);
+                let start = tokio::time::Instant::now();
+                let mut reader = BufReader::new(stream);
+                let err = if buffered {
+                    read_full_body_bounded(
+                        &mut reader,
+                        BodyFraming::Chunked,
+                        prefix,
+                        16,
+                        1024,
+                        idle,
+                    )
+                    .await
+                    .unwrap_err()
+                } else {
+                    stream_body(
+                        &mut reader,
+                        &mut tokio::io::sink(),
+                        BodyFraming::Chunked,
+                        prefix,
+                        16,
+                        idle,
+                    )
+                    .await
+                    .err()
+                    .expect("trickled framing must time out")
+                };
+                trickle.abort();
+                assert!(
+                    format!("{err:#}").contains("chunk framing read timeout"),
+                    "{err:#}"
+                );
+                assert_eq!(start.elapsed(), idle);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_chunk_data_stalls_time_out() {
+        let (_peer, stream) = tokio::io::duplex(64);
+        let err = read_full_body_bounded(
+            &mut BufReader::new(stream),
+            BodyFraming::Chunked,
+            b"1\r\n",
+            16,
+            1024,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("body read idle timeout"),
+            "{err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn buffered_bodies_over_the_limit_are_refused_without_reading_them() {
         // A declared length over the limit is refused before any byte is read.
@@ -4178,6 +4502,7 @@ Connection: keep-alive\r\n\r\n";
             &[],
             16,
             1024,
+            HttpLimits::default().body_idle,
         )
         .await
         .expect_err("a huge Content-Length must be refused");
@@ -4196,6 +4521,7 @@ Connection: keep-alive\r\n\r\n";
             &[],
             16,
             1024,
+            HttpLimits::default().body_idle,
         )
         .await
         .expect_err("a chunk past the limit must be refused");
@@ -4209,6 +4535,7 @@ Connection: keep-alive\r\n\r\n";
             &[],
             16,
             1024,
+            HttpLimits::default().body_idle,
         )
         .await
         .expect_err("a close-delimited body past the limit must be refused");
@@ -4222,6 +4549,7 @@ Connection: keep-alive\r\n\r\n";
             &[],
             16,
             1024,
+            HttpLimits::default().body_idle,
         )
         .await
         .expect("a body at the limit is read");
@@ -4247,6 +4575,7 @@ Connection: keep-alive\r\n\r\n";
             framing,
             &[], // no extra bytes
             DEFAULT_MAX_BODY_CAPTURE,
+            HttpLimits::default().body_idle,
         )
         .await
         .unwrap();
@@ -5191,6 +5520,7 @@ Connection: keep-alive\r\n\r\n";
         let ws_sink = WsCaptureSink {
             tx: ws_tx,
             max_payload_capture: 1024,
+            max_compressed_message_bytes: 16 * 1024 * 1024,
             capture_control_frames: false,
             session_id: uuid::Uuid::nil(),
             org_id: "test-org".to_string(),
@@ -5462,6 +5792,7 @@ Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
         let ws_sink = WsCaptureSink {
             tx: ws_tx,
             max_payload_capture: 1024,
+            max_compressed_message_bytes: 16 * 1024 * 1024,
             capture_control_frames: false,
             session_id: uuid::Uuid::nil(),
             org_id: "test-org".to_string(),

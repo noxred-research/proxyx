@@ -19,6 +19,9 @@ pub struct TuningConfig {
     /// Values exceeding this are truncated before writing to the Redis stream.
     #[serde(default = "default_max_header_capture")]
     pub max_header_capture: usize,
+    /// Maximum compressed WebSocket frame and fragmented-message size.
+    #[serde(default = "default_max_ws_compressed_message_bytes")]
+    pub max_ws_compressed_message_bytes: usize,
     /// Per-tunnel exchange channel capacity (default: 8).
     /// Controls backpressure from the pipeline to the MITM tunnel.
     #[serde(default = "default_exchange_channel_capacity")]
@@ -39,6 +42,9 @@ fn default_max_body_capture() -> usize {
 fn default_max_header_capture() -> usize {
     512
 }
+fn default_max_ws_compressed_message_bytes() -> usize {
+    16 * 1024 * 1024
+}
 fn default_exchange_channel_capacity() -> usize {
     8
 }
@@ -54,6 +60,7 @@ impl Default for TuningConfig {
         Self {
             max_body_capture: default_max_body_capture(),
             max_header_capture: default_max_header_capture(),
+            max_ws_compressed_message_bytes: default_max_ws_compressed_message_bytes(),
             exchange_channel_capacity: default_exchange_channel_capacity(),
             max_connections: default_max_connections(),
             shutdown_drain_timeout_secs: default_shutdown_drain_timeout_secs(),
@@ -335,6 +342,28 @@ fn default_ratelimit() -> crate::ratelimit::RateLimitConfig {
     crate::ratelimit::RateLimitConfig::default()
 }
 
+/// Trust policy for TLS connections from the session proxy to origins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Verify certificate chains and hostnames unless an explicit exception applies.
+    pub verify_upstream: bool,
+    /// Additional PEM CA bundle. System roots remain trusted.
+    pub ca_bundle: Option<PathBuf>,
+    /// Exact hostnames allowed to use unverified upstream TLS.
+    pub insecure_upstream_hosts: Vec<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            verify_upstream: true,
+            ca_bundle: None,
+            insecure_upstream_hosts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Proxy ID (set by PROXYX_INTERCEPT_ID env var, or auto-generated)
@@ -376,6 +405,10 @@ pub struct Config {
     /// CA certificate configuration
     #[serde(default)]
     pub ca: CaConfig,
+
+    /// Upstream certificate verification policy.
+    #[serde(default)]
+    pub tls: TlsConfig,
 
     /// Runtime tuning parameters
     #[serde(default)]
@@ -430,6 +463,7 @@ impl Default for Config {
             ratelimit: default_ratelimit(),
             request_log: default_request_log(),
             ca: CaConfig::default(),
+            tls: TlsConfig::default(),
             tuning: TuningConfig::default(),
             network: NetworkConfig::default(),
             breaker: crate::breaker::BreakerConfig::default(),
@@ -504,6 +538,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_tls_and_compressed_websocket_limits_default_secure() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "connect_addr": "127.0.0.1:8443"
+        }))
+        .unwrap();
+        assert!(config.tls.verify_upstream);
+        assert!(config.tls.ca_bundle.is_none());
+        assert!(config.tls.insecure_upstream_hosts.is_empty());
+        assert_eq!(
+            config.tuning.max_ws_compressed_message_bytes,
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn upstream_tls_trust_policy_deserializes_explicit_exceptions() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "connect_addr": "127.0.0.1:8443",
+            "tls": {
+                "verify_upstream": true,
+                "ca_bundle": "/etc/proxyx/test-roots.pem",
+                "insecure_upstream_hosts": ["test.example"]
+            },
+            "tuning": { "max_ws_compressed_message_bytes": 1024 }
+        }))
+        .unwrap();
+        assert!(config.tls.verify_upstream);
+        assert_eq!(
+            config.tls.ca_bundle.unwrap(),
+            PathBuf::from("/etc/proxyx/test-roots.pem")
+        );
+        assert_eq!(config.tls.insecure_upstream_hosts, ["test.example"]);
+        assert_eq!(config.tuning.max_ws_compressed_message_bytes, 1024);
+    }
 
     #[test]
     fn no_capture_hosts_accepts_csv_string() {

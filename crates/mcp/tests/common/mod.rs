@@ -187,10 +187,7 @@ pub async fn fake_pool() -> (Fake, Pool) {
         .route("/v1/policies/{scope}/{name}", delete(pool_policy_delete))
         .route("/v1/orgs/{org}/cache-policy", put(pool_org_policy))
         .route("/v1/inventory", get(pool_inventory))
-        .route(
-            "/v1/inventory/replacements",
-            get(|| async { Json(json!({"items": []})) }),
-        )
+        .route("/v1/inventory/replacements", get(pool_inventory))
         .route("/v1/inventory/{provider}", put(pool_inventory_put))
         .route("/v1/orgs/{org}/sessions", get(pool_sessions_list))
         .route("/v1/orgs/{org}/sessions/{sid}", delete(pool_session_drop))
@@ -667,9 +664,18 @@ async fn ctl_capture(
     match found {
         Some(mut c) => {
             // the full capture has header objects and plain string bodies
-            c["request_headers"] =
-                json!({"accept": "*/*", "authorization": "Bearer targetsecrettoken123"});
-            c["response_headers"] = json!({"content-type": "text/html", "set-cookie": "sid=abc"});
+            for key in ["request_headers", "response_headers"] {
+                if let Some(pairs) = c[key].as_array() {
+                    c[key] = Value::Object(
+                        pairs
+                            .iter()
+                            .filter_map(|pair| {
+                                Some((pair[0].as_str()?.to_ascii_lowercase(), pair[1].clone()))
+                            })
+                            .collect(),
+                    );
+                }
+            }
             c["response_body"] = json!(c["response_body"]["value"].clone());
             Json(c).into_response()
         }
@@ -1014,6 +1020,20 @@ pub async fn ask(server: &Arc<Server>, message: Value) -> Value {
     let mut frames = converse(server, &[message]).await;
     assert_eq!(frames.len(), 1, "one reply: {frames:?}");
     frames.remove(0)
+}
+
+/// Import an existing session into the private registry and return its model-safe handle.
+pub async fn existing_session_handle(server: &Arc<Server>) -> String {
+    server
+        .ctx
+        .store
+        .register_session(&json!({"session_id": SESSION_ID, "org": "acme"}))
+        .expect("register existing session");
+    let listed = tool_ok(server, "list_sessions", json!({})).await;
+    listed["sessions"][0]["session_id"]
+        .as_str()
+        .expect("session handle")
+        .to_owned()
 }
 
 /// Call a tool and return `(is_error, structured content or parsed text)`.

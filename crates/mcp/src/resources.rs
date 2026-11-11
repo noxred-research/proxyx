@@ -146,7 +146,9 @@ pub fn list(ctx: &Ctx) -> Vec<Value> {
     if ctx.backends.control.is_some() {
         out.push(json!({"uri": CERTIFICATE_URI, "name": "certificate", "description": "The MITM CA certificate (PEM, public) that session proxy clients must trust.", "mimeType": "text/plain"}));
     }
-    out.push(json!({"uri": AUDIT_URI, "name": "audit-recent", "description": "The last audit log entries of this server (secrets redacted).", "mimeType": "application/json"}));
+    if ctx.gate.unscoped() {
+        out.push(json!({"uri": AUDIT_URI, "name": "audit-recent", "description": "The last audit log entries of this server (secrets redacted).", "mimeType": "application/json"}));
+    }
     out
 }
 
@@ -211,6 +213,9 @@ pub async fn read(ctx: &Arc<Ctx>, uri: &str, info: &CallInfo) -> Result<Vec<Valu
         return via_tool(ctx, uri, live.tool, json!({}), info).await;
     }
     if uri == AUDIT_URI {
+        if !ctx.gate.unscoped() {
+            return Err(ReadError::NotFound);
+        }
         let tail = ctx.audit.tail(50);
         return Ok(contents(
             uri,

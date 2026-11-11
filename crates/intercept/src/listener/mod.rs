@@ -151,12 +151,42 @@ mod routing_tests {
             captured_hosts: Vec::new(),
             excluded_hosts: Vec::new(),
             upstream_overrides: Arc::from(vec![Arc::new(route)]),
+            insecure_upstream_tls: false,
             inject_headers: Arc::from([]),
             serialize: false,
             serial_lock: None,
             expires_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX)),
             egress_proxy: None,
             rate_limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_preserves_explicit_upstream_tls_policy() {
+        for insecure_upstream_tls in [false, true] {
+            let session_id = Uuid::new_v4();
+            let route =
+                parse_upstream_override("lab.example.test:443", "http://127.0.0.1:8000").unwrap();
+            let mut session = local_session(session_id, route);
+            session.insecure_upstream_tls = insecure_upstream_tls;
+            let (ctx, _captures, ca_dir) = test_context(vec![session]).await;
+            let auth = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{session_id}:password"))
+            );
+            let http = ctx
+                .state
+                .authenticate_and_route(Some(&auth), LOGICAL_HOST, LOGICAL_PORT)
+                .await
+                .unwrap();
+            assert_eq!(http.decision.insecure_upstream_tls, insecure_upstream_tls);
+            let socks = ctx
+                .state
+                .authenticate_socks_and_route(session_id, LOGICAL_HOST, LOGICAL_PORT)
+                .await
+                .unwrap();
+            assert_eq!(socks.decision.insecure_upstream_tls, insecure_upstream_tls);
+            let _ = std::fs::remove_dir_all(ca_dir);
         }
     }
 

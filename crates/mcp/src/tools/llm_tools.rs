@@ -11,11 +11,14 @@ use policy::PolicyFile;
 use serde_json::{Value, json};
 
 use super::manage::Action;
-use super::policy_tools::{doc_json, effective_summary, stored_policies, validate_merged};
+use super::policy_tools::{
+    check_policy_scope, doc_json, effective_summary, scoped_stored_policies, validate_merged,
+};
 use super::traffic::{clean_capture, validate_branches};
 use super::util::{Args, FailKind, ToolError, ToolResult};
 use super::{CallInfo, Ctx};
 use crate::llm::{Llm, LlmError, SYSTEM_RULES, untrusted};
+use crate::redact::{redact_body, redact_headers, redact_prompt_value};
 
 fn llm_error(error: LlmError) -> ToolError {
     ToolError::new(FailKind::Llm, error.to_string())
@@ -125,7 +128,8 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
         .api
         .post(&["rpc", "requests", "search"], &body)
         .await?;
-    let items: Vec<Value> = reply["items"].as_array().cloned().unwrap_or_default();
+    let mut items: Vec<Value> = reply["items"].as_array().cloned().unwrap_or_default();
+    items.iter_mut().for_each(redact_prompt_value);
     let stats = traffic_stats(&items);
     let mut out = json!({
         "statistics": stats,
@@ -283,14 +287,15 @@ pub async fn classify_block_page(ctx: &Ctx, args: &Args, info: &CallInfo) -> Too
     let (status, headers, body, host) = if let Some(id) = args.str("capture_id") {
         let control = ctx.control()?;
         let org = ctx.org(args)?;
-        let capture = control
+        let mut capture = control
             .api
             .get(&["rpc", "orgs", &org, "requests", id], &[])
             .await?;
+        redact_prompt_value(&mut capture);
         let cleaned = clean_capture(&capture, 16 * 1024);
         (
             capture["status_code"].as_u64().unwrap_or(0),
-            capture["response_headers"].clone(),
+            cleaned["response_headers"].clone(),
             cleaned["response_body"]["text"]
                 .as_str()
                 .unwrap_or("")
@@ -303,10 +308,12 @@ pub async fn classify_block_page(ctx: &Ctx, args: &Args, info: &CallInfo) -> Too
                 "give `capture_id`, or `status` with optional `headers` and `body`",
             ));
         };
+        let mut headers = args.get("headers").cloned().unwrap_or(Value::Null);
+        redact_headers(&mut headers);
         (
             status,
-            args.get("headers").cloned().unwrap_or(Value::Null),
-            args.string("body").unwrap_or_default(),
+            headers,
+            redact_body(args.str("body").unwrap_or("")),
             args.string("host"),
         )
     };
@@ -452,7 +459,7 @@ pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
             .get(&["v1", "policies"], &[])
             .await
             .ok()
-            .and_then(|body| stored_policies(&body).ok()),
+            .and_then(|body| scoped_stored_policies(ctx, &body).ok()),
         None => None,
     };
     let current = stored
@@ -480,10 +487,12 @@ pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
         "additionalProperties": false
     });
     let user = format!(
-        "Write the smallest policy change that satisfies the request. Scope: {scope}{}.\n{}\n{}\n{}",
-        org.as_deref()
-            .map(|org| format!(", org {org}"))
-            .unwrap_or_default(),
+        "Write the smallest policy change that satisfies the request.\n{}\n{}\n{}\n{}",
+        untrusted(
+            "requested_scope",
+            &json!({"scope": scope, "org": org}).to_string(),
+            2000
+        ),
         untrusted("policy_format", POLICY_REFERENCE, 6000),
         untrusted(
             "current_policies",
@@ -510,6 +519,7 @@ pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
             "the model's draft contains no policy",
         ));
     }
+    check_policy_scope(ctx, &file.policies)?;
     let verdict = validate_merged(stored.as_deref().unwrap_or(&[]), &file.policies);
     let (valid, error, effective) = match &verdict {
         Ok(set) => (true, None, Some(effective_summary(set, org.as_deref()))),

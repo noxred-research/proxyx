@@ -1,0 +1,120 @@
+name: codeql
+
+# Rust and Actions analysis uploads to code scanning only after this repository is public.
+# Keep CodeQL default setup disabled when enabling this advanced setup, to avoid duplicate
+# analyses. Rust's no-build analysis still runs build scripts and compiles macro code.
+#
+# Every job needs authorize. Ownership comes from the default branch's CODEOWNERS `*` rule,
+# not the event checkout. Actor and rerun actor must be owners; PRs also need an owner author
+# and a same-repository head. Scheduled runs require GitHub's recorded actor to remain an
+# owner; main-branch pushes check the pusher, not the authors of merged commits.
+# Repository fork-workflow restrictions and required code-owner review remain essential:
+# a pull request can change its own workflow file. No privileged PR or follow-up run trigger
+# is used here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1" # weekly (Monday)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.event.schedule || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      ok: ${{ steps.gate.outputs.ok }}
+    steps:
+      - name: Only code owners' events run workflows
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          deny() {
+            echo "::notice title=workflow gate::not run: $1"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          case "$EVENT_NAME" in
+            push|pull_request|schedule|workflow_dispatch) ;;
+            *) deny "event ${EVENT_NAME} is not allowed" ;;
+          esac
+          # Resolve ownership from the trusted default branch, not the event checkout.
+          branch="${DEFAULT_BRANCH:-$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)}"
+          case "$EVENT_NAME" in
+            push) [ "$GITHUB_REF" = refs/heads/main ] || deny "push is not on main" ;;
+            schedule) [ "$GITHUB_REF" = "refs/heads/$branch" ] || deny "schedule is not on the default branch" ;;
+          esac
+          codeowners=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/CODEOWNERS?ref=${branch}" --jq .content | base64 -d)
+          # The last global rule wins. Team owners cannot be resolved with this token.
+          owners=$(printf '%s\n' "$codeowners" | awk '
+            $1 == "*" {
+              o = ""
+              for (i = 2; i <= NF; i++) {
+                if ($i ~ /^#/) break
+                if ($i ~ /^@[A-Za-z0-9-]+$/) o = o tolower(substr($i, 2)) "\n"
+              }
+            }
+            END { printf "%s", o }')
+          [ -n "$owners" ] || deny "no user owner for the * rule in CODEOWNERS on ${branch}"
+          is_owner() {
+            [ -n "$1" ] && printf '%s\n' "$owners" | grep -qxF -- "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+          }
+          is_owner "$ACTOR" || deny "actor is not a code owner"
+          is_owner "$TRIGGERING_ACTOR" || deny "triggering actor is not a code owner"
+          if [ "$EVENT_NAME" = pull_request ]; then
+            is_owner "$PR_AUTHOR" || deny "pull request author is not a code owner"
+            [ "$PR_HEAD_REPO" = "$GITHUB_REPOSITORY" ] || deny "pull request comes from a fork"
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: authorize
+    if: needs.authorize.outputs.ok == 'true' && github.event.repository.private == false
+    permissions:
+      actions: read # Read workflow-run metadata for CodeQL analysis.
+      contents: read
+      security-events: write # Upload CodeQL results to code scanning.
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Native dependencies for Rust build scripts
+        if: matrix.language == 'rust'
+        run: sudo apt-get update && sudo apt-get install -y cmake clang protobuf-compiler libssl-dev libsasl2-dev pkg-config
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10
+        if: matrix.language == 'rust'
+        with:
+          toolchain: stable
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

@@ -75,7 +75,6 @@ pub enum ConnectError {
 
 #[derive(Clone, Copy)]
 pub struct Plan<'a> {
-    pub host: &'a str,
     pub port: u16,
     /// Resolved and checked destination addresses (never empty).
     pub ips: &'a [IpAddr],
@@ -91,6 +90,20 @@ pub struct Plan<'a> {
     pub client: SocketAddr,
     /// The request is bodyless and may use (and leave) an idle connection to an HTTP parent.
     pub reuse: bool,
+}
+
+impl Plan<'_> {
+    /// Pin the parent request to an address already approved by the edge.
+    fn target(&self) -> Result<Target, ConnectError> {
+        Ok(Target {
+            host: self
+                .ips
+                .first()
+                .ok_or(ConnectError::NoAddressOfFamily)?
+                .to_string(),
+            port: self.port,
+        })
+    }
 }
 
 pub struct Upstream {
@@ -480,10 +493,7 @@ async fn via_parent(
                 .await
                 .map_err(|e| fail(format!("send PROXY header: {e}")))?;
         }
-        let target = Target {
-            host: plan.host.to_owned(),
-            port: plan.port,
-        };
+        let target = plan.target()?;
         let stream = if http_parent {
             dial::proxy_transport(tcp, parent.endpoint())
                 .await

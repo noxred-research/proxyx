@@ -373,12 +373,13 @@ async fn resources_list_read_and_templates() {
     )
     .await;
     assert_eq!(legacy_missing["error"]["code"], -32002);
+    let alias = existing_session_handle(&server).await;
     let live = ask(
         &server,
         modern(
             8,
             "resources/read",
-            json!({"uri": "proxyx://sessions/0f6d3a4e-5b1c-4d52-9a0e-7c1b2e8d4f10"}),
+            json!({"uri": format!("proxyx://sessions/{alias}")}),
         ),
     )
     .await;

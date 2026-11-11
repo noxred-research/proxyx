@@ -249,8 +249,8 @@ fn cloudfront_signed_url(domain: &str, key_pair_id: &str, pem: &str, key: &str) 
 
     use rsa::pkcs1::DecodeRsaPrivateKey as _;
     use rsa::pkcs8::DecodePrivateKey as _;
-    let private_key = rsa::RsaPrivateKey::from_pkcs1_pem(pem)
-        .or_else(|_| rsa::RsaPrivateKey::from_pkcs8_pem(pem))
+    let private_key = rsa::PrivateKey::from_pkcs1_pem(pem)
+        .or_else(|_| rsa::PrivateKey::from_pkcs8_pem(pem))
         .ok()?;
 
     const SHA1_DI: &[u8] = &[
@@ -295,6 +295,68 @@ mod tests {
             sql,
             "azureBlobStorage('https://exampleaccount.blob.core.windows.net', \
              'traffic-views', 'traffic-views/org-1/view.parquet', 'Parquet')"
+        );
+    }
+
+    /// The signed URL verifies with the key pair's public key over CloudFront's canned
+    /// policy, PKCS#1 v1.5 with a SHA-1 digest, in CloudFront's URL-safe base64.
+    #[test]
+    fn cloudfront_signature_verifies_with_the_public_key() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use rsa::Generate as _;
+        use rsa::pkcs8::{EncodePrivateKey as _, LineEnding};
+        use sha1::Digest as _;
+
+        let key = rsa::PrivateKey::generate();
+        let pem = key.to_pkcs8_pem(LineEnding::LF).expect("pem");
+        let url = cloudfront_signed_url("cdn.example.test", "K2ABCDEF", &pem, "views/a.parquet")
+            .expect("a configured key signs");
+        let query = url.split_once('?').expect("query").1;
+        let param = |name: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+                .expect(name)
+                .to_owned()
+        };
+        assert_eq!(param("Key-Pair-Id"), "K2ABCDEF");
+        let expires = param("Expires");
+        let signature = STANDARD
+            .decode(
+                param("Signature")
+                    .replace('-', "+")
+                    .replace('_', "/")
+                    .replace('~', "="),
+            )
+            .expect("base64");
+        let policy = format!(
+            r#"{{"Statement":[{{"Resource":"https://cdn.example.test/views/a.parquet","Condition":{{"DateLessThan":{{"AWS:EpochTime":{expires}}}}}}}]}}"#
+        );
+        let mut digest_info = vec![
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+            0x14,
+        ];
+        digest_info.extend_from_slice(&sha1::Sha1::digest(policy.as_bytes()));
+        key.to_public_key()
+            .verify(
+                rsa::pkcs1v15::Pkcs1v15Sign::new_unprefixed(),
+                &digest_info,
+                &signature,
+            )
+            .expect("signature verifies");
+        // A different policy (another expiry) does not verify.
+        let mut tampered = digest_info.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 1;
+        }
+        assert!(
+            key.to_public_key()
+                .verify(
+                    rsa::pkcs1v15::Pkcs1v15Sign::new_unprefixed(),
+                    &tampered,
+                    &signature
+                )
+                .is_err()
         );
     }
 }

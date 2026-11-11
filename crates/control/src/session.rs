@@ -16,6 +16,10 @@ use common::wire::{self, request_log_message};
 #[error("active session has different upstream_overrides")]
 pub struct UpstreamOverridesConflict;
 
+#[derive(Debug, thiserror::Error)]
+#[error("active session has different insecure_upstream_tls")]
+pub struct InsecureUpstreamTlsConflict;
+
 /// Build an authenticated proxy URL from a `host:port` and scheme.
 fn build_authenticated_url(scheme: &str, host_port: &str, session_id: Uuid) -> String {
     format!("{}://{}:password@{}", scheme, session_id, host_port)
@@ -205,6 +209,8 @@ impl SessionManager {
     /// deadline is later, and the existing session is returned. A `warning`
     /// field is set on the response if the caller's capture config differs
     /// from the existing session's config.
+    /// Differences in private upstream routes or upstream TLS verification policy
+    /// are rejected before attaching; these settings cannot be silently inherited.
     pub async fn create(&self, req: CreateSessionRequest) -> Result<CreateSessionResponse> {
         let ttl_secs = if req.ttl_secs > 0 {
             req.ttl_secs
@@ -285,6 +291,7 @@ impl SessionManager {
             captured_hosts: req.captured_hosts,
             excluded_hosts: req.excluded_hosts,
             upstream_overrides: req.upstream_overrides,
+            insecure_upstream_tls: req.insecure_upstream_tls,
             inject_headers: req.inject_headers,
             serialize: req.serialize,
             expires_at_ms,
@@ -728,7 +735,7 @@ impl SessionManager {
         new_expires_at: time::OffsetDateTime,
     ) -> Result<Option<CreateSessionResponse>> {
         // Find a candidate first; only increment its reference after Redis config
-        // confirms this caller cannot attach to a different private route map.
+        // confirms the private route map and upstream TLS policy match this request.
         let session_id = self
             .db
             .active_session(&req.org_id, &req.source, &req.source_id)
@@ -762,9 +769,7 @@ impl SessionManager {
         let existing: SessionConfig =
             serde_json::from_str(&raw).context("failed to deserialize existing session config")?;
 
-        if req.upstream_overrides != existing.upstream_overrides {
-            return Err(UpstreamOverridesConflict.into());
-        }
+        ensure_attach_config_matches(req, &existing)?;
 
         let effective_expires_at_ms = self
             .db
@@ -831,6 +836,20 @@ fn ms_to_offset_dt(ms: i64) -> time::OffsetDateTime {
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
 }
 
+/// Reject security-sensitive differences before changing the existing session's references or TTL.
+fn ensure_attach_config_matches(
+    req: &CreateSessionRequest,
+    existing: &SessionConfig,
+) -> Result<()> {
+    if req.upstream_overrides != existing.upstream_overrides {
+        return Err(UpstreamOverridesConflict.into());
+    }
+    if req.insecure_upstream_tls != existing.insecure_upstream_tls {
+        return Err(InsecureUpstreamTlsConflict.into());
+    }
+    Ok(())
+}
+
 /// Compare the incoming request's capture config against the existing
 /// session and return a human-readable warning if they differ.
 fn detect_config_mismatch(req: &CreateSessionRequest, existing: &SessionConfig) -> Option<String> {
@@ -859,5 +878,53 @@ fn detect_config_mismatch(req: &CreateSessionRequest, existing: &SessionConfig) 
             "attached to existing session but config differs on: {}; existing config is used",
             diffs.join(", ")
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_requires_matching_upstream_tls_policy() {
+        for requested in [false, true] {
+            let request: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+                "captured_hosts": [],
+                "inject_headers": [],
+                "serialize": false,
+                "org_id": "org",
+                "source": "test",
+                "source_id": "run",
+                "ttl_secs": 60,
+                "insecure_upstream_tls": requested
+            }))
+            .unwrap();
+            for stored in [false, true] {
+                let config: SessionConfig = serde_json::from_value(serde_json::json!({
+                    "session_id": Uuid::nil(),
+                    "org_id": "org",
+                    "source": "test",
+                    "source_id": "run",
+                    "captured_hosts": [],
+                    "excluded_hosts": [],
+                    "inject_headers": [],
+                    "serialize": false,
+                    "expires_at_ms": i64::MAX,
+                    "insecure_upstream_tls": stored
+                }))
+                .unwrap();
+                let result = ensure_attach_config_matches(&request, &config);
+                if requested == stored {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .downcast_ref::<InsecureUpstreamTlsConflict>()
+                            .is_some()
+                    );
+                }
+            }
+        }
     }
 }

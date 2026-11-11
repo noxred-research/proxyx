@@ -5,6 +5,8 @@ name: ci
 # actor and, for pull requests, the author and that the head branch is not a fork. Every other
 # job needs it. The privileged fork-PR trigger and `workflow_run` are deliberately not used,
 # and the gate refuses any event outside the allow-list below.
+# Scheduled runs retain GitHub's recorded actor (the last cron/default-branch editor);
+# that user must remain a code owner. Main-branch pushes check the pusher, not commit authors.
 #
 # This gate is defense in depth. The authoritative controls are repository settings that the
 # maintainers apply: fork pull request workflows disabled (or approval required for all
@@ -74,6 +76,10 @@ jobs:
           # CODEOWNERS comes from the default branch through the API, never from the checkout
           # of the event under test, so a change to the file cannot authorize itself.
           branch="${DEFAULT_BRANCH:-$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)}"
+          case "$EVENT_NAME" in
+            push) [ "$GITHUB_REF" = refs/heads/main ] || deny "push is not on main" ;;
+            schedule) [ "$GITHUB_REF" = "refs/heads/$branch" ] || deny "schedule is not on the default branch" ;;
+          esac
           codeowners=$(gh api "repos/$GITHUB_REPOSITORY/contents/.github/CODEOWNERS?ref=${branch}" --jq .content | base64 -d)
           # Users owning the `*` rule (the last `*` line wins, as in GitHub). Team owners
           # (@org/team) cannot be resolved with the workflow token and are ignored.
@@ -199,7 +205,7 @@ jobs:
       contents: read
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42 # PostgreSQL 18 official image
         env:
           POSTGRES_USER: proxyx
           POSTGRES_PASSWORD: proxyx

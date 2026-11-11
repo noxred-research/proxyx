@@ -76,7 +76,10 @@ impl RpcWsTrafficQuery {
         })
     }
 }
-use crate::session::{OrgRow, SessionManager, UpstreamOverridesConflict, replicate_ratelimit};
+use crate::session::{
+    InsecureUpstreamTlsConflict, OrgRow, SessionManager, UpstreamOverridesConflict,
+    replicate_ratelimit,
+};
 use common::types::{
     CreateSessionRequest, EgressProxy, Org, ProxyType, RateLimitSettings, SessionConfig,
 };
@@ -300,7 +303,9 @@ async fn create_session(
     require_service_org(&principal, &req.org_id)
         .map_err(|_| AppError::forbidden("service principal cannot access requested org"))?;
     let response = state.session_manager.create(req).await.map_err(|e| {
-        if e.downcast_ref::<UpstreamOverridesConflict>().is_some() {
+        if e.downcast_ref::<UpstreamOverridesConflict>().is_some()
+            || e.downcast_ref::<InsecureUpstreamTlsConflict>().is_some()
+        {
             return AppError::conflict(e.to_string());
         }
         tracing::error!(error = %e, "session creation failed");

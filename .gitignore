@@ -6,15 +6,38 @@
 .env
 .env.*
 !.env.example
+*.env
+!docker/db-mariadb.env
+!docker/db-sqlite.env
 /pool.toml
 /intercept.toml
 /control.toml
+/edge.toml
+/mcp.toml
 *.local.toml
 /secrets
 /data/inventory
 *.pem
 *.key
 *.der
+*.p12
+*.pfx
+
+# Local state, captures and exports (the tracked data/ files are configuration examples)
+/session.json
+/data/captures/
+/data/exports/
+/data/ca/
+/captures/
+/exports/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.pcap
+*.pcapng
 
 # Python (prober)
 __pycache__/

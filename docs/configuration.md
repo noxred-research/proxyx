@@ -164,6 +164,7 @@ Per-org request rate limits. See [session-proxy.md](session-proxy.md#rate-limiti
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `max_body_capture` | `PROXYX_INTERCEPT_TUNING__MAX_BODY_CAPTURE` | `524288` | Largest request or response body (and WebSocket payload) kept in a capture, in bytes. Larger bodies are truncated and flagged. |
+| `max_ws_compressed_message_bytes` | `PROXYX_INTERCEPT_TUNING__MAX_WS_COMPRESSED_MESSAGE_BYTES` | `16777216` | Largest compressed (`permessage-deflate`) WebSocket message buffered for capture. A larger one closes the WebSocket with status `1009` before it is buffered.|
 | `max_header_capture` | `PROXYX_INTERCEPT_TUNING__MAX_HEADER_CAPTURE` | `512` | Largest header value kept, in bytes. |
 | `exchange_channel_capacity` | `PROXYX_INTERCEPT_TUNING__EXCHANGE_CHANNEL_CAPACITY` | `8` | Per-tunnel queue between the interception path and the capture publisher. |
 | `max_connections` | `PROXYX_INTERCEPT_TUNING__MAX_CONNECTIONS` | `10000` | Most concurrent connections across all listeners. |
@@ -192,6 +193,18 @@ Required when `capture_store.backend = "opensearch"`. OpenSearch 2.x or Elastics
 | `tcp_keepalive_secs` | `..__TCP_KEEPALIVE_SECS` | `60` | TCP keepalive interval; `0` disables it. |
 | `max_retries`, `retry_initial_backoff_ms`, `retry_max_backoff_ms` | `..__MAX_RETRIES` and so on | `3`, `200`, `5000` | In-place retries of a `_bulk` request after a transient failure, with exponential backoff and jitter. `0` disables the in-place retry. |
 | `bulk_size`, `flush_interval_secs`, `max_buffer_bytes`, `circuit_breaker_threshold`, `circuit_breaker_reset_secs` | `..__BULK_SIZE` and so on | as `[clickhouse]` | Batching, backpressure and circuit breaker, with the same meaning as the ClickHouse keys. |
+
+### `[tls]`
+
+Upstream TLS of intercepted connections. Certificates are verified by default; a failure answers `502` with `X-ProxyX-Error: upstream_tls` and captures nothing.
+
+| Key | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `verify_upstream` | `PROXYX_INTERCEPT_TLS__VERIFY_UPSTREAM` | `true` | Verify the upstream certificate chain and host name. `false` turns verification off for every session; use only in a closed test lab. |
+| `ca_bundle` | `PROXYX_INTERCEPT_TLS__CA_BUNDLE` | unset | PEM file of extra trusted roots, added to the system roots (for example a test lab's private CA). |
+| `insecure_upstream_hosts` | `PROXYX_INTERCEPT_TLS__INSECURE_UPSTREAM_HOSTS` | `[]` | Exact host names (case-insensitive) whose certificates are not verified, such as self-signed test targets. |
+
+A session can also turn verification off for itself with `insecure_upstream_tls: true` in `POST /rpc/sessions`, for authorized testing of hosts with self-signed certificates.
 
 ### `[ca]`
 
@@ -361,6 +374,7 @@ Exports exist only with the ClickHouse capture store; with `opensearch` they ans
 | `PROXYX_LIMITER_REAPER_MS` | `1000` | Interval of the TTL reaper, in milliseconds. |
 | `PROXYX_LIMITER_MAX_CONNECTIONS` | `4096` | Open connections the service accepts. It runs one thread per connection, so the cap bounds threads and memory. A connection above it is closed at once and counted in `proxyx_limiter_connections_refused_total`. |
 | `PROXYX_LIMITER_TCP_KEEPALIVE_SECS` | `60` | Idle time before the first TCP keepalive probe on accepted sockets. Probes then repeat every sixth of that time (at least 1 s), and the peer is dropped after 3 unanswered probes, so a client host that vanished does not hold a thread forever. `0` turns keepalive off. |
+| `PROXYX_LIMITER_IDLE_TIMEOUT_MS` | `60000` | Longest read inactivity on a connection, in milliseconds; each successful read restarts it, and it also bounds a blocked write. An idle connection is closed and frees its admission slot. A new connection must finish its handshake within a fixed 5 s of acceptance. Unset, invalid or `0` uses the default. |
 | `PROXYX_LIMITER_METRICS_ADDR` | empty (off) | Address of the plain-HTTP operations port with `/healthz`, `/readyz` and `/metrics` (for example `127.0.0.1:39092`). See [metrics/limiter.md](metrics/limiter.md). |
 
 A value that is not a positive integer falls back to the default (for `PROXYX_LIMITER_TCP_KEEPALIVE_SECS`, `0` is valid and means off).
@@ -375,6 +389,7 @@ The session proxy talks to the limiter through a pooled client (`backend = "limi
 |---|---|---|
 | Connect and handshake timeout | 1 s | A connect that does not finish counts as a transport failure. |
 | Exchange timeout | 1 s | One request/response on an open connection. On timeout the connection is dropped. |
+| Pooled maximum idle (`ResilienceConfig::max_idle`) | 30 s | Connections idle this long are dropped at checkout, before the server's default 60 s timeout. A reused socket that fails with EOF, reset or broken pipe before any response byte is retried once on a fresh connection; successful recovery does not count as a transport failure. Fresh connections, partial responses and timeouts are never retried. |
 | TCP keepalive | 30 s idle, 3 probes | Detects a peer that vanished without a FIN. |
 | Circuit breaker | opens after 5 consecutive transport failures, stays open 2 s, then lets one probe through | While open, no connection is attempted: `consume` returns at once the answer of the fail policy (`failopen_policy`: `grant_tokens` allows, `deny` rejects with the same `429`), and `create` fails. A `FULL` or `STALE` reply counts as a success, because the service answered. |
 

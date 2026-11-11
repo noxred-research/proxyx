@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use rcgen::{CertificateParams, KeyPair};
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::time::Duration;
 
@@ -65,8 +66,11 @@ fn decode_key_material(value: &str, var_name: &str) -> Result<Vec<u8>> {
 fn load_from_files(cert_path: &Path, key_path: &Path) -> Result<CertificateAuthority> {
     let cert_der =
         std::fs::read(cert_path).with_context(|| format!("read CA cert: {:?}", cert_path))?;
-    let key_der =
-        std::fs::read(key_path).with_context(|| format!("read CA key: {:?}", key_path))?;
+    let mut key_file = open_private_key(key_path)?;
+    let mut key_der = Vec::new();
+    key_file
+        .read_to_end(&mut key_der)
+        .with_context(|| format!("read CA key: {:?}", key_path))?;
 
     tracing::info!(?cert_path, ?key_path, "loaded CA from files");
     CertificateAuthority::from_der(&cert_der, &key_der)
@@ -105,14 +109,153 @@ fn load_or_generate(data_dir: &Path) -> Result<CertificateAuthority> {
     let cert_path = data_dir.join("ca.der");
     let key_path = data_dir.join("ca.key.der");
 
-    if cert_path.exists() && key_path.exists() {
-        load_from_files(&cert_path, &key_path)
-    } else {
-        let (cert_der, key_der) = generate()?;
-        std::fs::create_dir_all(data_dir)?;
-        std::fs::write(&cert_path, &cert_der)?;
-        std::fs::write(&key_path, &key_der)?;
-        tracing::info!(?cert_path, ?key_path, "saved generated CA to files");
-        CertificateAuthority::from_der(&cert_der, &key_der)
+    if cert_path.exists() || key_path.exists() {
+        return load_from_files(&cert_path, &key_path);
+    }
+
+    let (cert_der, key_der) = generate()?;
+    create_private_dir(data_dir)?;
+    // Claim the key first, without truncating another process's CA material.
+    match write_new(&key_path, &key_der).and_then(|()| write_new(&cert_path, &cert_der)) {
+        Ok(()) => {
+            tracing::info!(?cert_path, ?key_path, "saved generated CA to files");
+            CertificateAuthority::from_der(&cert_der, &key_der)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_from_files(&cert_path, &key_path)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
+fn open_private_key(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::File::open(path)
+        .inspect_err(|error| {
+            tracing::warn!(?path, %error, "refusing to load unreadable CA private key");
+        })
+        .with_context(|| format!("open CA key: {:?}", path))?;
+    #[cfg(unix)]
+    validate_key_metadata(&file.metadata()?, path, nix::unistd::geteuid().as_raw())?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_key_metadata(metadata: &std::fs::Metadata, path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        tracing::warn!(
+            ?path,
+            owner_uid = metadata.uid(),
+            expected_uid = uid,
+            mode = format_args!("{:o}", metadata.mode() & 0o777),
+            "refusing to load insecure CA private key"
+        );
+        anyhow::bail!(
+            "insecure CA private key {:?}: must be owned by uid {} with no group or other permissions",
+            path,
+            uid
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    #[test]
+    fn generated_ca_uses_private_directories_and_files() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("nested");
+        load_or_generate(&dir)?;
+        for path in [&root, &dir] {
+            assert_eq!(std::fs::metadata(path)?.mode() & 0o777, 0o700);
+        }
+        let key_path = dir.join("ca.key.der");
+        let key_metadata = std::fs::metadata(&key_path)?;
+        assert_eq!(key_metadata.mode() & 0o777, 0o600);
+        assert_eq!(key_metadata.uid(), nix::unistd::geteuid().as_raw());
+        let key = std::fs::read(&key_path)?;
+        load_or_generate(&dir)?;
+        assert_eq!(std::fs::read(&key_path)?, key);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn loading_rejects_group_or_world_accessible_keys() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        load_or_generate(&dir)?;
+        let cert_path = dir.join("ca.der");
+        let key_path = dir.join("ca.key.der");
+        let key = std::fs::read(&key_path)?;
+        for mode in [0o640, 0o604, 0o620, 0o602] {
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(mode))?;
+            let error = load_from_files(&cert_path, &key_path)
+                .err()
+                .expect("unsafe key rejected");
+            assert!(error.to_string().contains("insecure CA private key"));
+            assert!(load_or_generate(&dir).is_err());
+            assert_eq!(std::fs::read(&key_path)?, key);
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn key_metadata_rejects_another_owner() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        load_or_generate(&dir)?;
+        let path = dir.join("ca.key.der");
+        let metadata = std::fs::metadata(&path)?;
+        let error = validate_key_metadata(&metadata, &path, metadata.uid().wrapping_add(1))
+            .expect_err("another owner's key rejected");
+        assert!(error.to_string().contains("insecure CA private key"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_key_creation_does_not_overwrite_files_or_follow_symlinks() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        create_private_dir(&dir)?;
+        let key_path = dir.join("ca.key.der");
+        write_new(&key_path, b"original")?;
+        assert_eq!(
+            write_new(&key_path, b"replacement").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let link = dir.join("key-link");
+        symlink(&key_path, &link)?;
+        assert_eq!(
+            write_new(&link, b"replacement").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&key_path)?, b"original");
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

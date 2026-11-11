@@ -13,6 +13,10 @@ We take the security of ProxyX and of the people who run it seriously. This page
 
 ProxyX is pre-1.0. Only the latest 0.1.x release receives security fixes. The distribution is the source repository and tagged source releases. No binaries, container images, hosted service or crates.io packages are published, so there are no other artifacts to patch. The [Dockerfile](docker/Dockerfile) and [Compose file](docker/docker-compose.yml) in this repository are for development: do not expose the Compose stack to a network you do not control.
 
+### Automated security checks
+
+The [security workflow](.github/workflows/security.yml) checks locked dependencies against current Rust advisories, scans all fetched Git history with gitleaks and audits workflow configuration with zizmor on main-branch pushes, weekly and on manual dispatch. [CodeQL](.github/workflows/codeql.yml) analyzes Rust and GitHub Actions on authorized pull requests, main-branch pushes, weekly and on manual dispatch; analysis and upload are disabled while the repository is private. These checks use a code-owner authorization gate and do not replace manual review. Repository fork-workflow restrictions, required code-owner review and private vulnerability reporting must be configured separately by a maintainer.
+
 ## Reporting a vulnerability
 
 **Do not open a public issue, pull request or discussion for a suspected vulnerability.** Report it privately through GitHub private vulnerability reporting for `noxred-research/proxyx`:

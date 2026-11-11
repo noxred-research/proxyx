@@ -437,6 +437,8 @@ pub struct Opened {
     pub egress: Option<IpAddr>,
     /// Address the stream is connected to (the parent's, via a parent).
     pub peer: IpAddr,
+    /// Approved numeric target for an absolute-form request sent to an HTTP parent.
+    pub destination: SocketAddr,
     pub parent: Option<Arc<Parent>>,
     /// The stream speaks to an HTTP proxy.
     pub http_proxy: bool,
@@ -448,7 +450,7 @@ pub struct Opened {
 
 /// The outcome of the access rules and the destination check.
 pub struct Checked {
-    /// Resolved destination addresses (never empty).
+    /// Resolved destination addresses individually approved by the ACL (never empty).
     pub ips: Vec<IpAddr>,
     pub rule: Option<String>,
 }
@@ -510,23 +512,51 @@ fn check_destination_stage(
     checked: &mut Checked,
     stage: crate::acl::RuleStage,
 ) -> Result<(), Refusal> {
-    if !c.state.rules.has_stage(stage) {
+    if stage != crate::acl::RuleStage::Request && !c.state.rules.has_stage(stage) {
         return Ok(());
     }
-    let verdict = c.state.rules.evaluate_stage(stage, &c.req(&checked.ips));
-    enforce_verdict(c.shared, &verdict)?;
-    if !verdict.allow_internal
-        && std::iter::once(c.host.to_owned())
-            .chain(checked.ips.iter().map(ToString::to_string))
-            .any(|host| dial::is_denied_destination(&Target { host, port: c.port }))
-    {
-        c.shared.metrics.destination_denied_total.inc();
-        return Err(Refusal {
-            kind: RefusalKind::DestinationDenied,
-            rule: verdict.rule,
+    let mut refusal = None;
+    let mut first_rule = None;
+    let mut allowed = false;
+    checked.ips.retain(|ip| {
+        let verdict = c
+            .state
+            .rules
+            .evaluate_stage(stage, &c.req(std::slice::from_ref(ip)));
+        let result = enforce_verdict(c.shared, &verdict).and_then(|()| {
+            if !verdict.allow_internal
+                && [c.host.to_owned(), ip.to_string()]
+                    .into_iter()
+                    .any(|host| dial::is_denied_destination(&Target { host, port: c.port }))
+            {
+                c.shared.metrics.destination_denied_total.inc();
+                return Err(Refusal {
+                    kind: RefusalKind::DestinationDenied,
+                    rule: verdict.rule.clone(),
+                });
+            }
+            Ok(())
         });
+        match result {
+            Ok(()) => {
+                if !allowed {
+                    first_rule = verdict.rule;
+                    allowed = true;
+                }
+                true
+            }
+            Err(error) => {
+                if refusal.is_none() {
+                    refusal = Some(error);
+                }
+                false
+            }
+        }
+    });
+    if !allowed {
+        return Err(refusal.unwrap_or_else(|| Refusal::of(RefusalKind::Forbidden)));
     }
-    checked.rule = verdict.rule;
+    checked.rule = first_rule;
     Ok(())
 }
 
@@ -534,59 +564,37 @@ fn check_destination_stage(
 /// internal destinations (unless the deciding rule opts out). Nothing is
 /// connected and no limit is charged.
 pub async fn check(c: &ReqCtx<'_>) -> Result<Checked, Refusal> {
-    let state = c.state;
-    let metrics = &c.shared.metrics;
-
-    // Destination addresses: an IP literal is its own; a name is resolved when a rule
-    // needs the address before deciding, and always before connecting.
-    let literal: Option<IpAddr> = c.host.parse().ok();
-    let mut ips: Vec<IpAddr> = literal.into_iter().collect();
-    if literal.is_none() && state.uses_dst {
-        ips = resolve(c).await?;
+    if !c.state.uses_dst {
+        let verdict = c.state.rules.evaluate(&c.req(&[]));
+        if verdict.action == Action::Deny {
+            enforce_verdict(c.shared, &verdict)?;
+        }
+        if !verdict.allow_internal
+            && dial::is_denied_destination(&Target {
+                host: c.host.to_owned(),
+                port: c.port,
+            })
+        {
+            c.shared.metrics.destination_denied_total.inc();
+            return Err(Refusal {
+                kind: RefusalKind::DestinationDenied,
+                rule: verdict.rule,
+            });
+        }
     }
-
-    let verdict = state.rules.evaluate(&c.req(&ips));
-    let rule = verdict.rule.clone();
-    let deny = |kind| Refusal {
-        kind,
-        rule: rule.clone(),
+    let ips = match c.host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => resolve(c).await?,
     };
-    if verdict.action == Action::Deny {
-        metrics
-            .acl_decisions_total
-            .with_label_values(&["deny"])
-            .inc();
-        return Err(deny(RefusalKind::Forbidden));
-    }
-    metrics
-        .acl_decisions_total
-        .with_label_values(&["allow"])
-        .inc();
-
-    // ProxyX never proxies to private or internal destinations unless the rule says so.
-    let denied = |host: String| dial::is_denied_destination(&Target { host, port: c.port });
-    if !verdict.allow_internal && denied(c.host.to_owned()) {
-        metrics.destination_denied_total.inc();
-        return Err(deny(RefusalKind::DestinationDenied));
-    }
-    if ips.is_empty() {
-        ips = resolve(c).await.map_err(|mut r| {
-            r.rule = rule.clone();
-            r
-        })?;
-    }
-    if !verdict.allow_internal && ips.iter().any(|ip| denied(ip.to_string())) {
-        metrics.destination_denied_total.inc();
-        return Err(deny(RefusalKind::DestinationDenied));
-    }
-    let mut checked = Checked { ips, rule };
+    let mut checked = Checked { ips, rule: None };
+    check_destination_stage(c, &mut checked, crate::acl::RuleStage::Request)?;
     if c.proto == Proto::Udp {
         check_destination_stage(c, &mut checked, crate::acl::RuleStage::Udp)?;
     }
     Ok(checked)
 }
 
-fn admit(c: &ReqCtx<'_>, ips: &[IpAddr], rule: Option<&str>) -> Result<Held, Refusal> {
+pub(crate) fn admit(c: &ReqCtx<'_>, ips: &[IpAddr], rule: Option<&str>) -> Result<Held, Refusal> {
     let metrics = &c.shared.metrics;
     let deny = |kind| Refusal {
         kind,
@@ -643,6 +651,10 @@ pub async fn open_pinned(c: &ReqCtx<'_>, pinned: Option<&[String]>) -> Result<Op
         kind,
         rule: rule.clone(),
     };
+    let destination = SocketAddr::new(
+        *ips.first().ok_or_else(|| deny(RefusalKind::Forbidden))?,
+        c.port,
+    );
 
     let mut held = admit(c, &ips, rule.as_deref())?;
 
@@ -659,7 +671,6 @@ pub async fn open_pinned(c: &ReqCtx<'_>, pinned: Option<&[String]>) -> Result<Op
         target_host: c.host,
     };
     let plan = Plan {
-        host: c.host,
         port: c.port,
         ips: &ips,
         pool: pick.pool.as_ref(),
@@ -689,6 +700,7 @@ pub async fn open_pinned(c: &ReqCtx<'_>, pinned: Option<&[String]>) -> Result<Op
         bound_addr: upstream.bound_addr,
         chain: upstream.chain,
         peer: upstream.peer,
+        destination,
         parent: upstream.parent,
         http_proxy: upstream.http_proxy,
         reuse_key: upstream.reuse_key,

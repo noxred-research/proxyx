@@ -38,6 +38,8 @@ pub struct ResilienceConfig {
     pub connect_timeout: Duration,
     /// Budget for one request/response exchange on an open connection.
     pub io_timeout: Duration,
+    /// Drop pooled connections idle this long before checkout (default 30 seconds).
+    pub max_idle: Duration,
     /// Idle time before the first TCP keepalive probe; `None` leaves keepalive off.
     pub keepalive: Option<Duration>,
     /// `None` disables the breaker: every operation tries the network.
@@ -49,10 +51,19 @@ impl Default for ResilienceConfig {
         Self {
             connect_timeout: Duration::from_secs(1),
             io_timeout: Duration::from_secs(1),
+            max_idle: Duration::from_secs(30),
             keepalive: Some(Duration::from_secs(30)),
             breaker: Some(BreakerConfig::default()),
         }
     }
+}
+
+/// Only clean disconnects before a response starts permit replay on a reused socket.
+pub(crate) fn retryable_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
 }
 
 /// Circuit state.

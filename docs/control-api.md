@@ -92,6 +92,10 @@ A service principal may only act inside its own org. Any `{org_id}` in a path, `
 
 User principals on `/graphql`: a regular user is limited to its own org (asking for another gives an error); a superadmin may name any org, and when `orgId` is omitted on a search it may query across all orgs.
 
+### API rate limits
+
+`http.per_key_rps` (default 100) and `http.per_key_burst` (default 200) govern two independent token buckets. Before authentication, one bucket limits the TCP peer's source IP; forwarded headers and source ports do not change that identity. Another bucket limits normalized credentials: SHA-256 of the trimmed Bearer token, independent of scheme case and surrounding whitespace, or the trusted-header organization and canonical service/user identity. Changing Authorization spelling cannot replenish a credential's quota. Either exhausted bucket answers `429` with `Retry-After` in seconds. Setting `http.per_key_rps` to zero disables both buckets; concurrency and body limits remain separate.
+
 ## Conventions
 
 - All REST bodies are JSON. Errors are `{"error": "<message>"}` with the status codes shown below. Internal errors return `500` and include the error text.
@@ -163,6 +167,7 @@ Request:
 | `ttl_secs` | yes | `0` uses `session_default_ttl_secs` (default 600) |
 | `excluded_hosts`, `upstream_overrides` | no | default empty |
 | `agent` | no | user-agent string that picks the TLS profile ([session-proxy.md](session-proxy.md#tls-profiles)) |
+| `insecure_upstream_tls` | no | default `false`; disable upstream certificate and hostname verification for this session only, for authorized testing of hosts with self-signed certificates. Prefer a trusted CA bundle instead. |
 
 `upstream_overrides` entries are validated here: invalid entries give `400` naming the entry.
 
@@ -185,7 +190,7 @@ Response `201`:
 |---|---|
 | `400` | empty `org_id` or `source_id`; invalid override entry; malformed body |
 | `403` | org is not the principal's org |
-| `409` | an active session exists for the same `(org_id, source, source_id)` with different `upstream_overrides` |
+| `409` | an active session exists for the same `(org_id, source, source_id)` with different `upstream_overrides` or `insecure_upstream_tls` |
 | `500` | Redis or Postgres failure |
 
 ```sh
@@ -215,7 +220,7 @@ stateDiagram-v2
     closed --> [*]
 ```
 
-- **Attach.** A second `POST /rpc/sessions` with the same `(org_id, source, source_id)` while the session is `active` returns the same `session_id` with `"attached": true`, and increments `ref_count`. The expiry becomes the later of the two deadlines (Redis TTL and `expires_at` both move). The existing configuration is kept: if `captured_hosts`, `excluded_hosts`, `inject_headers`, `serialize` or `agent` differ from the request, the response carries `"warning": "attached to existing session but config differs on: <fields>; existing config is used"`. If `upstream_overrides` differ, the request fails with `409` instead, because routing to private targets must not change under another caller. A unique index allows at most one active row per triple.
+- **Attach.** A second `POST /rpc/sessions` with the same `(org_id, source, source_id)` while the session is `active` returns the same `session_id` with `"attached": true`, and increments `ref_count`. The expiry becomes the later of the two deadlines (Redis TTL and `expires_at` both move). The existing configuration is kept: if `captured_hosts`, `excluded_hosts`, `inject_headers`, `serialize` or `agent` differ from the request, the response carries `"warning": "attached to existing session but config differs on: <fields>; existing config is used"`. If `upstream_overrides` or `insecure_upstream_tls` differ, the request fails with `409` before changing the reference count or expiry. Private routing and upstream TLS trust must not silently change under another caller. A unique index allows at most one active row per triple.
 - **Release.** `DELETE /rpc/sessions/{id}` decrements `ref_count` (never below 0) and answers `200`. Only when it reaches 0 does teardown run: the row moves to `consuming`, `{prefix}:session_invalidations` is published so proxies drop their cached copy, and a `SessionEnd` event is published to the captures log keyed by `source_id`. A `DELETE` is `404` when the session's Redis key no longer exists (expired or never created); while the key exists, a session that is already past `active` answers `200` and does nothing. The Redis key is not removed; it expires at its TTL.
 - **Close.** The ingester marks the row `closed` once the `SessionEnd` and every message its consumer read before it have been stored in ClickHouse (see [capture-pipeline.md](capture-pipeline.md#session-close)).
 - **Reapers.** The API process runs a pass every 60 s. Sessions still `active` more than 300 s after `expires_at` (callers that never `DELETE`) move to `consuming` and get a `SessionEnd`. Sessions stuck in `consuming` for more than 300 s get their `SessionEnd` re-published (each claim renews the row's `closing_at`, so replicas do not publish it twice in one window). The same pass expires old [traffic views](#traffic-views).
@@ -230,7 +235,7 @@ Returns the stored configuration:
 {
   "session_id": "0f6d3a4e-...", "org_id": "acme", "source": "crawler", "source_id": "run-001",
   "agent": null, "captured_hosts": ["*"], "excluded_hosts": [], "upstream_overrides": {},
-  "inject_headers": [], "serialize": false, "expires_at_ms": 1783689600000,
+  "inject_headers": [], "serialize": false, "insecure_upstream_tls": false, "expires_at_ms": 1783689600000,
   "egress_proxy": null, "rate_limit": { "requests_per_minute": 6000, "burst": 1000 }
 }
 ```

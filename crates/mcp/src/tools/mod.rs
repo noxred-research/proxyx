@@ -18,7 +18,7 @@ mod traffic;
 pub mod util;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use proxyx_client::Secret;
@@ -144,6 +144,7 @@ pub struct Ctx {
     pub confirm_token: Option<String>,
     pub credentials: BTreeMap<String, Credential>,
     pub tools: Vec<ToolDef>,
+    session_aliases: Mutex<BTreeMap<String, String>>,
 }
 
 impl std::fmt::Debug for Ctx {
@@ -193,6 +194,7 @@ impl Ctx {
             confirm_token,
             credentials,
             tools,
+            session_aliases: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -306,6 +308,46 @@ impl Ctx {
         Ok(org)
     }
 
+    /// Issue a process-local management handle, never a proxy authentication credential.
+    pub(crate) fn session_alias(&self, id: &str) -> Result<String, ToolError> {
+        let mut aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| ToolError::internal("session handles unavailable"))?;
+        Ok(aliases
+            .entry(id.to_owned())
+            .or_insert_with(|| format!("session_{}", uuid::Uuid::new_v4().simple()))
+            .clone())
+    }
+
+    /// Resolve a management handle. Raw credentials are accepted only with explicit reveal policy.
+    pub(crate) fn resolve_session(&self, handle: &str) -> Result<String, ToolError> {
+        let aliases = self
+            .session_aliases
+            .lock()
+            .map_err(|_| ToolError::internal("session handles unavailable"))?;
+        if let Some((id, _)) = aliases.iter().find(|(_, alias)| alias.as_str() == handle) {
+            return Ok(id.clone());
+        }
+        if self.cfg.safety.reveal_secrets_once && uuid::Uuid::parse_str(handle).is_ok() {
+            return Ok(handle.to_owned());
+        }
+        Err(ToolError::invalid(
+            "session not found: use a session handle from create_session or list_sessions",
+        ))
+    }
+
+    pub(crate) fn check_tool(&self, name: &str) -> Result<(), ToolError> {
+        if self.gate.tool_allowed(name) {
+            Ok(())
+        } else {
+            Err(ToolError::new(
+                FailKind::Refused,
+                format!("tool `{name}` is disabled by this server's allow or deny list"),
+            ))
+        }
+    }
+
     /// A policy for the number of rows a list tool returns.
     pub fn rows(&self, requested: Option<u64>) -> usize {
         let cap = self.cfg.limits.max_rows;
@@ -413,15 +455,7 @@ async fn run_inner(ctx: &Arc<Ctx>, def: &ToolDef, arguments: Value, info: &CallI
 }
 
 async fn execute(ctx: &Arc<Ctx>, def: &ToolDef, arguments: Value, info: &CallInfo) -> ToolResult {
-    if !ctx.gate.tool_allowed(def.name) {
-        return Err(ToolError::new(
-            FailKind::Refused,
-            format!(
-                "tool `{}` is disabled by this server's allow or deny list (safety.allow_tools, safety.deny_tools)",
-                def.name
-            ),
-        ));
-    }
+    ctx.check_tool(def.name)?;
     if let Access::Write(capability) = def.access {
         ctx.gate.check_applicable(capability, None)?;
     }

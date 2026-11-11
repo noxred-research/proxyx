@@ -149,10 +149,12 @@ pub struct HttpLimits {
     /// Requests served at once; one more is answered `503` with `Retry-After: 1`.
     /// `0` disables.
     pub max_in_flight: usize,
-    /// Sustained requests per second per credential (the `Authorization` header,
-    /// or the client address without one); over it answers `429`. `0` disables.
+    /// Sustained requests per second in independent source-address and credential
+    /// buckets; either limit answers `429`. Source addresses use the transport
+    /// peer IP, not forwarded headers. Credentials use normalized bearer tokens
+    /// or trusted-header organization and principal identities. `0` disables both.
     pub per_key_rps: f64,
-    /// Burst allowance of `per_key_rps`.
+    /// Burst allowance of each source-address and credential bucket.
     pub per_key_burst: f64,
 }
 

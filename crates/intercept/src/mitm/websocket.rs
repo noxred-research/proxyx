@@ -163,10 +163,11 @@ pub struct Reassembler {
     leading_opcode: Option<u8>,
     rsv1: bool,
     max_capture: usize,
+    max_compressed_message_bytes: usize,
 }
 
 impl Reassembler {
-    pub fn new(max_capture: usize) -> Self {
+    pub fn new(max_capture: usize, max_compressed_message_bytes: usize) -> Self {
         Self {
             capture_buf: Vec::new(),
             captured_size: 0,
@@ -174,7 +175,30 @@ impl Reassembler {
             leading_opcode: None,
             rsv1: false,
             max_capture,
+            max_compressed_message_bytes,
         }
+    }
+
+    /// Reject compressed frames before buffering their payload, including
+    /// continuations that would exceed the logical message's wire-byte limit.
+    fn check_compressed_size(&self, payload_len: u64, opcode: u8, rsv1: bool) -> Result<()> {
+        if is_control(opcode) {
+            return Ok(());
+        }
+        let (compressed, buffered) = if opcode == OPCODE_CONTINUATION {
+            (self.rsv1, self.capture_buf.len())
+        } else {
+            (rsv1, 0)
+        };
+        if compressed
+            && payload_len > self.max_compressed_message_bytes.saturating_sub(buffered) as u64
+        {
+            bail!(
+                "compressed websocket message exceeds {} bytes",
+                self.max_compressed_message_bytes
+            );
+        }
+        Ok(())
     }
 
     /// Feed a frame's payload bytes (post-unmask for c2s).
@@ -228,14 +252,17 @@ impl Reassembler {
             self.truncated = false;
         }
 
+        self.check_compressed_size(payload.len() as u64, opcode, rsv1)?;
+
         // Tally pre-truncation size and append into the capture buffer.
         // For COMPRESSED messages (rsv1=true) we must retain the FULL
         // compressed payload so the inflater's LZ77 window stays in sync
-        // (context-takeover). Capping happens later on the inflated output.
+        // (context-takeover). The compressed wire-byte limit is enforced
+        // before appending; the capture cap applies to inflated output.
         // For UNCOMPRESSED messages we cap here — no shared window state.
         self.captured_size = self.captured_size.saturating_add(payload.len() as u64);
         if self.rsv1 {
-            // Compressed: keep everything for the inflater.
+            // Compressed: keep the bounded payload for the inflater.
             self.capture_buf.extend_from_slice(payload);
         } else if self.capture_buf.len() < self.max_capture {
             let room = self.max_capture - self.capture_buf.len();
@@ -475,7 +502,7 @@ use bytes::{Bytes, BytesMut};
 use common::types::SessionId;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -497,6 +524,9 @@ pub struct WsContext {
     /// Maximum captured payload bytes per logical message. Wire bytes are
     /// forwarded unaffected; this only caps the captured copy.
     pub max_payload_capture: usize,
+    /// Maximum compressed wire bytes per frame and logical message.
+    /// Exceeding this limit closes both peers with code 1009.
+    pub max_compressed_message_bytes: usize,
     /// `permessage-deflate` parameters parsed from the 101 response. `None`
     /// when the extension was not negotiated.
     pub deflate: Option<DeflateNegotiation>,
@@ -531,6 +561,8 @@ async fn acquire_rate_limit(
 /// Returns when both directional loops have exited (graceful close or peer
 /// EOF). Errors from individual loops are logged with full context and do
 /// not abort the other direction -- WS half-close is legal per RFC 6455.
+/// A compressed wire-byte limit violation instead closes both directions
+/// with code 1009 before buffering the rejected frame's payload.
 pub async fn proxy_websocket<C, U>(
     client: C,
     upstream: U,
@@ -544,9 +576,11 @@ where
     let (client_read, client_write) = tokio::io::split(client);
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
     let ctx = Arc::new(ctx);
+    let (close_tx, _) = watch::channel(false);
 
     // s2c: read upstream, write client. Receives s2c_prefix as initial buffer.
     let s2c_ctx = ctx.clone();
+    let s2c_close_tx = close_tx.clone();
     let s2c_handle = tokio::spawn(async move {
         direction_loop(
             upstream_read,
@@ -554,6 +588,7 @@ where
             WsDirection::S2c,
             s2c_prefix,
             s2c_ctx,
+            s2c_close_tx,
         )
         .await
     });
@@ -567,6 +602,7 @@ where
             WsDirection::C2s,
             Vec::new(),
             c2s_ctx,
+            close_tx,
         )
         .await
     });
@@ -615,6 +651,64 @@ async fn direction_loop<R, W>(
     direction: WsDirection,
     initial_buf: Vec<u8>,
     ctx: Arc<WsContext>,
+    close_tx: watch::Sender<bool>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut close_rx = close_tx.subscribe();
+    let closing = *close_rx.borrow();
+    let result = if closing {
+        Ok(())
+    } else {
+        tokio::select! {
+            biased;
+            _ = close_rx.changed() => Ok(()),
+            result = forward_direction(
+                &mut reader,
+                &mut writer,
+                direction,
+                initial_buf,
+                ctx,
+                close_tx,
+            ) => result,
+        }
+    };
+    let closing = *close_rx.borrow();
+    if closing {
+        // The proxy acts as server toward the client and client toward the
+        // upstream. Only the latter CLOSE must carry an RFC 6455 mask.
+        let code = 1009u16.to_be_bytes();
+        if matches!(direction, WsDirection::C2s) {
+            let random = Uuid::new_v4();
+            let mask = &random.as_bytes()[..4];
+            let frame = [
+                0x88,
+                0x82,
+                mask[0],
+                mask[1],
+                mask[2],
+                mask[3],
+                code[0] ^ mask[0],
+                code[1] ^ mask[1],
+            ];
+            writer.write_all(&frame).await?;
+        } else {
+            writer.write_all(&[0x88, 0x02, code[0], code[1]]).await?;
+        }
+        writer.shutdown().await?;
+    }
+    result
+}
+
+async fn forward_direction<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    direction: WsDirection,
+    initial_buf: Vec<u8>,
+    ctx: Arc<WsContext>,
+    close_tx: watch::Sender<bool>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -629,7 +723,8 @@ where
         buf.extend_from_slice(&initial_buf);
     }
 
-    let mut reassembler = Reassembler::new(ctx.max_payload_capture);
+    let mut reassembler =
+        Reassembler::new(ctx.max_payload_capture, ctx.max_compressed_message_bytes);
     let mut inflater: Option<Inflater> = match (direction, ctx.deflate) {
         (WsDirection::C2s, Some(d)) => Some(Inflater::new(
             d.client_max_window_bits,
@@ -690,6 +785,13 @@ where
             }
         };
 
+        if let Err(error) =
+            reassembler.check_compressed_size(header.payload_len, header.opcode, header.rsv1)
+        {
+            close_tx.send_replace(true);
+            return Err(error);
+        }
+
         let payload_len = match usize::try_from(header.payload_len) {
             Ok(n) => n,
             Err(_) => {
@@ -707,14 +809,14 @@ where
         // Update compressed-message tracking: leading data frames set the
         // flag from rsv1; continuations inherit; control frames don't affect it.
         if !is_control(header.opcode) && header.opcode != OPCODE_CONTINUATION {
-            message_is_compressed = header.rsv1 && inflater.is_some();
+            message_is_compressed = header.rsv1;
         }
 
         // Decide whether this frame can be streamed incrementally (F2.6).
         //
         // Control frames are always small (≤125 bytes) — buffer as before.
         // Compressed frames need the full compressed payload for
-        // permessage-deflate inflation — buffer as before.
+        // permessage-deflate inflation — buffer only within the wire-byte limit.
         // Uncompressed data frames are streamed: forward bytes to the peer as
         // they arrive, capturing only up to max_payload_capture.
         let can_stream = !is_control(header.opcode) && !message_is_compressed;
@@ -893,7 +995,10 @@ where
             // For compressed frames, permessage-deflate inflation requires
             // the full compressed payload, so we buffer the entire frame.
             // Control frames are always ≤125 bytes.
-            let frame_total = header.header_len + payload_len;
+            let frame_total = header
+                .header_len
+                .checked_add(payload_len)
+                .context("ws frame length exceeds usize")?;
             while buf.len() < frame_total {
                 let n = match reader.read(&mut read_chunk).await {
                     Ok(n) => n,
@@ -1280,7 +1385,7 @@ mod tests {
 
     #[test]
     fn reassembler_single_text() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         let m = r
             .feed(b"hello", OPCODE_TEXT, true, false)
             .unwrap()
@@ -1294,7 +1399,7 @@ mod tests {
 
     #[test]
     fn reassembler_fragmented() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         assert!(r.feed(b"he", OPCODE_TEXT, false, true).unwrap().is_none());
         assert!(
             r.feed(b"ll", OPCODE_CONTINUATION, false, false)
@@ -1313,13 +1418,13 @@ mod tests {
 
     #[test]
     fn reassembler_orphan_continuation_rejected() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         assert!(r.feed(b"x", OPCODE_CONTINUATION, true, false).is_err());
     }
 
     #[test]
     fn reassembler_nested_data_rejected() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         r.feed(b"he", OPCODE_TEXT, false, false).unwrap();
         let err = r.feed(b"x", OPCODE_BINARY, true, false).unwrap_err();
         assert!(err.to_string().contains("during fragmentation"));
@@ -1327,7 +1432,7 @@ mod tests {
 
     #[test]
     fn reassembler_rsv1_on_continuation_rejected() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         r.feed(b"he", OPCODE_TEXT, false, true).unwrap();
         let err = r.feed(b"x", OPCODE_CONTINUATION, true, true).unwrap_err();
         assert!(err.to_string().contains("rsv1"));
@@ -1335,7 +1440,7 @@ mod tests {
 
     #[test]
     fn reassembler_truncates_capture_only() {
-        let mut r = Reassembler::new(4); // tiny cap
+        let mut r = Reassembler::new(4, 1024); // tiny capture cap
         let m = r
             .feed(b"hello world", OPCODE_TEXT, true, false)
             .unwrap()
@@ -1347,7 +1452,7 @@ mod tests {
 
     #[test]
     fn reassembler_control_frame_bypasses_state() {
-        let mut r = Reassembler::new(1024);
+        let mut r = Reassembler::new(1024, 1024);
         // Begin fragmented data message.
         r.feed(b"he", OPCODE_TEXT, false, false).unwrap();
         // Interleaved control frame must not poison reassembly state.
@@ -1359,6 +1464,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(done.payload, b"hello");
+    }
+
+    #[test]
+    fn reassembler_rejects_compressed_payload_before_appending() {
+        let mut r = Reassembler::new(1, 4);
+        assert!(r.feed(b"abcde", OPCODE_TEXT, true, true).is_err());
+        assert!(r.capture_buf.is_empty());
+
+        let mut r = Reassembler::new(1, 4);
+        r.feed(b"abc", OPCODE_TEXT, false, true).unwrap();
+        r.feed(b"ping", OPCODE_PING, true, false).unwrap();
+        assert!(r.feed(b"de", OPCODE_CONTINUATION, true, false).is_err());
+        assert_eq!(r.capture_buf, b"abc");
+    }
+
+    #[test]
+    fn reassembler_accepts_compressed_message_at_limit_and_resets_budget() {
+        let mut r = Reassembler::new(1, 4);
+        r.feed(b"ab", OPCODE_TEXT, false, true).unwrap();
+        let message = r
+            .feed(b"cd", OPCODE_CONTINUATION, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.payload, b"abcd");
+        assert!(!message.truncated);
+        assert_eq!(
+            r.feed(b"efgh", OPCODE_BINARY, true, true)
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"efgh"
+        );
     }
 
     // -- Inflater --
@@ -1519,10 +1656,106 @@ mod integration_tests {
             host: "test.local".to_string(),
             capture_tx,
             max_payload_capture: 1024 * 1024,
+            max_compressed_message_bytes: 16 * 1024 * 1024,
             deflate: None,
             capture_control_frames: false,
             exchange_ratelimit: None,
         }
+    }
+
+    fn assert_too_big_close(frame: &[u8], masked: bool) {
+        let header = parse_frame_header(frame).unwrap().unwrap();
+        assert_eq!(header.opcode, OPCODE_CLOSE);
+        assert!(header.fin);
+        assert_eq!(header.mask_key.is_some(), masked);
+        assert_eq!(header.payload_len, 2);
+        assert_eq!(frame.len(), header.header_len + 2);
+        let mut payload = frame[header.header_len..].to_vec();
+        if let Some(key) = header.mask_key {
+            unmask(&mut payload, key);
+        }
+        assert_eq!(parse_close_payload(&payload).0, Some(1009));
+    }
+
+    #[tokio::test]
+    async fn oversized_compressed_frame_header_closes_both_peers_without_payload() {
+        for direction in [WsDirection::C2s, WsDirection::S2c] {
+            let (proxy_client, mut client) = tokio::io::duplex(4096);
+            let (proxy_upstream, mut upstream) = tokio::io::duplex(4096);
+            let (capture_tx, mut capture_rx) = mpsc::channel(8);
+            let mut ctx = make_ctx(capture_tx);
+            ctx.deflate = Some(DeflateNegotiation::default());
+            let advertised_len = u64::try_from(ctx.max_compressed_message_bytes).unwrap() + 1;
+            let proxy = tokio::spawn(proxy_websocket(
+                proxy_client,
+                proxy_upstream,
+                Vec::new(),
+                ctx,
+            ));
+            let mut header = vec![0xc1, 127];
+            header.extend_from_slice(&advertised_len.to_be_bytes());
+            if matches!(direction, WsDirection::C2s) {
+                header[1] |= 0x80;
+                header.extend_from_slice(&[1, 2, 3, 4]);
+                client.write_all(&header).await.unwrap();
+            } else {
+                upstream.write_all(&header).await.unwrap();
+            }
+
+            // Keep both send sides open and send no payload. Rejection must
+            // depend only on the advertised length, not EOF or payload reads.
+            let (client_bytes, upstream_bytes) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let mut client_bytes = Vec::new();
+                    let mut upstream_bytes = Vec::new();
+                    client.read_to_end(&mut client_bytes).await.unwrap();
+                    upstream.read_to_end(&mut upstream_bytes).await.unwrap();
+                    proxy.await.unwrap().unwrap();
+                    (client_bytes, upstream_bytes)
+                })
+                .await
+                .expect("oversized compressed frame waited for payload");
+            assert_too_big_close(&client_bytes, false);
+            assert_too_big_close(&upstream_bytes, true);
+            assert!(capture_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_fragment_budget_rejects_continuation_header_before_payload() {
+        let (proxy_client, mut client) = tokio::io::duplex(4096);
+        let (proxy_upstream, mut upstream) = tokio::io::duplex(4096);
+        let (capture_tx, mut capture_rx) = mpsc::channel(8);
+        let mut ctx = make_ctx(capture_tx);
+        ctx.max_compressed_message_bytes = 8;
+        ctx.deflate = Some(DeflateNegotiation::default());
+        // Initial bytes exercise the post-upgrade prefix path. The control
+        // frame must neither consume nor reset the compressed message budget.
+        let prefix = b"\x41\x04abcd\x89\x01x";
+        let proxy = tokio::spawn(proxy_websocket(
+            proxy_client,
+            proxy_upstream,
+            prefix.to_vec(),
+            ctx,
+        ));
+        // Each fragment fits alone, but 4 + 5 exceeds the message limit.
+        // Send no continuation payload and keep the send side open.
+        upstream.write_all(&[0x80, 5]).await.unwrap();
+        let (client_bytes, upstream_bytes) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut client_bytes = Vec::new();
+                let mut upstream_bytes = Vec::new();
+                client.read_to_end(&mut client_bytes).await.unwrap();
+                upstream.read_to_end(&mut upstream_bytes).await.unwrap();
+                proxy.await.unwrap().unwrap();
+                (client_bytes, upstream_bytes)
+            })
+            .await
+            .expect("oversized continuation waited for payload");
+        assert_eq!(&client_bytes[..prefix.len()], prefix);
+        assert_too_big_close(&client_bytes[prefix.len()..], false);
+        assert_too_big_close(&upstream_bytes, true);
+        assert!(capture_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

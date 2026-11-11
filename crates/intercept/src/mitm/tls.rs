@@ -196,13 +196,17 @@ impl TlsProfile {
 /// The connector is built once per profile at startup and reused for all
 /// connections — `SslConnector::configure()` produces a per-connection
 /// `ConnectConfiguration` from the shared context cheaply.
-pub fn build_connector(profile: TlsProfile) -> Result<SslConnector> {
+pub fn build_connector(
+    profile: TlsProfile,
+    ca_bundle: Option<&std::path::Path>,
+) -> Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
 
-    // Certificate verification is intentionally disabled. The proxy performs
-    // MITM interception by design; verifying upstream certs would break
-    // connections to targets with self-signed or mismatched certificates.
-    builder.set_verify(SslVerifyMode::NONE);
+    // SslConnector loads system roots and enables hostname verification by default.
+    builder.set_verify(SslVerifyMode::PEER);
+    if let Some(bundle) = ca_bundle {
+        builder.set_ca_file(bundle)?;
+    }
 
     // Enforce TLS 1.2 minimum; TLS 1.3 is automatically available.
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
@@ -217,6 +221,25 @@ pub fn build_connector(profile: TlsProfile) -> Result<SslConnector> {
 
     Ok(builder.build())
 }
+
+/// Derive one connection's policy without changing its browser fingerprint.
+pub(super) fn configure_upstream(
+    connector: &SslConnector,
+    insecure: bool,
+) -> Result<boring::ssl::ConnectConfiguration> {
+    let mut config = connector.configure()?;
+    config.set_verify_hostname(!insecure);
+    config.set_verify(if insecure {
+        SslVerifyMode::NONE
+    } else {
+        SslVerifyMode::PEER
+    });
+    Ok(config)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("upstream TLS handshake failed")]
+pub(super) struct UpstreamTlsFailure;
 
 /// Create TLS server config for accepting connections from clients.
 /// Uses dynamic certificate resolution based on SNI.
@@ -284,5 +307,174 @@ impl ResolvesServerCert for CertResolver {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn test_ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "ProxyX test root");
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn origin_config(ca: &rcgen::Certificate, key: &rcgen::KeyPair) -> Arc<ServerConfig> {
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&leaf_key, ca, key)
+            .unwrap();
+        Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(leaf.der().to_vec())],
+                    PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        )
+    }
+
+    async fn connect_origin(
+        connector: &SslConnector,
+        config: Arc<ServerConfig>,
+        host: &str,
+        insecure: bool,
+    ) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(config).accept(tcp).await;
+        });
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let config = if insecure {
+            configure_upstream(connector, true).unwrap()
+        } else {
+            connector.configure().unwrap()
+        };
+        let accepted = tokio_boring::connect(config, host, tcp)
+            .await
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("TLS connection to {host}: {error}"));
+        server.await.unwrap();
+        accepted
+    }
+
+    #[tokio::test]
+    async fn upstream_tls_verifies_chain_and_hostname_for_browser_profiles() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (ca, key) = test_ca();
+        let origin = origin_config(&ca, &key);
+        let bundle =
+            std::env::temp_dir().join(format!("proxyx-roots-{}.pem", uuid::Uuid::new_v4()));
+        std::fs::write(&bundle, ca.pem()).unwrap();
+        for profile in TlsProfile::ALL {
+            let system = build_connector(*profile, None).unwrap();
+            assert!(
+                connect_origin(&system, origin.clone(), "localhost", false)
+                    .await
+                    .is_err()
+            );
+            let trusted = build_connector(*profile, Some(&bundle)).unwrap();
+            connect_origin(&trusted, origin.clone(), "localhost", false)
+                .await
+                .unwrap();
+            assert!(
+                connect_origin(&trusted, origin.clone(), "wrong.example", false)
+                    .await
+                    .is_err()
+            );
+            connect_origin(&system, origin.clone(), "localhost", true)
+                .await
+                .unwrap();
+        }
+        std::fs::remove_file(bundle).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_tls_failure_returns_502_without_capture() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (mitm_ca, mitm_key) = test_ca();
+        let authority =
+            CertificateAuthority::from_der(mitm_ca.der().as_ref(), &mitm_key.serialize_der())
+                .unwrap();
+        let (origin_ca, origin_key) = test_ca();
+        let origin = origin_config(&origin_ca, &origin_key);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(origin).accept(tcp).await;
+        });
+        let network = crate::config::NetworkConfig::default();
+        let handler = super::super::MitmHandler::new(
+            Arc::new(authority),
+            1024,
+            1024,
+            crate::egress::Egress::new(&network, &crate::breaker::BreakerConfig::default()),
+            &network,
+            &crate::config::TlsConfig::default(),
+        )
+        .unwrap();
+        let (client, proxy) = tokio::io::duplex(65536);
+        let (exchange_tx, mut exchange_rx) = tokio::sync::mpsc::channel(4);
+        let intercept = tokio::spawn(async move {
+            handler
+                .intercept(
+                    proxy,
+                    tcp,
+                    super::super::MitmParams {
+                        host: "localhost",
+                        port: 443,
+                        inject_headers: &[],
+                        tls_profile: TlsProfile::Chrome133,
+                        exchange_tx,
+                        exchange_ratelimit: None,
+                        ws_sink: None,
+                        serial_lock: None,
+                        egress_proxy: None,
+                        upstream_tls: true,
+                        insecure_upstream_tls: false,
+                    },
+                )
+                .await
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(mitm_ca.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").unwrap(), client)
+            .await
+            .unwrap();
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"));
+        assert!(response.contains("X-ProxyX-Error: upstream_tls"));
+        assert!(intercept.await.unwrap().is_err());
+        assert!(exchange_rx.recv().await.is_none());
+        server.await.unwrap();
     }
 }

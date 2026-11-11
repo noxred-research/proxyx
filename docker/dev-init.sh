@@ -5,6 +5,8 @@
 # Idempotent: existing files are kept. Not for production: generate and store secrets and
 # the CA with your own tooling there.
 set -eu
+# Secret files must be private from creation, including when generation is interrupted.
+umask 077
 
 secrets=/etc/proxyx/secrets
 ca=/ca
@@ -16,7 +18,14 @@ for name in admin-token prober-token probe-key; do
     fi
 done
 
-if [ ! -s "$ca/ca.der" ]; then
+if [ -e "$ca/ca.pem" ] || [ -e "$ca/ca.key.pem" ] || [ -e "$ca/ca.der" ] || [ -e "$ca/ca.key.der" ]; then
+    for name in ca.pem ca.key.pem ca.der ca.key.der; do
+        if [ ! -s "$ca/$name" ]; then
+            echo "incomplete dev CA: restore all four CA files before restarting init" >&2
+            exit 1
+        fi
+    done
+else
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
         -subj "/CN=ProxyX dev CA/O=ProxyX" \
         -addext "basicConstraints=critical,CA:TRUE" \
@@ -29,5 +38,6 @@ if [ ! -s "$ca/ca.der" ]; then
 fi
 
 chown -R 10001:10001 "$secrets" "$ca"
+chmod 0700 "$secrets" "$ca"
 chmod 0400 "$secrets"/* "$ca"/*.key.*
 chmod 0444 "$ca/ca.pem" "$ca/ca.der"

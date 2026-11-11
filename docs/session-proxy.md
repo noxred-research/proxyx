@@ -112,7 +112,7 @@ Pattern syntax (`host_matches`) is exact and case-sensitive. The host is lower-c
 | `*.example.com` | `example.com` and any subdomain at any depth, but not `notexample.com` |
 | `example.com` | exactly `example.com` |
 
-Ports are not part of the pattern. Hosts that are not captured are tunneled blindly: bytes are copied in both directions and nothing is logged. `no_capture_hosts` (a list in the file, or a comma-separated string in `PROXYX_INTERCEPT_NO_CAPTURE_HOSTS`) is an operator-level deny list that wins over any session, for example package registries you never want to record.
+Ports are not part of the pattern. Non-captured CONNECT and SOCKS5 connections are tunneled blindly and nothing is logged. Non-captured absolute-form HTTP requests instead use a framed, sanitized single exchange and close the client connection. `no_capture_hosts` (a list in the file, or a comma-separated string in `PROXYX_INTERCEPT_NO_CAPTURE_HOSTS`) is an operator-level deny list that wins over any session, for example package registries you never want to record.
 
 ### Upstream overrides
 
@@ -134,7 +134,7 @@ When a connection's `host:port` equals an override key (host compared case-insen
 - the egress proxy is bypassed;
 - the logical `Host` is preserved in the forwarded request.
 
-Plain forward-proxy requests (`GET http://logical-host/...`) on sessions that have overrides are limited to one exchange per connection: the response carries `Connection: close`, so a pooled client cannot reuse the connection for a different authority. When the request is not for an overridden authority and the host is not captured, it is relayed once without capture.
+Plain forward-proxy requests (`GET http://logical-host/...`) on sessions that have overrides, and every non-intercepted HTTP forward request, are limited to one exchange per connection. The response carries `Connection: close`; pipelined requests are not sent to the first origin. Reconnect for another request so authentication, routing, and credential stripping run again. Requests not selected for capture are relayed without capture.
 
 ### Egress proxy chaining
 
@@ -200,12 +200,29 @@ flowchart TD
 
 - **CONNECT.** After `200 Connection Established`, a captured tunnel to port 80 is treated as plaintext HTTP; every other port is assumed to be TLS. Bytes the client pipelined after the `CONNECT` headers (for example a TLS ClientHello) are preserved.
 - **SOCKS5.** SOCKS carries no scheme, so for a captured target the proxy reads the first client bytes: `0x16` means TLS, an HTTP method (`GET `, `POST `, `PUT `, `PATCH `, `DELETE `, `HEAD `, `OPTIONS `, `TRACE `, `CONNECT `, `PRI `) means plaintext HTTP, anything else is copied blindly. Blind tunnels never wait for client bytes, so server-speaks-first protocols work.
-- **TLS.** The client side is terminated with rustls using a certificate minted on demand for the SNI name (see [CA](#ca-and-client-trust)). The proxy then connects to the upstream with BoringSSL using the session's [TLS profile](#tls-profiles) and ALPN `h2, http/1.1`. Upstream certificates are not verified (verification is disabled on purpose, so captures work against self-signed and mismatched targets). The client leg is always HTTP/1.1; if the upstream selects `h2`, the proxy translates each request into an HTTP/2 stream and the response back to HTTP/1.1.
+- **TLS.** The client side is terminated with rustls using a certificate minted on demand for the SNI name (see [CA](#ca-and-client-trust)). The proxy then connects to the upstream with BoringSSL using the session's [TLS profile](#tls-profiles) and ALPN `h2, http/1.1`. Certificate chains and hostnames are verified by default using system roots. An optional `[tls] ca_bundle` PEM file adds trusted roots. The client leg is always HTTP/1.1; if the upstream selects `h2`, the proxy translates each request into an HTTP/2 stream and the response back to HTTP/1.1.
 - **HTTP/1.1 loop.** Requests are parsed, rate limited, forwarded with streaming bodies (64 KiB chunks, `Content-Length` and chunked framing preserved) and captured. Only up to `tuning.max_body_capture` bytes of each body are kept in the capture; the rest is forwarded untouched. On an HTTP/2 upstream the request body is buffered in full before it is sent, up to 64 MiB (`MAX_BUFFERED_BODY`); a larger declared or streamed body is answered with `413 Content Too Large`. The HTTP/1.1 path streams and has no such limit.
 - **WebSocket.** A `101` response to a request offering `Upgrade: websocket` hands the connection to the WebSocket proxy: frames are forwarded byte for byte while a parallel parser reassembles messages and inflates `permessage-deflate` payloads. Each logical message becomes a capture linked to the `101` row through `parent_event_id`. Over an HTTP/2 upstream the proxy uses RFC 8441 Extended CONNECT and falls back to a fresh HTTP/1.1 dial when the server does not advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL`. PING and PONG are forwarded but not captured (the context flag that would capture them is hard-wired off); CLOSE is always captured. The captured payload per message is capped by `tuning.max_body_capture`.
-- **Plain HTTP forward proxying** of a non-captured host with no overrides forwards the request (without `Proxy-Authorization`) and then copies bytes in both directions.
+- **Plain HTTP forward proxying** of a non-captured host sends only one framed request without proxy credentials. Both origin and client connections close after the response; subsequent requests require a fresh authenticated connection.
 
 A captured connection waits for the next request up to 30 s of idleness, then closes. The proxy waits up to 30 s for upstream response headers and answers `504` if none arrive. Body reads give up after 30 s without new bytes.
+
+Chunked bodies impose an 8 KiB limit on each chunk-size line (including extensions) and each trailer line, plus a 64 KiB aggregate trailer limit. Metadata reads have deadlines as well as body idle limits, on streaming HTTP/1.1 and buffered HTTP/1.1-to-HTTP/2 paths. Oversized or stalled framing is rejected and the connection closes.
+
+Compressed WebSocket frames and fragmented compressed messages must fit `tuning.max_ws_compressed_message_bytes` (default 16777216 bytes, 16 MiB). The proxy checks declared sizes before buffering payloads and closes with code `1009` when the bound is exceeded. This transport limit is separate from the captured-payload cap.
+
+### Upstream TLS trust
+
+```toml
+[tls]
+verify_upstream = true
+# ca_bundle = "/etc/proxyx/testing-ca.pem"
+insecure_upstream_hosts = []
+```
+
+Keep verification enabled in production. For authorized testing of hosts with self-signed certificates, prefer adding their CA bundle. A session may explicitly set `insecure_upstream_tls = true` to disable chain and hostname checks for its intercepted upstream TLS connections. The proxy-wide `insecure_upstream_hosts` list makes equivalent exceptions for exact hostnames, compared case-insensitively; it does not support wildcards. Setting `verify_upstream = false` disables upstream verification globally and is unsafe outside controlled testing. Exceptions preserve browser fingerprint profiles and also apply to WebSocket HTTP/1.1 fallback dials.
+
+An upstream verification or handshake failure produces `502 Bad Gateway` with `X-ProxyX-Error: upstream_tls` inside the intercepted TLS connection. No exchange is captured. Non-intercepted TLS tunnels remain end-to-end: the client verifies the origin certificate.
 
 ## CA and client trust
 
@@ -240,7 +257,7 @@ openssl x509 -in ca.pem -outform DER -out ca.der          # proxy ca.type = file
 openssl pkey -in ca-key.pem -outform DER -out ca.key.der  # proxy ca.type = file
 ```
 
-`generate` is for local development only: the generated CA key sits unprotected in `data_dir`.
+On Unix, generated CA directories use mode `0700`, and private keys are created exclusively with mode `0600`. Existing private-key files must be owned by the process's effective UID, with no group or world permissions. Both the control plane and session proxy warn and refuse unsafe key files; correct ownership and run `chmod 600 ca.key.der` before restarting. Generated keys are not encrypted at rest, so protect the storage volume and backups.
 
 ## TLS profiles
 

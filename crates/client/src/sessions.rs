@@ -88,6 +88,10 @@ pub struct CreateSessionRequest {
     pub agent: Option<String>,
     /// Lifetime in seconds. `0` is the server default (600 s).
     pub ttl_secs: u32,
+    /// Accept upstream TLS certificates that fail verification (self-signed test targets).
+    /// For authorized testing only; omitted from the request when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_upstream_tls: bool,
 }
 
 impl CreateSessionRequest {
@@ -108,6 +112,7 @@ impl CreateSessionRequest {
             source_id: source_id.into(),
             agent: None,
             ttl_secs: DEFAULT_TTL_SECS,
+            insecure_upstream_tls: false,
         }
     }
 
@@ -171,6 +176,14 @@ impl CreateSessionRequest {
     #[must_use]
     pub fn ttl_secs(mut self, ttl_secs: u32) -> Self {
         self.ttl_secs = ttl_secs;
+        self
+    }
+
+    /// Accept upstream certificates that fail verification for this session (self-signed
+    /// test targets). Authorized testing only; the proxy verifies by default.
+    #[must_use]
+    pub fn insecure_upstream_tls(mut self, insecure: bool) -> Self {
+        self.insecure_upstream_tls = insecure;
         self
     }
 
@@ -380,6 +393,9 @@ pub struct SessionConfig {
     pub inject_headers: InjectHeaders,
     /// Whether requests are serialized.
     pub serialize: bool,
+    /// Whether upstream certificate verification is off for this session.
+    #[serde(default)]
+    pub insecure_upstream_tls: bool,
     /// Expiry, Unix milliseconds.
     pub expires_at_ms: i64,
     /// The org's second-hop proxy, if any.

@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::breaker::BreakerConfig;
-use crate::config::{Config, NetworkConfig, TuningConfig};
+use crate::config::{Config, NetworkConfig, TlsConfig, TuningConfig};
 use crate::egress::Egress;
 use crate::mitm::{CertificateAuthority, MitmHandler};
 use crate::pipeline::RequestLogWriter;
@@ -19,6 +19,7 @@ pub struct ProxySettings {
     pub tuning: TuningConfig,
     pub network: NetworkConfig,
     pub breaker: BreakerConfig,
+    pub tls: TlsConfig,
 }
 
 impl From<&Config> for ProxySettings {
@@ -27,6 +28,7 @@ impl From<&Config> for ProxySettings {
             tuning: config.tuning.clone(),
             network: config.network.clone(),
             breaker: config.breaker.clone(),
+            tls: config.tls.clone(),
         }
     }
 }
@@ -40,6 +42,7 @@ pub struct ProxyContext {
     pub exchange_channel_capacity: usize,
     /// Per-message WebSocket payload capture cap. Defaults to `max_body_capture`.
     pub max_ws_payload_capture: usize,
+    pub max_ws_compressed_message_bytes: usize,
     /// Capture PING/PONG too. CLOSE is always captured. Default false.
     pub capture_ws_control_frames: bool,
     /// Global connection semaphore — limits concurrent connection tasks.
@@ -82,6 +85,7 @@ impl ProxyContext {
             tuning,
             network,
             breaker,
+            tls,
         } = settings;
         // For now WS payload cap mirrors HTTP body cap. A separate knob can
         // be plumbed through TuningConfig if WS volume requires it.
@@ -98,12 +102,14 @@ impl ProxyContext {
                 tuning.max_header_capture,
                 egress.clone(),
                 &network,
+                &tls,
             )?,
             egress,
             state,
             pipeline,
             exchange_channel_capacity: tuning.exchange_channel_capacity,
             max_ws_payload_capture,
+            max_ws_compressed_message_bytes: tuning.max_ws_compressed_message_bytes,
             capture_ws_control_frames,
             conn_semaphore: Arc::new(Semaphore::new(tuning.max_connections)),
             network,

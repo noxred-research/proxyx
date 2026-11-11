@@ -32,13 +32,11 @@ pub fn load_ca_cert_pem(ca_config: &crate::config::CaConfig) -> Result<String> {
 fn load_or_generate_shared(data_dir: &Path) -> Result<String> {
     let cert_path = data_dir.join("ca.der");
     let key_path = data_dir.join("ca.key.der");
-    if cert_path.exists() {
-        let der = std::fs::read(&cert_path)?;
-        tracing::info!(?cert_path, "loaded shared CA certificate");
-        return Ok(der_to_pem(&der));
+    if cert_path.exists() || key_path.exists() {
+        return load_shared_cert(&cert_path, &key_path);
     }
     let (cert_der, key_der) = generate()?;
-    std::fs::create_dir_all(data_dir)?;
+    create_private_dir(data_dir)?;
     // `create_new` so a session proxy that generated concurrently wins and we
     // read its certificate rather than overwrite it.
     match write_new(&key_path, &key_der).and_then(|()| write_new(&cert_path, &cert_der)) {
@@ -47,7 +45,7 @@ fn load_or_generate_shared(data_dir: &Path) -> Result<String> {
             Ok(der_to_pem(&cert_der))
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(der_to_pem(&std::fs::read(&cert_path)?))
+            load_shared_cert(&cert_path, &key_path)
         }
         Err(err) => Err(err.into()),
     }
@@ -55,11 +53,61 @@ fn load_or_generate_shared(data_dir: &Path) -> Result<String> {
 
 fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    file.write_all(bytes)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn load_shared_cert(cert_path: &Path, key_path: &Path) -> Result<String> {
+    // Validate the opened key's metadata, not a separately resolved pathname.
+    let _key_file = std::fs::File::open(key_path).inspect_err(|error| {
+        tracing::warn!(?key_path, %error, "refusing to load unreadable CA private key");
+    })?;
+    #[cfg(unix)]
+    validate_key_metadata(
+        &_key_file.metadata()?,
+        key_path,
+        nix::unistd::geteuid().as_raw(),
+    )?;
+    let der = std::fs::read(cert_path)?;
+    tracing::info!(?cert_path, "loaded shared CA certificate");
+    Ok(der_to_pem(&der))
+}
+
+#[cfg(unix)]
+fn validate_key_metadata(metadata: &std::fs::Metadata, path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        tracing::warn!(
+            ?path,
+            owner_uid = metadata.uid(),
+            expected_uid = uid,
+            mode = format_args!("{:o}", metadata.mode() & 0o777),
+            "refusing to load insecure CA private key"
+        );
+        anyhow::bail!(
+            "insecure CA private key {:?}: must be owned by uid {} with no group or other permissions",
+            path,
+            uid
+        );
+    }
+    Ok(())
 }
 
 /// The same CA the session proxy generates: ECDSA P-256, 10 years, with the
@@ -119,6 +167,79 @@ mod tests {
         assert_eq!(first, der_to_pem(&der));
         assert!(first.starts_with("-----BEGIN CERTIFICATE-----\n"));
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_ca_uses_private_directories_and_files() -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("nested");
+        load_or_generate_shared(&dir)?;
+        for path in [&root, &dir] {
+            assert_eq!(std::fs::metadata(path)?.mode() & 0o777, 0o700);
+        }
+        let metadata = std::fs::metadata(dir.join("ca.key.der"))?;
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loading_rejects_group_or_world_accessible_keys() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        load_or_generate_shared(&dir)?;
+        let key_path = dir.join("ca.key.der");
+        let key = std::fs::read(&key_path)?;
+        for mode in [0o640, 0o604, 0o620, 0o602] {
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(mode))?;
+            let error = load_or_generate_shared(&dir).expect_err("unsafe key rejected");
+            assert!(error.to_string().contains("insecure CA private key"));
+            assert_eq!(std::fs::read(&key_path)?, key);
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_metadata_rejects_another_owner() -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        load_or_generate_shared(&dir)?;
+        let path = dir.join("ca.key.der");
+        let metadata = std::fs::metadata(&path)?;
+        let error = validate_key_metadata(&metadata, &path, metadata.uid().wrapping_add(1))
+            .expect_err("another owner's key rejected");
+        assert!(error.to_string().contains("insecure CA private key"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_key_creation_does_not_overwrite_files_or_follow_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("proxyx-ca-{}", uuid::Uuid::new_v4()));
+        create_private_dir(&dir)?;
+        let key_path = dir.join("ca.key.der");
+        write_new(&key_path, b"original")?;
+        assert_eq!(
+            write_new(&key_path, b"replacement").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let link = dir.join("key-link");
+        symlink(&key_path, &link)?;
+        assert_eq!(
+            write_new(&link, b"replacement").unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&key_path)?, b"original");
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }
