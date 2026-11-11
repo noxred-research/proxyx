@@ -1,7 +1,6 @@
 //! Test support: capture finished OTel spans in memory.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use opentelemetry::trace::TracerProvider as _;
@@ -21,12 +20,9 @@ impl Spans {
 }
 
 impl SpanExporter for Spans {
-    fn export(
-        &mut self,
-        batch: Vec<SpanData>,
-    ) -> Pin<Box<dyn Future<Output = OTelSdkResult> + Send + 'static>> {
+    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
         self.0.lock().extend(batch);
-        Box::pin(std::future::ready(Ok(())))
+        std::future::ready(Ok(()))
     }
 }
 

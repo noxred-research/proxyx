@@ -243,7 +243,8 @@ pub async fn redelivery_of_unacked(
 pub async fn session_end_barrier(backend: &dyn Backend, database_url: &str) {
     let admin = sqlx::PgPool::connect(database_url).await.expect("postgres");
     let database = format!("pxt_{}", &Uuid::new_v4().simple().to_string()[..12]);
-    sqlx::query(&format!("CREATE DATABASE {database}"))
+    // The identifier contains only a fixed prefix and UUID hexadecimal digits.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {database}")))
         .execute(&admin)
         .await
         .unwrap();
@@ -317,9 +318,12 @@ pub async fn session_end_barrier(backend: &dyn Backend, database_url: &str) {
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
     pool.close().await;
-    let _ = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
-        .execute(&admin)
-        .await;
+    // Reuse the identifier generated from the UUID above.
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
 }
 
 pub fn arc<T: Backend + 'static>(backend: T) -> Arc<dyn Backend> {

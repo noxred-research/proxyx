@@ -52,6 +52,8 @@ First public development line, version 0.1.0.
 
 ### Changed
 
+- Upgrade the OpenTelemetry family to 0.33 with tracing-opentelemetry 0.34, SQLx to 0.9, HMAC/SHA digests to the digest 0.11 family, and jemallocator to 0.7, preserving trace propagation, database backend support, and signing output.
+
 - Edge request and response header limits now reject complete oversized heads regardless of buffered read segmentation, while retaining exact-limit heads and pipelined bodies. HTTP parent reuse includes every affinity attribute and configuration generation, preventing stale source-address reuse across clients or reloads.
 
 - The Kafka consumer's security protocol follows the configured sections, like the producer: `ssl` with `[kafka.tls]`, `sasl_plaintext` with `[kafka.sasl]` alone, `sasl_ssl` with both. Earlier builds used `sasl_ssl` whenever SASL was set, which a producer without TLS could never talk to.

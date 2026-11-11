@@ -11,7 +11,7 @@
 use sqlx::decode::Decode;
 use sqlx::encode::{Encode, IsNull};
 use sqlx::error::BoxDynError;
-use sqlx::sqlite::{SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef};
+use sqlx::sqlite::{SqliteArgumentsBuffer, SqliteTypeInfo, SqliteValueRef};
 use sqlx::types::Type;
 use sqlx::{MySql, Postgres, Sqlite};
 use time::OffsetDateTime;
@@ -103,11 +103,8 @@ impl Type<Sqlite> for Ts {
     }
 }
 
-impl<'q> Encode<'q, Sqlite> for Ts {
-    fn encode_by_ref(
-        &self,
-        args: &mut Vec<SqliteArgumentValue<'q>>,
-    ) -> Result<IsNull, BoxDynError> {
+impl Encode<'_, Sqlite> for Ts {
+    fn encode_by_ref(&self, args: &mut SqliteArgumentsBuffer) -> Result<IsNull, BoxDynError> {
         Encode::<Sqlite>::encode(self.unix_micros(), args)
     }
 }

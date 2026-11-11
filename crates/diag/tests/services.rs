@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use proxyx_diag::db::database as postgres;
 use proxyx_diag::redis_checks::{RedisOptions, redis_server, redis_stream};
 use proxyx_diag::{Check, Status};
-use sqlx::Connection as _;
+use sqlx::{AssertSqlSafe, Connection as _};
 
 const T: Duration = Duration::from_secs(5);
 /// Redis database index of the doctor tests (contract: doctor 12).
@@ -35,17 +35,21 @@ fn redis_url() -> Option<String> {
 }
 
 /// A database of this test binary on the test server, created empty.
-async fn database(name: &str) -> Option<String> {
+async fn database(name: &'static str) -> Option<String> {
     let Ok(base) = std::env::var("PROXYX_TEST_DATABASE_URL") else {
         eprintln!("SKIP: PROXYX_TEST_DATABASE_URL is not set");
         return None;
     };
     let mut admin = sqlx::PgConnection::connect(&base).await.expect("connect");
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-        .execute(&mut admin)
-        .await
-        .expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {name}"))
+    // The only caller supplies the fixed identifier `proxyx_ops_doctor_diag`.
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+    )))
+    .execute(&mut admin)
+    .await
+    .expect("drop");
+    // `name` is the same fixed test identifier.
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&mut admin)
         .await
         .expect("create");

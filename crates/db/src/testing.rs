@@ -12,8 +12,8 @@
 
 use std::path::Path;
 
-use sqlx::Connection as _;
 use sqlx::types::Json;
+use sqlx::{AssertSqlSafe, Connection as _};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -94,9 +94,12 @@ async fn postgres(base: &str, name: &str, fresh: bool) -> Result<String, sqlx::E
         .execute(&mut admin)
         .await?;
     if fresh {
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .execute(&mut admin)
-            .await?;
+        // `database` restricts `name` to ASCII letters, digits and underscores.
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(&mut admin)
+        .await?;
     }
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
@@ -104,7 +107,8 @@ async fn postgres(base: &str, name: &str, fresh: bool) -> Result<String, sqlx::E
             .fetch_one(&mut admin)
             .await?;
     if !exists {
-        sqlx::query(&format!("CREATE DATABASE {name}"))
+        // `database` validates the interpolated identifier.
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
             .execute(&mut admin)
             .await?;
     }
@@ -126,7 +130,8 @@ async fn mariadb(base: &str, name: &str, fresh: bool) -> Result<String, sqlx::Er
         // directory it removes (error 1010): try again.
         let mut attempt = 0;
         loop {
-            match sqlx::query(&format!("DROP DATABASE IF EXISTS `{name}`"))
+            // `database` validates `name`; it cannot contain a backtick.
+            match sqlx::query(AssertSqlSafe(format!("DROP DATABASE IF EXISTS `{name}`")))
                 .execute(&mut admin)
                 .await
             {
@@ -141,9 +146,10 @@ async fn mariadb(base: &str, name: &str, fresh: bool) -> Result<String, sqlx::Er
             }
         }
     }
-    sqlx::query(&format!(
+    // `database` validates the only interpolated identifier.
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE DATABASE IF NOT EXISTS `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"
-    ))
+    )))
     .execute(&mut admin)
     .await?;
     sqlx::query("SELECT RELEASE_LOCK(?)")
@@ -288,20 +294,23 @@ impl Raw {
     }
 
     /// Run a statement; the rows it changed.
+    /// SQL must be a trusted test template; pass row values through `args`.
     pub async fn execute(&self, sql: &str, args: &[Arg]) -> Result<u64, sqlx::Error> {
+        // Fixture SQL contains only test-owned identifiers; row values stay bound.
         match &self.pool {
             Pool::Postgres(p) => {
                 let sql = number_placeholders(sql);
-                Ok(bind_all!(sqlx::query(&sql), args)
+                // Placeholder numbering preserves the trusted template; move its allocation.
+                Ok(bind_all!(sqlx::query(AssertSqlSafe(sql)), args)
                     .execute(p)
                     .await?
                     .rows_affected())
             }
-            Pool::MariaDb(p) => Ok(bind_all!(sqlx::query(sql), args)
+            Pool::MariaDb(p) => Ok(bind_all!(sqlx::query(AssertSqlSafe(sql)), args)
                 .execute(p)
                 .await?
                 .rows_affected()),
-            Pool::Sqlite(p) => Ok(bind_all!(sqlx::query(sql), args)
+            Pool::Sqlite(p) => Ok(bind_all!(sqlx::query(AssertSqlSafe(sql)), args)
                 .execute(p)
                 .await?
                 .rows_affected()),
@@ -309,23 +318,39 @@ impl Raw {
     }
 
     /// The first column of the first row as an integer (`count(*)`, `max(x)`).
+    /// SQL must be a trusted test template; pass row values through `args`.
     pub async fn int(&self, sql: &str, args: &[Arg]) -> Result<i64, sqlx::Error> {
+        // Only fixture-owned identifiers enter SQL; row values stay bound.
         match &self.pool {
             Pool::Postgres(p) => {
                 let sql = number_placeholders(sql);
-                bind_all!(sqlx::query_scalar(&sql), args).fetch_one(p).await
+                // Numbering changes placeholders only; retain the generated allocation.
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
+                    .fetch_one(p)
+                    .await
             }
-            Pool::MariaDb(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
-            Pool::Sqlite(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
+            Pool::MariaDb(p) => {
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
+                    .fetch_one(p)
+                    .await
+            }
+            Pool::Sqlite(p) => {
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
+                    .fetch_one(p)
+                    .await
+            }
         }
     }
 
     /// The first column of the first row as bytes.
-    pub async fn bytes(&self, sql: &str, args: &[Arg]) -> Result<Vec<u8>, sqlx::Error> {
+    pub async fn bytes(&self, sql: &'static str, args: &[Arg]) -> Result<Vec<u8>, sqlx::Error> {
         match &self.pool {
             Pool::Postgres(p) => {
                 let sql = number_placeholders(sql);
-                bind_all!(sqlx::query_scalar(&sql), args).fetch_one(p).await
+                // Only placeholders in a static SQL template are rewritten.
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
+                    .fetch_one(p)
+                    .await
             }
             Pool::MariaDb(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
             Pool::Sqlite(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
@@ -333,11 +358,14 @@ impl Raw {
     }
 
     /// The first column of the first row as text.
-    pub async fn text(&self, sql: &str, args: &[Arg]) -> Result<String, sqlx::Error> {
+    pub async fn text(&self, sql: &'static str, args: &[Arg]) -> Result<String, sqlx::Error> {
         match &self.pool {
             Pool::Postgres(p) => {
                 let sql = number_placeholders(sql);
-                bind_all!(sqlx::query_scalar(&sql), args).fetch_one(p).await
+                // Only placeholders in a static SQL template are rewritten.
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
+                    .fetch_one(p)
+                    .await
             }
             Pool::MariaDb(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
             Pool::Sqlite(p) => bind_all!(sqlx::query_scalar(sql), args).fetch_one(p).await,
@@ -345,11 +373,16 @@ impl Raw {
     }
 
     /// The first column of the first row as a time (a [`Ts`] column).
-    pub async fn time(&self, sql: &str, args: &[Arg]) -> Result<OffsetDateTime, sqlx::Error> {
+    pub async fn time(
+        &self,
+        sql: &'static str,
+        args: &[Arg],
+    ) -> Result<OffsetDateTime, sqlx::Error> {
         let ts: Ts = match &self.pool {
             Pool::Postgres(p) => {
                 let sql = number_placeholders(sql);
-                bind_all!(sqlx::query_scalar(&sql), args)
+                // Only placeholders in a static SQL template are rewritten.
+                bind_all!(sqlx::query_scalar(AssertSqlSafe(sql)), args)
                     .fetch_one(p)
                     .await?
             }

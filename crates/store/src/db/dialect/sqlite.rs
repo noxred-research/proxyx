@@ -123,7 +123,7 @@ pub(in crate::db) async fn bump_version(conn: &mut Conn) -> Result<()> {
 /// Run an INSERT of an auto-numbered row and return its id (`rowid`).
 pub(in crate::db) async fn insert_id<'q>(
     conn: &mut Conn,
-    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments>,
 ) -> Result<i64> {
     Ok(query.execute(conn).await?.last_insert_rowid())
 }

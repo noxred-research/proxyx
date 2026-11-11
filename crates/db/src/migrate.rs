@@ -98,11 +98,11 @@ impl Pool {
                     .await;
                 let restored = conn
                     .execute(
-                        format!(
+                        // Both values came from numeric server variables.
+                        sqlx::AssertSqlSafe(format!(
                             "SET SESSION max_statement_time = {statement}, \
                              innodb_lock_wait_timeout = {lock}"
-                        )
-                        .as_str(),
+                        )),
                     )
                     .await;
                 applied?;

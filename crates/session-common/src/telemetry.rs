@@ -185,7 +185,8 @@ pub fn start_trace(span: &tracing::Span, traceparent: Option<&str>) {
     if let Some(traceparent) = traceparent {
         let carrier =
             std::collections::HashMap::from([("traceparent".to_owned(), traceparent.to_owned())]);
-        span.set_parent(TraceContextPropagator::new().extract(&carrier));
+        // OTel may be disabled or this span may be filtered out.
+        let _ = span.set_parent(TraceContextPropagator::new().extract(&carrier));
     }
     let trace_id = span.context().span().span_context().trace_id();
     if trace_id != opentelemetry::trace::TraceId::INVALID {

@@ -18,12 +18,12 @@ unmaintained = "workspace"
 # Each ignore names why the advisory does not apply and when to revisit it.
 ignore = [
   # rsa: Marvin timing side channel on PKCS#1 v1.5 decryption. ProxyX only signs CDN URLs with
-  # an operator key (no decryption oracle), and sqlx-mysql uses it for the caching_sha2 password
-  # exchange that ProxyX runs over TLS. No fixed release of the 0.9 line exists yet.
-  { id = "RUSTSEC-2023-0071", reason = "no decryption oracle; revisit when rsa 0.10 is stable" },
+  # an operator key (no decryption oracle). SQLx 0.9 uses the fixed rsa 0.10
+  # for password exchange; the signing dependency remains on the unfixed 0.9 line.
+  { id = "RUSTSEC-2023-0071", reason = "no decryption oracle; revisit when the signing dependency moves to rsa 0.10" },
   # libsqlite3-sys: the bundled SQLite misreads a crafted database plus a WAL file of another
-  # page size. The fix needs libsqlite3-sys 0.39, which sqlx 0.8/0.9 do not allow yet. ProxyX
-  # opens only operator-owned database files in a private directory.
+  # page size. SQLx 0.9 now resolves libsqlite3-sys 0.37, but the fix needs 0.39,
+  # outside its supported range (<0.38). ProxyX opens only operator-owned files.
   { id = "RUSTSEC-2026-0459", reason = "needs local write access to the database directory; revisit with the next sqlx release" },
 ]
 

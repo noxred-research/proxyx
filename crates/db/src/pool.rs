@@ -272,8 +272,9 @@ fn mysql_pool(settings: &PoolSettings, session: MySqlSession) -> MySqlPoolOption
         .after_connect(move |conn, _| {
             let statements = session.statements.clone();
             Box::pin(async move {
-                for statement in &statements {
-                    conn.execute(statement.as_str()).await?;
+                // Statements contain only fixed SQL and numeric timeout settings.
+                for statement in statements {
+                    conn.execute(sqlx::AssertSqlSafe(statement)).await?;
                 }
                 Ok(())
             })
