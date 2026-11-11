@@ -22,7 +22,7 @@ use crate::auth::Login;
 use crate::conn::{self, ReqCtx, Shared};
 use crate::connect::Mode;
 use crate::egress::{Family, Lease, PickKey};
-use crate::limits::{Dir, Shaper};
+use crate::limits::Dir;
 use crate::socks::reply5;
 use crate::state::{ListenerRt, State};
 
@@ -96,6 +96,35 @@ pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
     let started = SystemTime::now();
     let t0 = Instant::now();
     let metrics = &shared.metrics;
+    // Limits of the association: admitted once, as a UDP request without a destination.
+    let unspec: IpAddr = [0, 0, 0, 0].into();
+    let ctx0 = ReqCtx {
+        shared: &shared,
+        state: &state,
+        listener: rt,
+        client: peer,
+        proto: Proto::Udp,
+        method: "UDP",
+        host: "0.0.0.0",
+        port: 0,
+        login: login.as_ref(),
+        mode: Mode::Tunnel,
+        reuse: false,
+    };
+    let held = match conn::admit(&ctx0, &[unspec], None) {
+        Ok(held) => held,
+        Err(r) => {
+            let _ = control.write_all(&reply5(r.socks5_reply(), None)).await;
+            let mut rec = ctx0.record(started, t0.elapsed(), r.status(), r.result());
+            rec.rule = r.rule;
+            shared.log(rec);
+            return;
+        }
+    };
+    let (up, down) = (
+        held.admission.shaper(Dir::Up),
+        held.admission.shaper(Dir::Down),
+    );
     let relay_sock = match UdpSocket::bind(SocketAddr::new(local_ip, 0)).await {
         Ok(s) => s,
         Err(_) => {
@@ -114,26 +143,6 @@ pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
         .with_label_values(&[&rt.cfg.name])
         .inc();
 
-    // Limits of the association: admitted once, as a UDP request without a destination.
-    let unspec: IpAddr = [0, 0, 0, 0].into();
-    let ctx0 = ReqCtx {
-        shared: &shared,
-        state: &state,
-        listener: rt,
-        client: peer,
-        proto: Proto::Udp,
-        method: "UDP",
-        host: "0.0.0.0",
-        port: 0,
-        login: login.as_ref(),
-        mode: Mode::Tunnel,
-        reuse: false,
-    };
-    let admission = state.limits.admit(&ctx0.req(&[unspec]));
-    let (up, down) = match &admission {
-        Ok(a) => (a.shaper(Dir::Up), a.shaper(Dir::Down)),
-        Err(_) => (Shaper::none(), Shaper::none()),
-    };
     let pool = state
         .egress_for(&ctx0.req(&[unspec]), login.as_ref(), rt)
         .ok()
@@ -156,7 +165,6 @@ pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buf_c = vec![0u8; 65_535];
     let mut buf_4 = vec![0u8; 65_535];
     let mut buf_6 = vec![0u8; 65_535];
-    let refused = admission.is_err();
 
     loop {
         let deadline = last + idle;
@@ -175,7 +183,7 @@ pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
             } => break,
             r = relay_sock.recv_from(&mut buf_c) => {
                 let Ok((n, src)) = r else { continue };
-                if refused || src.ip() != peer.ip() {
+                if src.ip() != peer.ip() {
                     continue;
                 }
                 if client_addr.is_some_and(|c| c != src) {
@@ -277,12 +285,7 @@ pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
         .udp_associations_open
         .with_label_values(&[&rt.cfg.name])
         .dec();
-    let mut rec = ctx0.record(
-        started,
-        t0.elapsed(),
-        if refused { 429 } else { 200 },
-        if refused { "limited" } else { "ok" },
-    );
+    let mut rec = ctx0.record(started, t0.elapsed(), 200, "ok");
     rec.url = format!("udp://{bound}");
     rec.egress = last_egress;
     rec.pool = pool.as_ref().map(|p| p.name().to_owned());

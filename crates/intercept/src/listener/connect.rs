@@ -424,6 +424,7 @@ pub async fn handle_client(
                                     serial_lock: serial_lock.clone(),
                                     egress_proxy,
                                     upstream_tls: mapped.is_none(),
+                                    insecure_upstream_tls: decision.insecure_upstream_tls,
                                 },
                             )
                         },
@@ -456,6 +457,7 @@ pub async fn handle_client(
                                     serial_lock: serial_lock.clone(),
                                     egress_proxy,
                                     upstream_tls: mapped.is_none(),
+                                    insecure_upstream_tls: decision.insecure_upstream_tls,
                                 },
                             )
                         },
@@ -505,24 +507,16 @@ pub async fn handle_client(
                     },
                 )
                 .await;
-            } else if decision.has_upstream_overrides {
+            } else {
+                // Frame exactly one exchange, then explicitly close both sides.
+                // Overflow can contain another authority and its proxy credential;
+                // never turn a forward-proxy connection into an unparsed tunnel.
                 let mut prefix = raw.to_vec();
                 prefix.extend_from_slice(&overflow);
                 let prefixed = PrefixedStream::new(prefix, stream);
                 ctx.mitm
                     .relay_plaintext_once(prefixed, upstream, host)
                     .await?;
-            } else {
-                let mut upstream = upstream;
-                // Strip the session credential (Proxy-Authorization) before
-                // relaying to the origin — it authenticates the client to this
-                // proxy, not to the destination.
-                let forwarded = crate::mitm::strip_hop_by_hop_request_headers(&raw);
-                upstream.write_all(&forwarded).await?;
-                if !overflow.is_empty() {
-                    upstream.write_all(&overflow).await?;
-                }
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
             }
         }
     }
@@ -624,6 +618,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
             let ws_sink = WsCaptureSink {
                 tx: ws_tx,
                 max_payload_capture: ctx.max_ws_payload_capture,
+                max_compressed_message_bytes: ctx.max_ws_compressed_message_bytes,
                 capture_control_frames: ctx.capture_ws_control_frames,
                 session_id: *session_id,
                 org_id: String::new(),
@@ -647,6 +642,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
     let ws_sink = WsCaptureSink {
         tx: ws_tx,
         max_payload_capture: ctx.max_ws_payload_capture,
+        max_compressed_message_bytes: ctx.max_ws_compressed_message_bytes,
         capture_control_frames: ctx.capture_ws_control_frames,
         session_id: *session_id,
         org_id: session.org_id.to_string(),
@@ -769,3 +765,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
         warn!(error=?e, %host, %session_id, "interception failed");
     }
 }
+
+#[cfg(test)]
+#[path = "forward_tests.rs"]
+mod forward_tests;

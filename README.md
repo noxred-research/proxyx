@@ -95,6 +95,8 @@ docker compose -f docker/docker-compose.yml up -d --build --wait
 
 This builds one image with both binaries and starts PostgreSQL 18, Valkey 8, ClickHouse, the gateway, the warmer, the control API, the ingester, the session proxy and the limiter, with migrations applied and secrets and a development CA generated into volumes. Everything listens on `127.0.0.1`. The compose file is for development, not for production.
 
+Initialization creates secret files with a private umask and retains existing credentials. If CA generation was interrupted, initialization refuses an incomplete CA instead of silently replacing it: restore all four CA files from the same backup before restarting. Keep the generated CA out of personal and system trust stores.
+
 ### From source
 
 ```
@@ -111,6 +113,7 @@ export PROXYX_POOL_REDIS_URL=redis://localhost:6379/1
 export PROXYX_POOL_DATA_DIR=$PWD/data PROXYX_POOL_SECRETS_DIR=$PWD/secrets
 export PROXYX_POOL_ADMIN_TOKEN_FILE=$PWD/secrets/admin-token
 
+umask 077
 mkdir -p secrets
 for f in admin-token prober-token probe-key; do openssl rand -hex 32 > secrets/$f; done
 

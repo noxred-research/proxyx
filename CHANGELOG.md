@@ -10,6 +10,7 @@ First public development line, version 0.1.0.
 
 ### Added
 
+- **Publication security hardening.** Code-owner-gated advisory, full-history secret and workflow scans, plus public-repository CodeQL for Rust and GitHub Actions; explicit `.github` ownership; private development secret creation and incomplete-CA refusal; broader secret, database and capture exclusions; corrected private conduct reporting, fixture guidance and third-party notices.
 - **MariaDB and SQLite as alternatives to PostgreSQL** for the pool (`PROXYX_POOL_DATABASE_URL`) and the control plane (`PROXYX_CONTROL_DATABASE_URL`): the URL scheme selects `postgres://` (default), `mariadb://`/`mysql://` (MariaDB 10.6+) or `sqlite://PATH?mode=rwc` (one host only). New crate `proxyx-db`; per-backend migration directories with equal versions; `proxyx migrate pool|control` and `--check` work on all three (`migrate control --target database`, alias `postgres`); `proxyx doctor` checks the backend version; compose profiles `mariadb` and `sqlite`; test variables `PROXYX_TEST_BACKEND`, `PROXYX_TEST_MARIADB_URL`, `PROXYX_TEST_SQLITE_DIR`. See [databases.md](docs/databases.md) for the limits: SQLite is single host and logs a warning at start, MariaDB text compares case-insensitively.
 - Control API request limits (`[http]`): per-request deadline (`504`), in-flight cap (`503` with `Retry-After`) and a per-credential token bucket (`429` with `Retry-After`), with `proxyx_control_api_refusals_total{reason}`.
 - **Edge proxy** (`proxyx edge --config FILE [--check]`, crate `proxyx-edge`): a self-hosted forward proxy for a machine with many IP addresses, configured by one TOML file, no database.
@@ -49,6 +50,26 @@ First public development line, version 0.1.0.
   - Benchmarks: `crates/bench` with criterion microbenchmarks and the `proxyx-bench` load tool for the gateway and the session proxy, `ci/bench-smoke.sh`, and measured numbers in [benchmarks.md](docs/benchmarks.md).
   - systemd units for the gateway, warmer, session proxy, control API, ingester and limiter in `deploy/systemd`; the compose limiter has a health check.
 - **Documentation.** Architecture, configuration reference, gateway, providers, policies, session proxy, control API, capture pipeline and operations pages under `docs/`.
+
+### Security
+
+- **Session proxy verifies upstream TLS.** Intercepted connections check the upstream certificate chain and host name against the system roots plus an optional `[tls] ca_bundle`. A failure answers `502` with `X-ProxyX-Error: upstream_tls` and captures nothing. Exceptions are explicit: `[tls] verify_upstream = false`, `[tls] insecure_upstream_hosts`, or `insecure_upstream_tls: true` on one session (client: `CreateSessionRequest::insecure_upstream_tls`), for authorized testing only.
+- Non-intercepted HTTP forwarding in the session proxy serves one exchange per upstream connection and then closes it, so each pipelined or keep-alive request is authenticated, routed and stripped of `Proxy-Authorization` on its own.
+- Chunked bodies in the session proxy bound chunk-size lines, chunk extensions and trailers (each and in total) with checked arithmetic and read deadlines, on the HTTP/1.1 and HTTP/1.1-to-HTTP/2 paths.
+- Compressed WebSocket messages are bounded before they are buffered (`[tuning] max_ws_compressed_message_bytes`, default 16 MiB); a larger message closes the WebSocket with `1009`.
+- CA directories are created `0700` and key files `0600` exclusively; the session proxy and control plane refuse a CA key file that is group- or world-readable or owned by another user.
+- Control API rate limits key on the canonical credential (a hash of the normalized bearer token, or org and principal for trusted headers) and add an independent per-source-address bucket checked before authentication, both from `[http] per_key_rps` / `per_key_burst`.
+- Edge ACLs evaluate every resolved address on its own; TCP, UDP ASSOCIATE and BIND connect only to addresses that the rules allow, in resolver order, so a name resolving to a mix of allowed and denied addresses can no longer reach the denied ones.
+- Edge requests through a parent send the approved numeric address (CONNECT target, SOCKS5 IPv4/IPv6 address, absolute-form URL) while keeping the logical `Host` and TLS SNI, so the parent cannot re-resolve the name to a different address. This includes the final hop of a chain.
+- Edge HTTP requests whose `Connection` header nominates framing or routing headers (`Content-Length`, `Transfer-Encoding`, `Host`, `TE`, `Trailer`, `Proxy-*`, or `Upgrade` without an upgrade) are refused with `400` before authentication, closing a request-smuggling path.
+- Edge SOCKS5 UDP ASSOCIATE holds the per-user and per-source connection slots for as long as the control connection lives, like TCP and BIND.
+- MCP session tools return opaque per-server session handles instead of session ids, which are proxy credentials. Pending `extend`/`end` changes keep the real id in the private `0600` change file, so approvals survive a restart. Basic auth and proxy URL userinfo carrying a session id are redacted.
+- MCP servers scoped with `allowed_orgs` filter every read tool and resource to those orgs before pagination, check session ownership first, and no longer expose the shared audit history.
+- Nested MCP mutations (`classify_block_page` with `report`, stored configuration changes) enforce the tool allow and deny lists of the action they perform, at proposal and at apply time.
+- Approved MCP changes expire at their deadline, consumption re-checks expiry and revocation atomically, and `proxyx mcp reject` also revokes approved, not yet applied changes.
+- MCP LLM tools build prompts from cleaned captures: authorization, cookie, proxy and API-key headers, credential query parameters and body secrets are removed before any request leaves the process.
+- The limiter service closes connections that do not finish the handshake within 5 s or stay idle longer than `PROXYX_LIMITER_IDLE_TIMEOUT_MS` (default 60 s), so idle peers cannot hold its connection slots.
+- CloudFront URL signing uses `rsa` 0.10, which removes the timing side channel of RUSTSEC-2023-0071; the advisory is no longer ignored in `deny.toml`.
 
 ### Changed
 

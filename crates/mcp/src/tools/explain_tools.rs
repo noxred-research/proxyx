@@ -7,7 +7,8 @@ use serde_json::json;
 
 use super::Ctx;
 use super::policy_tools::{
-    doc_json, doc_label, effective_summary, parse_input, stored_policies, validate_merged,
+    check_policy_scope, doc_json, doc_label, effective_summary, parse_input,
+    scoped_stored_policies, validate_merged,
 };
 use super::util::{Args, ToolError, ToolResult};
 use crate::explain::{self, CodeSource};
@@ -54,7 +55,7 @@ pub async fn explain_selector(ctx: &Ctx, args: &Args) -> ToolResult {
         return Ok(out);
     };
     let listing = pool.api.get(&["v1", "policies"], &[]).await?;
-    let stored = stored_policies(&listing).map_err(ToolError::internal)?;
+    let stored = scoped_stored_policies(ctx, &listing).map_err(ToolError::internal)?;
     let set =
         PolicySet::from_docs(stored.into_iter().map(|s| s.doc).collect()).map_err(|error| {
             ToolError::internal(format!(
@@ -98,11 +99,13 @@ pub async fn explain_selector(ctx: &Ctx, args: &Args) -> ToolResult {
 }
 
 pub async fn validate_policy(ctx: &Ctx, args: &Args) -> ToolResult {
+    let org = args.str("org").map(|_| ctx.org(args)).transpose()?;
     let docs = parse_input(args)?;
+    check_policy_scope(ctx, &docs)?;
     let mut notes: Vec<String> = Vec::new();
     let stored = match ctx.backends.pool.as_ref() {
         Some(pool) => match pool.api.get(&["v1", "policies"], &[]).await {
-            Ok(listing) => stored_policies(&listing).map_err(|error| {
+            Ok(listing) => scoped_stored_policies(ctx, &listing).map_err(|error| {
                 notes.push(format!("the stored policies were not usable: {error}"));
             }),
             Err(error) => {
@@ -119,7 +122,7 @@ pub async fn validate_policy(ctx: &Ctx, args: &Args) -> ToolResult {
     let stored_list = stored.unwrap_or_default();
     let verdict = validate_merged(&stored_list, &docs);
     let (valid, error, effective) = match &verdict {
-        Ok(set) => (true, None, Some(effective_summary(set, args.str("org")))),
+        Ok(set) => (true, None, Some(effective_summary(set, org.as_deref()))),
         Err(error) => (false, Some(error.clone()), None),
     };
     if !valid && !merged_with_stored {

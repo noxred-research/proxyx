@@ -10,6 +10,8 @@ use limiter_proto::{MAGIC, VERSION};
 use proxyx_limiter_server::{spawn, Config};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn config(max_buckets: usize) -> Config {
@@ -55,6 +57,7 @@ fn quick_resilience() -> ResilienceConfig {
     ResilienceConfig {
         connect_timeout: Duration::from_millis(200),
         io_timeout: Duration::from_millis(200),
+        max_idle: Duration::from_secs(30),
         keepalive: Some(Duration::from_secs(30)),
         breaker: Some(BreakerConfig {
             failure_threshold: 3,
@@ -67,6 +70,42 @@ fn quick_resilience() -> ResilienceConfig {
 fn dead_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap()
+}
+
+fn handshake(stream: &mut TcpStream) -> std::io::Result<u8> {
+    let mut hello = MAGIC.to_vec();
+    hello.push(VERSION);
+    stream.write_all(&hello)?;
+    let mut reply = [0u8; 1];
+    stream.read_exact(&mut reply)?;
+    Ok(reply[0])
+}
+
+fn wait_for_connections(addr: SocketAddr, expected: f64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (_, body) = http_get(addr, "/metrics");
+        if metric(&body, "proxyx_limiter_connections ") == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection count never became {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn assert_closed(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("expected closed connection, got {result:?}"),
+    }
 }
 
 #[test]
@@ -86,6 +125,64 @@ fn ping_round_trips_over_sync_and_async_clients() {
     rt.block_on(async {
         let client = AsyncClient::connect(server.addr.to_string(), ClientConfig::default());
         assert!(client.ping().await.unwrap().uptime_ns > 0);
+    });
+}
+
+#[test]
+fn sync_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
+    let server = spawn(
+        "127.0.0.1:0",
+        Some("127.0.0.1:0"),
+        &Config {
+            idle_timeout: Duration::from_millis(200),
+            ..config(16)
+        },
+    )
+    .unwrap();
+    let client = Client::connect(server.addr.to_string(), ClientConfig::default());
+    let bucket = client.create(b"idle-sync", limits()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    wait_for_connections(server.metrics_addr.unwrap(), 0.0);
+
+    let outcome = bucket.consume(1);
+    assert!(outcome.allowed);
+    assert!(!outcome.degraded);
+    assert_eq!(outcome.remaining, 1);
+    assert_eq!(client.stats().transport_errors, 0);
+    assert_eq!(client.stats().circuit_opens, 0);
+    assert_eq!(client.circuit_state(), CircuitState::Closed);
+}
+
+#[test]
+fn async_consume_recovers_after_the_server_closes_an_idle_pooled_connection() {
+    let server = spawn(
+        "127.0.0.1:0",
+        Some("127.0.0.1:0"),
+        &Config {
+            idle_timeout: Duration::from_millis(200),
+            ..config(16)
+        },
+    )
+    .unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let client = AsyncClient::connect(server.addr.to_string(), ClientConfig::default());
+        let bucket = client.create(b"idle-async", limits()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_connections(server.metrics_addr.unwrap(), 0.0);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), bucket.consume(1))
+            .await
+            .unwrap();
+        assert!(outcome.allowed);
+        assert!(!outcome.degraded);
+        assert_eq!(outcome.remaining, 1);
+        assert_eq!(client.stats().transport_errors, 0);
+        assert_eq!(client.stats().circuit_opens, 0);
+        assert_eq!(client.circuit_state(), CircuitState::Closed);
     });
 }
 
@@ -144,14 +241,7 @@ fn connection_cap_drops_excess_connections() {
         },
     )
     .unwrap();
-    let handshake = |stream: &mut TcpStream| -> std::io::Result<u8> {
-        let mut hello = MAGIC.to_vec();
-        hello.push(VERSION);
-        stream.write_all(&hello)?;
-        let mut reply = [0u8; 1];
-        stream.read_exact(&mut reply)?;
-        Ok(reply[0])
-    };
+    // Complete a handshake on every admitted connection before checking the cap.
     let mut held = Vec::new();
     for _ in 0..2 {
         let mut stream = TcpStream::connect(server.addr).unwrap();
@@ -191,6 +281,140 @@ fn connection_cap_drops_excess_connections() {
 }
 
 #[test]
+fn idle_handshakes_close_and_release_admission_slots() {
+    for prefix in [&[][..], &MAGIC[..2]] {
+        let server = spawn(
+            "127.0.0.1:0",
+            Some("127.0.0.1:0"),
+            &Config {
+                max_connections: 1,
+                handshake_timeout: Duration::from_millis(150),
+                idle_timeout: Duration::from_secs(5),
+                keepalive: None,
+                ..config(16)
+            },
+        )
+        .unwrap();
+        let ops = server.metrics_addr.unwrap();
+        let mut idle = TcpStream::connect(server.addr).unwrap();
+        idle.write_all(prefix).unwrap();
+        wait_for_connections(ops, 1.0);
+        assert_closed(&mut idle);
+        wait_for_connections(ops, 0.0);
+
+        let mut replacement = TcpStream::connect(server.addr).unwrap();
+        replacement
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(handshake(&mut replacement).unwrap(), VERSION);
+    }
+}
+
+#[test]
+fn handshake_progress_does_not_extend_absolute_deadline() {
+    let server = spawn(
+        "127.0.0.1:0",
+        Some("127.0.0.1:0"),
+        &Config {
+            max_connections: 1,
+            handshake_timeout: Duration::from_millis(250),
+            idle_timeout: Duration::from_secs(5),
+            keepalive: None,
+            ..config(16)
+        },
+    )
+    .unwrap();
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    wait_for_connections(server.metrics_addr.unwrap(), 1.0);
+    let mut writer = stream.try_clone().unwrap();
+    let trickle = std::thread::spawn(move || {
+        let mut hello = MAGIC.to_vec();
+        hello.push(VERSION);
+        for byte in hello {
+            if writer.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    // Each gap is below the handshake budget, but the whole hello exceeds it.
+    assert_closed(&mut stream);
+    trickle.join().unwrap();
+    wait_for_connections(server.metrics_addr.unwrap(), 0.0);
+    let mut replacement = TcpStream::connect(server.addr).unwrap();
+    replacement
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(handshake(&mut replacement).unwrap(), VERSION);
+}
+
+#[test]
+fn idle_established_connections_and_partial_frames_release_admission_slots() {
+    let mut frame = Vec::new();
+    limiter_proto::encode_ping_reqs(&mut frame, &[7]);
+    for prefix in [&[][..], &frame[..2], &frame[..10]] {
+        let server = spawn(
+            "127.0.0.1:0",
+            Some("127.0.0.1:0"),
+            &Config {
+                max_connections: 1,
+                handshake_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_millis(150),
+                keepalive: None,
+                ..config(16)
+            },
+        )
+        .unwrap();
+        let ops = server.metrics_addr.unwrap();
+        let mut idle = TcpStream::connect(server.addr).unwrap();
+        idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert_eq!(handshake(&mut idle).unwrap(), VERSION);
+        idle.write_all(prefix).unwrap();
+        wait_for_connections(ops, 1.0);
+        assert_closed(&mut idle);
+        wait_for_connections(ops, 0.0);
+
+        let mut replacement = TcpStream::connect(server.addr).unwrap();
+        replacement
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(handshake(&mut replacement).unwrap(), VERSION);
+    }
+}
+
+#[test]
+fn frame_read_progress_refreshes_idle_timeout() {
+    let server = spawn(
+        "127.0.0.1:0",
+        None,
+        &Config {
+            handshake_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_millis(250),
+            ..config(16)
+        },
+    )
+    .unwrap();
+    let mut stream = TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(handshake(&mut stream).unwrap(), VERSION);
+    let mut request = Vec::new();
+    limiter_proto::encode_ping_reqs(&mut request, &[42]);
+    // Total frame time exceeds the idle timeout; every read still progresses.
+    for chunk in request.chunks(4) {
+        stream.write_all(chunk).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut response = [0u8; 4 + 5 + limiter_proto::PING_RESULT_BYTES];
+    stream.read_exact(&mut response).unwrap();
+    let frame = limiter_proto::parse_frame(&response).unwrap().unwrap();
+    assert_eq!(frame.op, limiter_proto::OP_PING);
+    let results = limiter_proto::decode_ping_results(frame.payload, frame.count).unwrap();
+    assert_eq!(results[0].token, 42);
+}
+
+#[test]
 fn breaker_opens_on_a_dead_service_and_recovers_when_it_returns() {
     let addr = dead_addr();
     let client = Client::connect_with(
@@ -224,24 +448,59 @@ fn breaker_opens_on_a_dead_service_and_recovers_when_it_returns() {
     assert_eq!(client.circuit_state(), CircuitState::Closed);
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum OnConsume {
     /// Close the connection (a crashed service).
     Hangup,
     /// Read the request and never answer (a wedged service).
     Silence,
+    /// Send one response byte and close; replay could double-charge the bucket.
+    PartialResponse,
+    /// Deny on the CREATE connection, but allow on a new connection.
+    RejectReuse,
+}
+
+#[derive(Default)]
+struct StubCounts {
+    connections: AtomicUsize,
+    consumes: AtomicUsize,
+    reused_consumes: AtomicUsize,
 }
 
 /// A stand-in service that handshakes and answers CREATE, and misbehaves on CONSUME.
 fn stub_service(on_consume: OnConsume) -> SocketAddr {
+    counted_stub_service(on_consume).0
+}
+
+fn counted_stub_service(on_consume: OnConsume) -> (SocketAddr, Arc<StubCounts>) {
     use limiter_proto::{
-        encode_create_results, parse_frame, CreateResult, OP_CONSUME, OP_CREATE, ST_OK,
+        encode_consume_results, encode_create_results, parse_frame, ConsumeResult, CreateResult,
+        OP_CONSUME, OP_CREATE, ST_OK,
     };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let counts = Arc::new(StubCounts::default());
+    let service_counts = counts.clone();
+    listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("stub accept failed: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            service_counts.connections.fetch_add(1, Ordering::Relaxed);
+            let counts = service_counts.clone();
             std::thread::spawn(move || {
                 let mut hello = [0u8; 5];
                 if stream.read_exact(&mut hello).is_err() || stream.write_all(&[VERSION]).is_err() {
@@ -249,6 +508,7 @@ fn stub_service(on_consume: OnConsume) -> SocketAddr {
                 }
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
+                let mut created = false;
                 loop {
                     let n = match stream.read(&mut chunk) {
                         Ok(0) | Err(_) => return,
@@ -259,6 +519,7 @@ fn stub_service(on_consume: OnConsume) -> SocketAddr {
                         let total = frame.total_len;
                         match frame.op {
                             OP_CREATE => {
+                                created = true;
                                 let mut resp = Vec::new();
                                 let results = vec![
                                     CreateResult {
@@ -272,10 +533,36 @@ fn stub_service(on_consume: OnConsume) -> SocketAddr {
                                     return;
                                 }
                             }
-                            OP_CONSUME => match on_consume {
-                                OnConsume::Hangup => return,
-                                OnConsume::Silence => {}
-                            },
+                            OP_CONSUME => {
+                                counts.consumes.fetch_add(1, Ordering::Relaxed);
+                                if created {
+                                    counts.reused_consumes.fetch_add(1, Ordering::Relaxed);
+                                }
+                                match on_consume {
+                                    OnConsume::Hangup => return,
+                                    OnConsume::Silence => {}
+                                    OnConsume::PartialResponse => {
+                                        stream.write_all(&[0]).unwrap();
+                                        return;
+                                    }
+                                    OnConsume::RejectReuse => {
+                                        let mut resp = Vec::new();
+                                        let results = vec![
+                                            ConsumeResult {
+                                                status: ST_OK,
+                                                allowed: !created,
+                                                remaining: 1,
+                                                retry_after_ns: 0,
+                                            };
+                                            frame.count
+                                        ];
+                                        encode_consume_results(&mut resp, &results);
+                                        if stream.write_all(&resp).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                             _ => return,
                         }
                         buf.drain(..total);
@@ -284,7 +571,169 @@ fn stub_service(on_consume: OnConsume) -> SocketAddr {
             });
         }
     });
-    addr
+    (addr, counts)
+}
+
+#[test]
+fn sync_checkout_drops_expired_connections_before_the_server_idle_timeout() {
+    let (addr, counts) = counted_stub_service(OnConsume::RejectReuse);
+    let client = Client::connect_with(
+        addr.to_string(),
+        ClientConfig {
+            pool_size: 1,
+            fail_mode: FailMode::Closed,
+        },
+        ResilienceConfig {
+            max_idle: Duration::from_millis(50),
+            ..quick_resilience()
+        },
+    );
+    let bucket = client.create(b"idle-sync", limits()).unwrap();
+    // The stub keeps idle sockets open for two seconds, well past this checkout.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let outcome = bucket.consume(1);
+    assert!(outcome.allowed, "the stub denies CONSUME on the old socket");
+    assert!(!outcome.degraded);
+    assert_eq!(counts.connections.load(Ordering::Relaxed), 2);
+    assert_eq!(counts.consumes.load(Ordering::Relaxed), 1);
+    assert_eq!(counts.reused_consumes.load(Ordering::Relaxed), 0);
+    assert_eq!(client.stats().transport_errors, 0);
+    assert_eq!(client.stats().circuit_opens, 0);
+    assert_eq!(client.circuit_state(), CircuitState::Closed);
+}
+
+#[test]
+fn async_checkout_drops_expired_connections_before_the_server_idle_timeout() {
+    let (addr, counts) = counted_stub_service(OnConsume::RejectReuse);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let client = AsyncClient::connect_with(
+            addr.to_string(),
+            ClientConfig {
+                pool_size: 1,
+                fail_mode: FailMode::Closed,
+            },
+            ResilienceConfig {
+                max_idle: Duration::from_millis(50),
+                ..quick_resilience()
+            },
+        );
+        let bucket = client.create(b"idle-async", limits()).await.unwrap();
+        // The stub keeps idle sockets open for two seconds, well past this checkout.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), bucket.consume(1))
+            .await
+            .unwrap();
+        assert!(outcome.allowed, "the stub denies CONSUME on the old socket");
+        assert!(!outcome.degraded);
+        assert_eq!(counts.connections.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.consumes.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.reused_consumes.load(Ordering::Relaxed), 0);
+        assert_eq!(client.stats().transport_errors, 0);
+        assert_eq!(client.stats().circuit_opens, 0);
+        assert_eq!(client.circuit_state(), CircuitState::Closed);
+    });
+}
+
+#[test]
+fn sync_replay_is_limited_to_one_reused_connection_without_response_bytes() {
+    for (on_consume, max_idle, expected_connections, expected_consumes) in [
+        (OnConsume::Hangup, Duration::from_secs(30), 2, 2),
+        (OnConsume::PartialResponse, Duration::from_secs(30), 1, 1),
+        (OnConsume::Hangup, Duration::ZERO, 2, 1),
+    ] {
+        let (addr, counts) = counted_stub_service(on_consume);
+        let client = Client::connect_with(
+            addr.to_string(),
+            ClientConfig {
+                pool_size: 1,
+                fail_mode: FailMode::Closed,
+            },
+            ResilienceConfig {
+                max_idle,
+                ..quick_resilience()
+            },
+        );
+        let bucket = client.create(b"retry-sync", limits()).unwrap();
+        let outcome = bucket.consume(1);
+        assert!(outcome.degraded, "{on_consume:?}, max_idle={max_idle:?}");
+        assert!(!outcome.allowed);
+        assert_eq!(
+            counts.connections.load(Ordering::Relaxed),
+            expected_connections,
+            "{on_consume:?}, max_idle={max_idle:?}"
+        );
+        assert_eq!(
+            counts.consumes.load(Ordering::Relaxed),
+            expected_consumes,
+            "{on_consume:?}, max_idle={max_idle:?}"
+        );
+        assert_eq!(
+            counts.reused_consumes.load(Ordering::Relaxed),
+            usize::from(!max_idle.is_zero())
+        );
+        assert_eq!(client.stats().transport_errors, 1);
+        assert_eq!(client.stats().degraded, 1);
+        assert_eq!(client.stats().circuit_opens, 0);
+        assert_eq!(client.circuit_state(), CircuitState::Closed);
+    }
+}
+
+#[test]
+fn async_replay_is_limited_to_one_reused_connection_without_response_bytes() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        for (on_consume, max_idle, expected_connections, expected_consumes) in [
+            (OnConsume::Hangup, Duration::from_secs(30), 2, 2),
+            (OnConsume::PartialResponse, Duration::from_secs(30), 1, 1),
+            (OnConsume::Hangup, Duration::ZERO, 2, 1),
+        ] {
+            let (addr, counts) = counted_stub_service(on_consume);
+            let client = AsyncClient::connect_with(
+                addr.to_string(),
+                ClientConfig {
+                    pool_size: 1,
+                    fail_mode: FailMode::Closed,
+                },
+                ResilienceConfig {
+                    max_idle,
+                    ..quick_resilience()
+                },
+            );
+            let bucket = client.create(b"retry-async", limits()).await.unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), bucket.consume(1))
+                .await
+                .unwrap();
+            assert!(outcome.degraded, "{on_consume:?}, max_idle={max_idle:?}");
+            assert!(!outcome.allowed);
+            assert_eq!(
+                counts.connections.load(Ordering::Relaxed),
+                expected_connections,
+                "{on_consume:?}, max_idle={max_idle:?}"
+            );
+            assert_eq!(
+                counts.consumes.load(Ordering::Relaxed),
+                expected_consumes,
+                "{on_consume:?}, max_idle={max_idle:?}"
+            );
+            assert_eq!(
+                counts.reused_consumes.load(Ordering::Relaxed),
+                usize::from(!max_idle.is_zero())
+            );
+            assert_eq!(client.stats().transport_errors, 1);
+            assert_eq!(client.stats().degraded, 1);
+            assert_eq!(client.stats().circuit_opens, 0);
+            assert_eq!(client.circuit_state(), CircuitState::Closed);
+        }
+    });
 }
 
 #[test]

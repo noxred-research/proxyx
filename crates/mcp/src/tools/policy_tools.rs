@@ -10,6 +10,7 @@ use common::types::OrgId;
 use policy::{PolicyDoc, PolicyFile, PolicySet, Scope};
 use serde_json::{Map, Value, json};
 
+use super::Ctx;
 use super::util::{Args, ToolError};
 
 /// Policy documents from either input form.
@@ -49,6 +50,21 @@ pub fn parse_input(args: &Args) -> Result<Vec<PolicyDoc>, ToolError> {
     })
 }
 
+/// Reject organization targets outside this server's authorized scope.
+///
+/// # Errors
+/// When an organization policy targets an unauthorized organization.
+pub fn check_policy_scope(ctx: &Ctx, docs: &[PolicyDoc]) -> Result<(), ToolError> {
+    for doc in docs {
+        if doc.scope == Scope::Org
+            && let Some(org) = doc.target.as_deref()
+        {
+            ctx.gate.check_org(org)?;
+        }
+    }
+    Ok(())
+}
+
 /// One stored policy as `GET /v1/policies` reports it.
 #[derive(Debug, Clone)]
 pub struct Stored {
@@ -67,19 +83,41 @@ pub fn stored_policies(body: &Value) -> Result<Vec<Stored>, String> {
     let items = body["items"]
         .as_array()
         .ok_or_else(|| "the policies answer has no `items` list".to_owned())?;
+    items.iter().map(parse_stored_policy).collect()
+}
+
+fn parse_stored_policy(item: &Value) -> Result<Stored, String> {
+    let doc: PolicyDoc = serde_json::from_value(item["doc"].clone())
+        .map_err(|error| format!("a stored policy does not parse: {error}"))?;
+    Ok(Stored {
+        scope: item["scope"].as_str().unwrap_or("").to_owned(),
+        name: item["name"].as_str().unwrap_or("").to_owned(),
+        actor: item["actor"].as_str().unwrap_or("").to_owned(),
+        raw: compact(&serde_json::to_value(&doc).unwrap_or(Value::Null)),
+        doc,
+    })
+}
+
+/// Stored shared policies and policies for authorized organizations only.
+///
+/// Filtering precedes parsing so errors cannot disclose unauthorized documents.
+///
+/// # Errors
+/// When the listing or an authorized document has an invalid shape.
+pub fn scoped_stored_policies(ctx: &Ctx, body: &Value) -> Result<Vec<Stored>, String> {
+    let items = body["items"]
+        .as_array()
+        .ok_or_else(|| "the policies answer has no `items` list".to_owned())?;
     items
         .iter()
-        .map(|item| {
-            let doc: PolicyDoc = serde_json::from_value(item["doc"].clone())
-                .map_err(|error| format!("a stored policy does not parse: {error}"))?;
-            Ok(Stored {
-                scope: item["scope"].as_str().unwrap_or("").to_owned(),
-                name: item["name"].as_str().unwrap_or("").to_owned(),
-                actor: item["actor"].as_str().unwrap_or("").to_owned(),
-                raw: compact(&serde_json::to_value(&doc).unwrap_or(Value::Null)),
-                doc,
-            })
+        .filter(|item| {
+            ctx.gate.unscoped()
+                || (item["scope"] != "org" && item["doc"]["scope"] != "org")
+                || item["doc"]["match"]
+                    .as_str()
+                    .is_some_and(|org| ctx.gate.check_org(org).is_ok())
         })
+        .map(parse_stored_policy)
         .collect()
 }
 

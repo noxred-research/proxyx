@@ -1,5 +1,6 @@
 # Secret-scan configuration (https://github.com/gitleaks/gitleaks). Run:
-#   gitleaks detect --no-git --source . --config .gitleaks.toml --redact -v
+#   gitleaks git . --log-opts="--all --full-history --diff-merges=separate" --config .gitleaks.toml --redact
+#   gitleaks dir . --config .gitleaks.toml --redact
 title = "proxyx"
 
 [extend]
@@ -16,18 +17,22 @@ description = "ProxyX pool gateway org key"
 regex = '''\bak_[A-Za-z0-9_-]{43}\b'''
 
 [allowlist]
-description = "throwaway test fixtures"
-paths = ['''(^|/)tests?/fixtures/''']
-# RFC 6455 sample WebSocket key, documentation placeholders and inventory credential file names.
+description = "Reviewed synthetic values only; fixture directories are scanned normally"
+regexTarget = "secret"
 regexes = [
-  '''dGhlIHNhbXBsZSBub25jZQ==''',
-  '''ak_YOUR_KEY''',
-  '''ak_EXAMPLE_ONLY_NOT_A_REAL_KEY''',
-  '''oxylabs_isp_203-0-113-50''',
-  # Synthetic keys of the bench and MCP test fixtures.
-  '''ak_benchbenchbenchbenchbenchbenchbenchbench000''',
-  '''ak_A{43}''',
-  '''ak_orgkeyorgkeyorgkeyorgkeyorgkey0123456789abc''',
-  '''ak_newkeynewkeynewkeynewkeynewkey0123456789xyz''',
-  '''llm-api-key-0123456789''',
+  # RFC 6455 sample nonce in crates/intercept/src/mitm/mod.rs WebSocket tests.
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+  # docs/gateway.md curl example: placeholder password, optionally preceded by username.
+  '''(?:^|:)ak_YOUR_KEY'?$''',
+  # docs/gateway.md and docs/providers.md: credential file name using an RFC 5737 address.
+  '''^oxylabs_isp_203-0-113-50$''',
+  # crates/bench/src/gateway.rs: repetitive benchmark-only org key.
+  '''^ak_benchbenchbenchbenchbenchbenchbenchbench000$''',
+  # crates/mcp/src/redact.rs: all-A key used to assert secret redaction.
+  '''^ak_A{43}$''',
+  # crates/mcp/tests/common/mod.rs: repetitive keys served by local test backends.
+  '''^ak_orgkeyorgkeyorgkeyorgkeyorgkey0123456789abc$''',
+  '''^ak_newkeynewkeynewkeynewkeynewkey0123456789xyz$''',
+  # crates/mcp/tests/common/mod.rs: local LLM test backend's expected bearer token.
+  '''^llm-api-key-0123456789$''',
 ]

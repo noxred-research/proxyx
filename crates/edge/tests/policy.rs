@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 const USERS: &str = r#"
 [[listener]]
@@ -415,6 +415,77 @@ async fn bad_requests_are_refused() {
         "a".repeat(40_000)
     );
     assert_eq!(via_proxy(l, &big).await.status, 431);
+}
+
+#[tokio::test]
+async fn unsafe_connection_options_fail_before_authentication_or_dial() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = origin.local_addr().unwrap();
+    let edge = Edge::start(&format!("{USERS}\n{}\n", allow_all())).await;
+    for options in [
+        "Connection: keep-alive\r\ncOnNeCtIoN: CoNtEnT-LeNgTh\r\n",
+        "Connection: TRANSFER-ENCODING\r\n",
+        "Connection: Host\r\n",
+        "Connection: tE\r\n",
+        "Connection: Trailer\r\n",
+        "Connection: Proxy-Authorization\r\n",
+        "Connection: PROXY-CONNECTION\r\n",
+        "Connection: pRoXy-Custom\r\n",
+        "Connection: keep-alive\r\nCONNECTION: UpGrAdE\r\n",
+    ] {
+        let request = format!("GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\n{options}\r\n");
+        let response = via_proxy(edge.addr("main"), &request).await;
+        assert_eq!(response.status, 400, "{options:?}");
+        assert_eq!(response.header("x-proxyx-error"), Some("bad_request"));
+        assert_eq!(response.header("connection"), Some("close"));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), origin.accept())
+            .await
+            .is_err(),
+        "invalid Connection options must not reach the origin"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_content_length_smuggling_is_rejected_before_origin_connection() {
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = origin.local_addr().unwrap();
+    let edge = Edge::start(
+        r#"
+[[listener]]
+name = "main"
+listen = "127.0.0.1:0"
+auth = "none"
+[[rule]]
+action = "deny"
+when = { method = ["POST"] }
+[[rule]]
+action = "allow"
+allow_internal = true
+"#,
+    )
+    .await;
+    let forbidden =
+        format!("POST /forbidden HTTP/1.1\r\nHost: {target}\r\nContent-Length: 0\r\n\r\n");
+    let direct_post = format!(
+        "POST http://{target}/forbidden HTTP/1.1\r\nHost: {target}\r\nContent-Length: 0\r\n\r\n"
+    );
+    assert_eq!(via_proxy(edge.addr("main"), &direct_post).await.status, 403);
+    let smuggling = format!(
+        "GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nConnection: upgrade,content-length\r\nUpgrade: unsupported\r\nContent-Length: {}\r\n\r\n{forbidden}",
+        forbidden.len()
+    );
+    let response = via_proxy(edge.addr("main"), &smuggling).await;
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header("x-proxyx-error"), Some("bad_request"));
+    assert_eq!(response.header("connection"), Some("close"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), origin.accept())
+            .await
+            .is_err(),
+        "the smuggling request must not open an origin connection"
+    );
 }
 
 #[tokio::test]

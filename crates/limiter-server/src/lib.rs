@@ -21,7 +21,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:39091";
 const DEFAULT_MAX_BUCKETS: usize = 1 << 20;
@@ -29,6 +29,8 @@ const DEFAULT_SHARDS: usize = 256;
 const DEFAULT_REAPER_MS: u64 = 1000;
 const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 const DEFAULT_KEEPALIVE_SECS: u64 = 60;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
@@ -75,6 +77,10 @@ pub struct Config {
     /// Open connections above this are accepted and dropped at once (one OS
     /// thread per connection, so the cap bounds threads and memory).
     pub max_connections: usize,
+    /// Absolute budget to complete the handshake, measured from acceptance.
+    pub handshake_timeout: Duration,
+    /// Maximum time without read progress on an established connection.
+    pub idle_timeout: Duration,
     /// Idle time before the first TCP keepalive probe on accepted sockets;
     /// probes then repeat every `keepalive / 6` (at least 1 s) and the peer is
     /// dropped after 3 unanswered probes. `None` leaves keepalive off.
@@ -88,15 +94,17 @@ impl Default for Config {
             shards: DEFAULT_SHARDS,
             reaper_interval: Duration::from_millis(DEFAULT_REAPER_MS),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS),
             keepalive: Some(Duration::from_secs(DEFAULT_KEEPALIVE_SECS)),
         }
     }
 }
 
 impl Config {
-    /// `PROXYX_LIMITER_MAX_BUCKETS`, `_SHARDS`, `_REAPER_MS`, `_MAX_CONNECTIONS`
-    /// and `_TCP_KEEPALIVE_SECS` (`0` turns keepalive off). Unset, unparsable
-    /// or zero values (except the keepalive) fall back to the defaults.
+    /// `PROXYX_LIMITER_MAX_BUCKETS`, `_SHARDS`, `_REAPER_MS`, `_MAX_CONNECTIONS`,
+    /// `_IDLE_TIMEOUT_MS` and `_TCP_KEEPALIVE_SECS` (`0` turns keepalive off).
+    /// Unset, unparsable or zero values (except keepalive) use the defaults.
     pub fn from_env() -> Self {
         let keepalive = match env::var("PROXYX_LIMITER_TCP_KEEPALIVE_SECS")
             .ok()
@@ -114,6 +122,11 @@ impl Config {
                 DEFAULT_REAPER_MS,
             )),
             max_connections: env_usize("PROXYX_LIMITER_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_timeout: Duration::from_millis(env_u64(
+                "PROXYX_LIMITER_IDLE_TIMEOUT_MS",
+                DEFAULT_IDLE_TIMEOUT_MS,
+            )),
             keepalive,
         }
     }
@@ -160,9 +173,11 @@ pub fn spawn(addr: &str, metrics_addr: Option<&str>, config: &Config) -> std::io
 
     let capacity = registry.capacity();
     let (max_connections, keepalive) = (config.max_connections as u64, config.keepalive);
+    let (handshake_timeout, idle_timeout) = (config.handshake_timeout, config.idle_timeout);
     let accept = thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let handshake_deadline = Instant::now() + handshake_timeout;
             if stats.connections.load(Ordering::Relaxed) >= max_connections {
                 Stats::add(&stats.connections_refused, 1);
                 continue;
@@ -177,7 +192,8 @@ pub fn spawn(addr: &str, metrics_addr: Option<&str>, config: &Config) -> std::io
             let (registry, stats) = (Arc::clone(&registry), Arc::clone(&stats));
             thread::spawn(move || {
                 let _guard = guard;
-                let _ = conn::handle_client(stream, registry, stats);
+                let _ =
+                    conn::handle_client(stream, registry, stats, handshake_deadline, idle_timeout);
             });
         }
     });

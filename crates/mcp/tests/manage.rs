@@ -233,14 +233,25 @@ async fn secrets_go_to_a_private_file_unless_revealing_once_is_enabled() {
     .await;
     let text = session.to_string();
     assert!(
-        !text.contains("password@") && !text.contains(SESSION_PROXY_URL),
+        !text.contains("password@") && !text.contains(SESSION_ID),
         "the proxy URL is a credential: {text}"
     );
     assert!(session["result"]["secret_file"].is_string());
-    assert_eq!(session["result"]["session_id"], SESSION_ID);
+    let alias = session["result"]["session_id"].as_str().expect("handle");
+    assert!(alias.starts_with("session_"));
     let env = std::fs::read_to_string(session["result"]["secret_file"].as_str().expect("file"))
         .expect("env file");
     assert!(env.contains(&format!("HTTPS_PROXY={SESSION_PROXY_URL}")));
+    assert!(env.contains(&format!("SESSION_ID={SESSION_ID}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(session["result"]["secret_file"].as_str().expect("file"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     let body = &fx.control.log.calls("POST", "/rpc/sessions")[0].body;
     assert_eq!(
         (
@@ -251,13 +262,19 @@ async fn secrets_go_to_a_private_file_unless_revealing_once_is_enabled() {
         (Some("acme"), Some("run-9"), Some(300))
     );
     let registered = tool_ok(&server, "list_sessions", json!({})).await;
-    assert_eq!(registered["sessions"][0]["session_id"], SESSION_ID);
-    assert!(!registered.to_string().contains("password"));
+    assert_eq!(registered["sessions"][0]["session_id"], alias);
+    assert!(!registered.to_string().contains(SESSION_ID));
+    let status = tool_ok(&server, "session_status", json!({"session_id": alias})).await;
+    assert_eq!(status["session_id"], alias);
+    assert!(!status.to_string().contains(SESSION_ID));
+    let raw = tool_err(&server, "session_status", json!({"session_id": SESSION_ID})).await;
+    assert!(raw.to_string().contains("session handle"));
 
     // the log has neither secret
     let log = audit_text(&fx);
     for secret in [
         NEW_ORG_KEY,
+        SESSION_ID,
         SESSION_PROXY_URL,
         ADMIN,
         SERVICE_KEY,
@@ -277,6 +294,26 @@ async fn secrets_go_to_a_private_file_unless_revealing_once_is_enabled() {
         !audit_text(&fx).contains(NEW_ORG_KEY),
         "even a revealed key never reaches the audit log"
     );
+    let session = tool_ok(
+        &revealing,
+        "create_session",
+        json!({"captured_hosts": ["*.example.com"]}),
+    )
+    .await;
+    assert_eq!(session["result"]["revealed_once"]["SESSION_ID"], SESSION_ID);
+    assert_eq!(
+        session["result"]["revealed_once"]["HTTP_PROXY"],
+        SESSION_PROXY_URL
+    );
+    assert!(
+        session["result"]["session_id"]
+            .as_str()
+            .expect("handle")
+            .starts_with("session_")
+    );
+    let listed = tool_ok(&revealing, "list_sessions", json!({})).await;
+    assert!(!listed.to_string().contains(SESSION_ID));
+    assert!(!audit_text(&fx).contains(SESSION_ID));
     // and it cannot be read back afterwards
     let log = tool_ok(&revealing, "list_changes", json!({})).await;
     assert!(!log.to_string().contains(NEW_ORG_KEY));
@@ -680,13 +717,16 @@ async fn block_signals_use_the_org_key_route_or_the_operator_route() {
 async fn sessions_can_be_extended_and_ended_and_inventory_diffed() {
     let fx = Fixture::start().await;
     let server = fx.admin();
+    let alias = existing_session_handle(&server).await;
     let extended = tool_ok(
         &server,
         "extend_session",
-        json!({"session_id": SESSION_ID, "additional_secs": 300}),
+        json!({"session_id": alias, "additional_secs": 300}),
     )
     .await;
     assert_eq!(extended["status"], "applied");
+    assert_eq!(extended["result"]["session_id"], alias);
+    assert!(!extended.to_string().contains(SESSION_ID));
     assert_eq!(
         fx.control
             .log
@@ -697,18 +737,20 @@ async fn sessions_can_be_extended_and_ended_and_inventory_diffed() {
     let both = tool_err(
         &server,
         "extend_session",
-        json!({"session_id": SESSION_ID, "additional_secs": 1, "new_ttl_secs": 1}),
+        json!({"session_id": alias, "additional_secs": 1, "new_ttl_secs": 1}),
     )
     .await;
     assert!(both.to_string().contains("not both"));
     let too_long = tool_err(
         &server,
         "extend_session",
-        json!({"session_id": SESSION_ID, "additional_secs": 7200}),
+        json!({"session_id": alias, "additional_secs": 7200}),
     )
     .await;
     assert!(too_long.to_string().contains("above this server's limit"));
-    let ended = tool_ok(&server, "end_session", json!({"session_id": SESSION_ID})).await;
+    let ended = tool_ok(&server, "end_session", json!({"session_id": alias})).await;
+    assert_eq!(ended["result"]["session_id"], alias);
+    assert!(!ended.to_string().contains(SESSION_ID));
     assert_eq!(ended["result"]["released"], true);
 
     let diff = tool_ok(
@@ -1136,4 +1178,121 @@ async fn an_endpoint_that_carries_a_credential_is_refused() {
     .await;
     assert!(error.to_string().contains("carries a credential"));
     assert!(!error.to_string().contains("leakedleaked"));
+}
+
+#[tokio::test]
+async fn nested_reporting_enforces_underlying_tool_allow_and_deny_lists() {
+    let fx = Fixture::start().await;
+    for rules in [
+        "deny_tools = [\"report_block_signal\"]",
+        "allow_tools = [\"classify_block_page\"]",
+    ] {
+        let server = fx.server(&format!("profile = \"admin\"\n{rules}"), "");
+        let classified = tool_ok(
+            &server,
+            "classify_block_page",
+            json!({
+                "status": 403, "host": "example.com", "exit_ip": "203.0.113.50", "report": true
+            }),
+        )
+        .await;
+        assert!(
+            classified["reported"].to_string().contains("disabled"),
+            "{classified}"
+        );
+        assert!(fx.pool.log.mutations().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn stored_changes_obey_current_underlying_tool_policy_without_consumption() {
+    let fx = Fixture::start().await;
+    let admin = fx.admin();
+    let proposal = tool_ok(
+        &admin,
+        "propose_config_change",
+        json!({
+            "action": "set_org_rate_limit",
+            "arguments": {"org": "acme", "requests_per_minute": 100, "burst": 10}
+        }),
+    )
+    .await;
+    let id = proposal["change_id"].as_str().expect("id");
+    for rules in [
+        "deny_tools = [\"set_org_rate_limit\"]",
+        "allow_tools = [\"apply_config_change\"]",
+    ] {
+        let server = fx.server(&format!("profile = \"admin\"\n{rules}"), "");
+        let refused = tool_err(&server, "apply_config_change", json!({"change_id": id})).await;
+        assert!(refused.to_string().contains("disabled"), "{refused}");
+        assert!(fx.control.log.mutations().is_empty());
+    }
+    let applied = tool_ok(&admin, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(fx.control.log.mutations().len(), 1);
+}
+
+#[tokio::test]
+async fn session_handles_are_server_local_and_recovered_by_listing() {
+    let fx = Fixture::start().await;
+    let first = fx.read_only();
+    let original = existing_session_handle(&first).await;
+    let restarted = fx.read_only();
+    let stale = tool_err(
+        &restarted,
+        "session_status",
+        json!({"session_id": original}),
+    )
+    .await;
+    assert!(stale.to_string().contains("session handle"));
+    let listed = tool_ok(&restarted, "list_sessions", json!({})).await;
+    let current = listed["sessions"][0]["session_id"]
+        .as_str()
+        .expect("handle");
+    assert_ne!(current, original);
+    let status = tool_ok(&restarted, "session_status", json!({"session_id": current})).await;
+    assert_eq!(status["session_id"], current);
+    assert!(!status.to_string().contains(SESSION_ID));
+}
+
+#[tokio::test]
+async fn approved_session_changes_survive_restart_with_private_credentials() {
+    for action in ["extend_session", "end_session"] {
+        let fx = Fixture::start().await;
+        let first = fx.server("profile = \"admin\"\napproval = \"all\"", "");
+        let handle = existing_session_handle(&first).await;
+        let mut arguments = json!({"session_id": handle});
+        if action == "extend_session" {
+            arguments["additional_secs"] = json!(60);
+        }
+        let held = tool_ok(&first, action, arguments).await;
+        assert_eq!(held["status"], "pending_approval");
+        assert!(!held.to_string().contains(SESSION_ID));
+        let id = held["change_id"].as_str().expect("change");
+        let stored = first.ctx.store.load(id).expect("stored change");
+        assert_eq!(stored.arguments["session_id"], SESSION_ID);
+        first
+            .ctx
+            .store
+            .approve(id, "operator", None)
+            .expect("approve");
+        let restarted = fx.server("profile = \"admin\"\napproval = \"all\"", "");
+        let preview = tool_ok(
+            &restarted,
+            "apply_config_change",
+            json!({"change_id": id, "dry_run": true}),
+        )
+        .await;
+        assert!(!preview.to_string().contains(SESSION_ID));
+        let applied = tool_ok(&restarted, "apply_config_change", json!({"change_id": id})).await;
+        assert_eq!(applied["status"], "applied");
+        assert!(!applied.to_string().contains(SESSION_ID));
+        assert!(
+            applied["result"]["session_id"]
+                .as_str()
+                .expect("handle")
+                .starts_with("session_")
+        );
+        assert!(!audit_text(&fx).contains(SESSION_ID));
+    }
 }

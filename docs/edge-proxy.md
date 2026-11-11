@@ -170,17 +170,22 @@ stage adds no restriction. BIND and each UDP destination must pass the normal re
 and their configured command-stage rules. Place source-only admission rules in `pre_negotiation`
 and identity rules in `post_auth`; these checks never replace destination authorization.
 
-**Private and internal destinations are always denied**, whatever the rules say: loopback, RFC 1918, link-local and the cloud metadata addresses, IPv4-mapped and translated IPv6 forms, odd spellings (`2130706433`, `0x7f.1`), internal names (`localhost`, dotless names, `.internal`, `.local`, `.svc`), and any name that *resolves* to one of them. The answer is `403` with `X-ProxyX-Error: destination_denied`. A rule that must reach an internal network says so with `allow_internal = true` (allow rules only); the opt-out belongs to that rule, never to the proxy as a whole. The proxy connects to the addresses it checked, never to a second resolution.
+**Private and internal destinations are denied unless their deciding allow rule sets `allow_internal = true`**: loopback, RFC 1918, link-local and cloud metadata addresses, IPv4-mapped and translated IPv6 forms, odd spellings (`2130706433`, `0x7f.1`), and internal names (`localhost`, dotless names, `.internal`, `.local`, `.svc`). The opt-out belongs to that rule, never to the proxy as a whole.
+
+Each resolved address passes the ordered access rules independently. The proxy retains only addresses whose own rule allows them and whose own destination check passes, preserving resolver order. One permitted answer, including an internal-address exception, never authorizes another answer. TCP, UDP destinations and BIND peer checks use this filtered set; BIND and UDP command-stage rules filter it again. If no address survives, the request is refused with `403` (`forbidden` or `destination_denied`). The proxy never resolves the target a second time when dialing.
 
 ## Limits
 
 * `server.max_connections`, `server.max_connections_per_src` and a listener's `max_connections` cap client connections at accept (the connection is closed unanswered and counted `over_limit`). A `[[user]]`'s `max_connections` caps its simultaneous requests and tunnels (`429 too_many_connections`).
 * `[[limit]]` tables add shaping to whatever matches their `when`; every matching table applies, each with its own budget per `scope` (`user`, `src`, or `rule` for one budget shared by everything that matches). `bandwidth_down` (target to client) and `bandwidth_up` are token buckets (a number is bytes per second; `512KiB`, `2MB`, `10Mbit/s` work), paced on both HTTP bodies and tunnels, UDP included. `max_connections` bounds simultaneous requests and `request_rate = "100/min"` new requests (HTTP requests, `CONNECT`, SOCKS commands), refused with `429 rate_limited`.
+* UDP ASSOCIATE acquires the same user and matching `[[limit]]` connection guards as TCP and BIND before sending a success reply. The TCP control connection also holds the accept-time source/listener/server slot. Closing the control connection releases the association's guards; a refused association gets a failure reply, not a successful but unusable relay.
 * `[timeouts]`: `handshake` (first request and login), `connect` (name resolution plus connect, over every attempt), `idle` (a tunnel with no byte either way is closed), `keepalive` (between HTTP requests).
 
 ## Parent proxies
 
 `[[parent]]` tables define upstream HTTP, HTTPS, SOCKS4 or SOCKS5 proxies (Squid `cache_peer`, 3proxy `parent`). Lowest available priority tiers serve first; weighted random remains the default selector. HTTPS verifies the proxy certificate and hostname before forwarding or CONNECT. Plain HTTP requests use absolute-form forwarding and separate `Proxy-Authorization` toward a flat HTTP(S) parent; tunnels and chain hops use CONNECT handshakes. The first parent connection uses its own `pool`, else the request pool. Bounded parent keep-alive reuse remains available for bodyless HTTP requests. A parent `407` becomes `502 parent_error`; upstream credentials never reach the target.
+
+Target resolution always happens at the edge, including parent routes. CONNECT and SOCKS parent handshakes carry an approved numeric IP address; absolute-form HTTP requests sent to HTTP(S) parents also use a numeric authority. The HTTP `Host` header remains the logical target name, and tunneled TLS bytes, including client SNI, remain unchanged. The final hop of a chain follows the same rule. There is no parent-side target-resolution opt-in: parents that require domain-form targets are not supported. This prevents a parent's independent DNS answer from bypassing the edge's destination policy.
 
 `[[route]]` tables choose per request, first match wins (otherwise `server.default_route`): `route = "direct"` (squid `always_direct`), `"parent"` (squid `never_direct`: only through a parent; `503` when none is up) or `"parent_or_direct"`; `parents = [...]` restricts the choice to named parents.
 
@@ -384,6 +389,8 @@ parent_max_idle = 64
 Every timeout except `total` must be above zero (checked at start). `total` is the only way to bound a tunnel that is never idle.
 
 ## Header policy
+
+Requests receive `400 Bad Request` before authentication or dialing if any `Connection` field nominates `Content-Length`, `Transfer-Encoding`, `Host`, `TE`, `Trailer`, or a `Proxy-*` header. Nominating `Upgrade` also requires an actual nonempty `Upgrade` header. Other upgrade protocols remain supported, but an upgrade request cannot remove its own framing headers and turn its body into an unchecked request.
 
 For forwarded plain HTTP, `[http]` decides what the target sees. Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`, `Upgrade` outside a handshake) are always removed, and the client's `Proxy-Authorization` never goes on. `forwarded_for` is `delete` (default: remove `X-Forwarded-For`, `Forwarded` and `X-Real-IP`), `off` (`X-Forwarded-For: unknown`), `truncate` (only the client address), `on` (append it) or `transparent` (leave it). `via = true` adds `Via: 1.1 <proxy_name>`; by default the proxy hides itself. `request_headers_remove` and `request_headers_set` (and the `response_` pair) edit what is left.
 

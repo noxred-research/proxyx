@@ -16,6 +16,19 @@ fn cap_items(body: &Value, key: &str, limit: usize) -> (Vec<Value>, bool, usize)
     (items.into_iter().take(limit).collect(), truncated, total)
 }
 
+fn scope_inventory(ctx: &Ctx, body: &mut Value) {
+    if !ctx.gate.unscoped()
+        && let Some(items) = body["items"].as_array_mut()
+    {
+        items.retain(|item| {
+            item.get("owner").is_some_and(Value::is_null)
+                || item["owner"]
+                    .as_str()
+                    .is_some_and(|org| ctx.gate.check_org(org).is_ok())
+        });
+    }
+}
+
 pub fn capabilities(ctx: &Ctx) -> ToolResult {
     let cfg = &ctx.cfg;
     let enabled: Vec<&str> = ctx.gate.enabled().iter().map(|c| c.as_str()).collect();
@@ -100,17 +113,19 @@ pub async fn list_inventory(ctx: &Ctx, args: &Args) -> ToolResult {
     if let Some(state) = args.str("state") {
         query.push(("state", state.to_owned()));
     }
-    let body = pool.api.get(&["v1", "inventory"], &query).await?;
+    let mut body = pool.api.get(&["v1", "inventory"], &query).await?;
+    scope_inventory(ctx, &mut body);
     let (items, truncated, total) = cap_items(&body, "items", ctx.rows(args.u64("limit")));
     Ok(json!({"items": items, "total": total, "truncated": truncated}))
 }
 
 pub async fn inventory_replacements(ctx: &Ctx, args: &Args) -> ToolResult {
     let pool = ctx.pool()?;
-    let body = pool
+    let mut body = pool
         .api
         .get(&["v1", "inventory", "replacements"], &[])
         .await?;
+    scope_inventory(ctx, &mut body);
     let (items, truncated, total) = cap_items(&body, "items", ctx.rows(args.u64("limit")));
     Ok(json!({"items": items, "total": total, "truncated": truncated}))
 }
@@ -126,6 +141,13 @@ pub async fn list_policies(ctx: &Ctx, args: &Args) -> ToolResult {
         .cloned()
         .unwrap_or_default()
         .into_iter()
+        .filter(|item| {
+            item["scope"] != "org"
+                || item["match"]
+                    .as_str()
+                    .or_else(|| item["doc"]["match"].as_str())
+                    .is_some_and(|org| ctx.gate.check_org(org).is_ok())
+        })
         .filter(|item| scope.is_none_or(|s| item["scope"] == s))
         .filter(|item| name.is_none_or(|n| item["name"] == n))
         .map(|mut item| {
@@ -149,6 +171,11 @@ pub async fn list_policies(ctx: &Ctx, args: &Args) -> ToolResult {
 pub async fn list_org_blocks(ctx: &Ctx, args: &Args) -> ToolResult {
     let pool = ctx.pool()?;
     let mut query = Vec::new();
+    if !ctx.gate.unscoped() && args.str("org").is_none() {
+        return Err(ToolError::invalid(
+            "`org` is required when scope.allowed_orgs is configured",
+        ));
+    }
     if let Some(org) = args.str("org") {
         ctx.gate.check_org(org)?;
         query.push(("org", org.to_owned()));
@@ -220,7 +247,19 @@ pub async fn get_org(ctx: &Ctx, args: &Args) -> ToolResult {
 
 pub async fn list_sessions(ctx: &Ctx, args: &Args) -> ToolResult {
     let limit = ctx.rows(args.u64("limit"));
-    let mut sessions = ctx.store.recent_sessions(limit);
+    // Scope before truncation: unauthorized rows must not displace authorized sessions.
+    let mut sessions: Vec<Value> = ctx
+        .store
+        .recent_sessions(usize::MAX)
+        .into_iter()
+        .filter(|record| {
+            ctx.gate.unscoped()
+                || record["org"]
+                    .as_str()
+                    .is_some_and(|org| ctx.gate.check_org(org).is_ok())
+        })
+        .take(limit)
+        .collect();
     if args.bool("refresh").unwrap_or(false) {
         let control = ctx.control()?;
         for record in sessions.iter_mut().take(20) {
@@ -239,6 +278,9 @@ pub async fn list_sessions(ctx: &Ctx, args: &Args) -> ToolResult {
     }
     let now_ms = now() * 1000;
     for record in &mut sessions {
+        if let Some(id) = record["session_id"].as_str() {
+            record["session_id"] = json!(ctx.session_alias(id)?);
+        }
         if let Some(expires) = record["expires_at_ms"].as_i64() {
             record["expired"] = json!(expires <= now_ms);
         }
@@ -252,17 +294,19 @@ pub async fn list_sessions(ctx: &Ctx, args: &Args) -> ToolResult {
 pub async fn session_status(ctx: &Ctx, args: &Args) -> ToolResult {
     let control = ctx.control()?;
     let id = args.require_str("session_id")?;
-    let config = control.api.get(&["rpc", "sessions", id], &[]).await;
+    let real_id = ctx.resolve_session(id)?;
+    let config = control.api.get(&["rpc", "sessions", &real_id], &[]).await?;
+    let org = config["org_id"]
+        .as_str()
+        .ok_or_else(|| ToolError::internal("session configuration has no org"))?;
+    ctx.gate.check_org(org)?;
     let status = control
         .api
-        .get(&["rpc", "sessions", id, "status"], &[])
-        .await;
-    let (config, status) = match (config, status) {
-        (Err(a), Err(_)) => return Err(a.into()),
-        (config, status) => (config.ok(), status.ok()),
-    };
-    let mut out = json!({"session_id": id, "lifecycle": status});
-    if let Some(config) = config {
+        .get(&["rpc", "sessions", &real_id, "status"], &[])
+        .await?;
+    let alias = ctx.session_alias(&real_id)?;
+    let mut out = json!({"session_id": alias, "lifecycle": status});
+    {
         let expires = config["expires_at_ms"].as_i64();
         out["org_id"] = config["org_id"].clone();
         out["source"] = config["source"].clone();
@@ -308,6 +352,12 @@ pub fn list_changes(ctx: &Ctx, args: &Args) -> ToolResult {
         .store
         .list()
         .into_iter()
+        .filter(|(change, _)| {
+            ctx.gate.unscoped()
+                || change.arguments["org"]
+                    .as_str()
+                    .is_some_and(|org| ctx.gate.check_org(org).is_ok())
+        })
         .filter(|(_, status)| wanted.is_none_or(|w| status.name() == w))
         .take(limit)
         .map(|(change, status)| {

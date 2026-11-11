@@ -68,6 +68,10 @@ pub struct CreateSessionRequest {
     /// Exact logical `host:port` authorities mapped to private plain-HTTP upstream URLs.
     #[serde(default)]
     pub upstream_overrides: HashMap<String, String>,
+    /// Disable upstream TLS certificate verification only for authorized self-signed testing.
+    /// Defaults to false; normal sessions verify upstream certificates.
+    #[serde(default)]
+    pub insecure_upstream_tls: bool,
     pub inject_headers: Vec<(String, String)>,
     pub serialize: bool,
     pub org_id: String,
@@ -123,6 +127,9 @@ pub struct SessionConfig {
     pub excluded_hosts: Vec<String>,
     #[serde(default)]
     pub upstream_overrides: HashMap<String, String>,
+    /// Explicit opt-in to disable upstream certificate verification for authorized self-signed testing.
+    #[serde(default)]
+    pub insecure_upstream_tls: bool,
     pub inject_headers: Vec<(String, String)>,
     pub serialize: bool,
     pub expires_at_ms: i64,
@@ -271,6 +278,30 @@ mod upstream_override_tests {
         }))
         .unwrap();
         assert!(config.upstream_overrides.is_empty());
+        assert!(!config.insecure_upstream_tls);
+        let mut config = config;
+        config.insecure_upstream_tls = true;
+        let persisted = serde_json::to_string(&config).unwrap();
+        let restored: super::SessionConfig = serde_json::from_str(&persisted).unwrap();
+        assert!(restored.insecure_upstream_tls);
+    }
+
+    #[test]
+    fn session_request_defaults_to_verified_upstream_tls() {
+        let mut json = serde_json::json!({
+            "captured_hosts": [],
+            "inject_headers": [],
+            "serialize": false,
+            "org_id": "org",
+            "source": "test",
+            "source_id": "run",
+            "ttl_secs": 60
+        });
+        let request: super::CreateSessionRequest = serde_json::from_value(json.clone()).unwrap();
+        assert!(!request.insecure_upstream_tls);
+        json["insecure_upstream_tls"] = serde_json::json!(true);
+        let request: super::CreateSessionRequest = serde_json::from_value(json).unwrap();
+        assert!(request.insecure_upstream_tls);
     }
 }
 // Wire format — `CapturedRequest`, `SessionEndEvent`, `RequestLogMessage`

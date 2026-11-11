@@ -50,7 +50,7 @@ pub struct WsReassembler(websocket::Reassembler);
 
 impl WsReassembler {
     pub fn new(max_capture: usize) -> Self {
-        Self(websocket::Reassembler::new(max_capture))
+        Self(websocket::Reassembler::new(max_capture, 16 * 1024 * 1024))
     }
 
     /// Feed one frame's payload. Returns the size of the finished message, or

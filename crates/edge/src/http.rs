@@ -316,6 +316,9 @@ impl Session {
         let started = SystemTime::now();
         let t0 = Instant::now();
         let shared = &self.shared;
+        if let Err(message) = crate::headers::validate_request_connection(&head.headers) {
+            return self.reply_close(client, 400, "bad_request", message).await;
+        }
         let is_connect = head.method.eq_ignore_ascii_case("CONNECT");
         let framing = match request_framing(&head.headers) {
             Ok(f) => f,
@@ -613,6 +616,7 @@ impl Session {
             reuse_key,
             reused,
             peer: upstream_peer,
+            destination,
             ..
         } = opened;
         let mut up = Pipe::new(stream);
@@ -656,7 +660,10 @@ impl Session {
             if let Some(auth) = parent.as_ref().and_then(|p| p.proxy_authorization()) {
                 headers.push(("Proxy-Authorization".to_owned(), auth.into_bytes()));
             }
-            format!("{} {} HTTP/1.1", head.method, abs.url())
+            format!(
+                "{} http://{}{} HTTP/1.1",
+                head.method, destination, abs.path
+            )
         } else {
             format!("{} {} HTTP/1.1", head.method, abs.path)
         };

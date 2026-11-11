@@ -681,16 +681,13 @@ async fn via_path(
                     return Err(parent_error(parent, error));
                 }
             }
-            let target = parents.get(hop + 1).map_or_else(
-                || Target {
-                    host: plan.host.to_owned(),
-                    port: plan.port,
+            let target = match parents.get(hop + 1) {
+                Some(next) => Target {
+                    host: next.host.clone(),
+                    port: next.port,
                 },
-                |p| Target {
-                    host: p.host.clone(),
-                    port: p.port,
-                },
-            );
+                None => plan.target()?,
+            };
             let result = if hop + 1 == parents.len() && http_proxy {
                 dial::proxy_transport(stream, parent.endpoint())
                     .await

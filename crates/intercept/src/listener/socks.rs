@@ -612,6 +612,7 @@ pub(super) async fn handle_socks5(
                                 serial_lock: serial_lock.clone(),
                                 egress_proxy,
                                 upstream_tls: mapped.is_none(),
+                                insecure_upstream_tls: decision.insecure_upstream_tls,
                             },
                         )
                     },

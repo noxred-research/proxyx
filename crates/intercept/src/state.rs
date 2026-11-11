@@ -33,6 +33,8 @@ pub struct LocalSession {
     pub captured_hosts: Vec<String>,
     pub excluded_hosts: Vec<String>,
     pub upstream_overrides: Arc<[Arc<ParsedUpstreamOverride>]>,
+    /// Disable upstream certificate verification only for authorized self-signed testing.
+    pub insecure_upstream_tls: bool,
     pub inject_headers: Arc<[(String, String)]>,
     pub serialize: bool,
     pub serial_lock: Option<Arc<Mutex<()>>>,
@@ -54,6 +56,8 @@ pub struct RoutingDecision {
     pub egress_proxy: Option<Arc<EgressProxy>>,
     pub upstream_override: Option<Arc<ParsedUpstreamOverride>>,
     pub has_upstream_overrides: bool,
+    /// Explicit session opt-in for authorized self-signed upstream testing.
+    pub insecure_upstream_tls: bool,
     pub rate_limit: Option<RateLimitSettings>,
     pub tls_profile: TlsProfile,
 }
@@ -235,6 +239,7 @@ impl ProxyState {
             captured_hosts: config.captured_hosts,
             excluded_hosts: config.excluded_hosts,
             upstream_overrides: Arc::from(upstream_overrides),
+            insecure_upstream_tls: config.insecure_upstream_tls,
             inject_headers: Arc::from(config.inject_headers),
             serialize: config.serialize,
             serial_lock,
@@ -348,6 +353,7 @@ impl ProxyState {
             egress_proxy: session.egress_proxy.clone(),
             has_upstream_overrides: !session.upstream_overrides.is_empty(),
             upstream_override,
+            insecure_upstream_tls: session.insecure_upstream_tls,
             rate_limit: session.rate_limit.clone(),
             tls_profile: TlsProfile::for_agent(session.agent.as_deref()),
         }
@@ -553,13 +559,17 @@ mod tests {
                 "lab.example.test:443".into(),
                 "http://docs-app.lab.svc.cluster.local:8000".into(),
             )]),
+            insecure_upstream_tls: true,
             inject_headers: Vec::new(),
             serialize: false,
             expires_at_ms: i64::MAX,
             egress_proxy: None,
             rate_limit: None,
         };
+        let persisted = serde_json::to_string(&config).unwrap();
+        let config: SessionConfig = serde_json::from_str(&persisted).unwrap();
         let local = ProxyState::from_session_config(config).unwrap();
+        assert!(local.insecure_upstream_tls);
         let route = &local.upstream_overrides[0];
         assert_eq!(route.logical_port, 443);
         assert_eq!(route.upstream_port, 8000);

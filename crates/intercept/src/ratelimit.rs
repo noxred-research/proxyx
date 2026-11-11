@@ -162,6 +162,7 @@ impl RateLimitConfig {
                 failure_threshold: self.limiter_breaker_failures,
                 open_duration: Duration::from_millis(self.limiter_breaker_open_ms),
             }),
+            ..limiter_client::ResilienceConfig::default()
         }
     }
 }

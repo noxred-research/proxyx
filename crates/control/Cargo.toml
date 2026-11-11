@@ -57,6 +57,9 @@ async-trait.workspace = true
 rdkafka.workspace = true
 rsa.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }
+
 [dev-dependencies]
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

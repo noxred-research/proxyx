@@ -33,6 +33,42 @@ fn check_value(v: &str) -> bool {
     !v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
 }
 
+/// Reject connection options that would remove routing, framing or proxy metadata.
+pub(crate) fn validate_request_connection(h: &[Header]) -> Result<(), &'static str> {
+    let has_upgrade = h.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("upgrade") && !value.trim_ascii().is_empty()
+    });
+    for (_, value) in h
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        if !value.is_ascii() {
+            return Err("Connection options must be ASCII");
+        }
+        for token in value.split(|b| *b == b',').map(<[u8]>::trim_ascii) {
+            if [
+                b"content-length".as_slice(),
+                b"transfer-encoding",
+                b"host",
+                b"te",
+                b"trailer",
+            ]
+            .iter()
+            .any(|name| token.eq_ignore_ascii_case(name))
+                || token
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"proxy-"))
+            {
+                return Err("Connection must not nominate routing, framing or proxy headers");
+            }
+            if token.eq_ignore_ascii_case(b"upgrade") && !has_upgrade {
+                return Err("Connection upgrade requires an Upgrade header");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct HeaderPolicy {
     xff: ForwardedFor,
@@ -328,6 +364,60 @@ mod tests {
 
     fn client() -> IpAddr {
         CLIENT.parse().expect("ip")
+    }
+
+    #[test]
+    fn connection_options_reject_routing_framing_and_proxy_headers() {
+        for token in [
+            "content-length",
+            "CoNtEnT-LeNgTh",
+            "TRANSFER-ENCODING",
+            "Host",
+            "tE",
+            "Trailer",
+            "Proxy-Authorization",
+            "proxy-authenticate",
+            "PROXY-CONNECTION",
+            "pRoXy-Custom",
+            "\u{a0}content-length",
+        ] {
+            let value = format!("keep-alive, \t{token}\t, X-Hop");
+            let h = hdrs(&[
+                ("Connection", "keep-alive"),
+                ("cOnNeCtIoN", &value),
+                ("Upgrade", "echo"),
+            ]);
+            assert!(validate_request_connection(&h).is_err(), "{token}");
+        }
+    }
+
+    #[test]
+    fn connection_upgrade_requires_an_actual_upgrade_header() {
+        for upgrade in [None, Some(""), Some(" \t")] {
+            let mut h = hdrs(&[
+                ("Connection", "keep-alive"),
+                ("CONNECTION", "X-Hop, UpGrAdE"),
+            ]);
+            if let Some(value) = upgrade {
+                h.push(("Upgrade".to_owned(), value.as_bytes().to_vec()));
+            }
+            assert!(validate_request_connection(&h).is_err(), "{upgrade:?}");
+        }
+    }
+
+    #[test]
+    fn connection_options_allow_custom_headers_and_arbitrary_upgrades() {
+        for h in [
+            hdrs(&[]),
+            hdrs(&[("Connection", "keep-alive, X-Hop")]),
+            hdrs(&[
+                ("Connection", "keep-alive"),
+                ("cOnNeCtIoN", "X-Hop, UpGrAdE"),
+                ("uPgRaDe", "echo"),
+            ]),
+        ] {
+            assert_eq!(validate_request_connection(&h), Ok(()));
+        }
     }
 
     #[test]

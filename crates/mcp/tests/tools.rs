@@ -263,7 +263,10 @@ async fn state_tools_read_the_backends() {
     assert_eq!(org["rate_limit"]["burst"], 1000);
     assert_eq!(org["rate_limit_state"]["tokens"], 0.0);
     assert!(org["egress_proxy"].is_null());
-    let session = tool_ok(&server, "session_status", json!({"session_id": SESSION_ID})).await;
+    let sessions = tool_ok(&server, "list_sessions", json!({})).await;
+    assert_eq!(sessions["sessions"], json!([]));
+    let alias = existing_session_handle(&server).await;
+    let session = tool_ok(&server, "session_status", json!({"session_id": alias})).await;
     assert_eq!(session["lifecycle"]["state"], "active");
     assert_eq!(
         session["inject_header_names"],
@@ -280,8 +283,6 @@ async fn state_tools_read_the_backends() {
     )
     .await;
     assert!(missing.to_string().contains("404") || missing.to_string().contains("not found"));
-    let sessions = tool_ok(&server, "list_sessions", json!({})).await;
-    assert_eq!(sessions["sessions"], json!([]));
     let capabilities = tool_ok(&server, "capabilities", json!({})).await;
     assert_eq!(capabilities["read_only"], true);
     assert_eq!(capabilities["backends"]["pool_api"], true);
@@ -825,4 +826,125 @@ async fn effective_config_reports_policy_timeouts_and_builtins() {
     let for_provider = tool_ok(&server, "effective_config", json!({"provider": "p1"})).await;
     assert_eq!(for_provider["policy"]["provider"], "p1");
     assert!(fx.pool.log.mutations().is_empty());
+}
+
+#[tokio::test]
+async fn scoped_reads_filter_tenants_before_pagination() {
+    let fx = Fixture::start().await;
+    {
+        let mut pool = fx.pool_state.lock().expect("pool");
+        pool.inventory = vec![
+            json!({"ip": "203.0.113.99", "provider": "private", "owner": "other"}),
+            json!({"ip": "203.0.113.10", "provider": "shared", "owner": null}),
+            json!({"ip": "203.0.113.11", "provider": "private", "owner": "acme"}),
+        ];
+        pool.policies.extend([
+            json!({"scope": "org", "name": "other-secret-policy", "match": "other", "doc": {"scope": "org", "match": "other"}}),
+            json!({"scope": "org", "name": "acme-policy", "match": "acme", "doc": {"scope": "org", "match": "acme"}}),
+        ]);
+    }
+    let server = fx.server(
+        "",
+        "[scope]\nallowed_orgs = [\"acme\"]\n[limits]\nmax_rows = 1",
+    );
+    for name in ["list_inventory", "inventory_replacements"] {
+        let result = tool_ok(&server, name, json!({})).await;
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["items"][0]["ip"], "203.0.113.10");
+        assert!(!result.to_string().contains("203.0.113.99"));
+    }
+    for args in [
+        json!({}),
+        json!({"include_docs": true}),
+        json!({"name": "other-secret-policy"}),
+    ] {
+        let result = tool_ok(&server, "list_policies", args).await;
+        assert!(!result.to_string().contains("other-secret-policy"));
+        assert!(!result.to_string().contains("\"other\""));
+    }
+    let missing = tool_err(&server, "list_org_blocks", json!({})).await;
+    assert!(missing.to_string().contains("`org` is required"));
+    let foreign = tool_err(&server, "list_org_blocks", json!({"org": "other"})).await;
+    assert!(foreign.to_string().contains("authorized scope"));
+    assert!(fx.pool.log.calls("GET", "/v1/org-blocks").is_empty());
+    let blocks = tool_ok(&server, "list_org_blocks", json!({"org": "acme"})).await;
+    assert_eq!(blocks["items"][0]["org"], "acme");
+
+    for (id, org) in [(SESSION_ID, "acme"), ("foreign-session", "other")] {
+        server
+            .ctx
+            .store
+            .register_session(&json!({"session_id": id, "org": org}))
+            .expect("register");
+    }
+    let sessions = tool_ok(
+        &server,
+        "list_sessions",
+        json!({"limit": 1, "refresh": true}),
+    )
+    .await;
+    assert_eq!(sessions["sessions"].as_array().expect("sessions").len(), 1);
+    assert_eq!(sessions["sessions"][0]["org"], "acme");
+    assert!(!sessions.to_string().contains(SESSION_ID));
+    assert!(!sessions.to_string().contains("foreign-session"));
+    assert!(
+        fx.control
+            .log
+            .all()
+            .iter()
+            .all(|r| !r.path.contains("foreign-session"))
+    );
+    let status = tool_ok(
+        &server,
+        "session_status",
+        json!({"session_id": sessions["sessions"][0]["session_id"]}),
+    )
+    .await;
+    assert_eq!(status["org_id"], "acme");
+}
+
+#[tokio::test]
+async fn session_status_checks_owner_before_lifecycle_and_audit_is_not_shared() {
+    let fx = Fixture::start().await;
+    let server = fx.server(
+        "reveal_secrets_once = true",
+        "[scope]\nallowed_orgs = [\"other\"]",
+    );
+    let refused = tool_err(&server, "session_status", json!({"session_id": SESSION_ID})).await;
+    assert!(refused.to_string().contains("authorized scope"));
+    assert!(
+        fx.control
+            .log
+            .calls("GET", &format!("/rpc/sessions/{SESSION_ID}/status"))
+            .is_empty()
+    );
+    let resources = ask(&server, modern(2, "resources/list", json!({}))).await;
+    assert!(!resources.to_string().contains("proxyx://audit/recent"));
+    let audit = ask(
+        &server,
+        modern(3, "resources/read", json!({"uri": "proxyx://audit/recent"})),
+    )
+    .await;
+    assert!(audit.get("error").is_some());
+}
+
+#[tokio::test]
+async fn scoped_change_listing_hides_other_orgs() {
+    let fx = Fixture::start().await;
+    let admin = fx.admin();
+    for org in ["acme", "other"] {
+        tool_ok(
+            &admin,
+            "propose_config_change",
+            json!({
+                "action": "set_org_rate_limit",
+                "arguments": {"org": org, "requests_per_minute": 100, "burst": 10}
+            }),
+        )
+        .await;
+    }
+    let scoped = fx.server("", "[scope]\nallowed_orgs = [\"acme\"]");
+    let changes = tool_ok(&scoped, "list_changes", json!({"limit": 1})).await;
+    assert_eq!(changes["changes"].as_array().expect("changes").len(), 1);
+    assert!(!changes.to_string().contains("other"));
 }

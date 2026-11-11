@@ -4,3 +4,6 @@
 # request does not come from a fork. Contributors who are not listed here never run a
 # workflow. Only user owners are honoured; team owners (@org/team) are ignored by that check.
 * @kaan-zeroday
+
+# Explicitly protect workflow policy and this allow-list as well as the wildcard above.
+/.github/ @kaan-zeroday

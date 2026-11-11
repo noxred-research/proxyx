@@ -30,13 +30,13 @@ Examples of unacceptable behavior include:
   permission
 * Other conduct which could reasonably be considered inappropriate in a professional setting
 
-In addition, crawlx is built and intended for security research and authorized testing only, and it can act on
-other people's systems. Therefore:
+In addition, ProxyX is built for operating authorized proxy infrastructure and inspecting traffic whose
+owner has consented. Therefore:
 
 * Do not use project spaces to plan, request help with, or advertise unauthorized scraping, credential
   attacks, or probing or attacking systems you do not own or have written authorization to test.
-* Do not ask for, or share, ways to evade a site's protections or to weaken or bypass crawlx's safety kernel,
-  egress policy or authorization-record checks.
+* Do not ask for, or share, ways to evade a site's protections or to weaken or bypass ProxyX's destination
+  controls, authentication, org isolation or TLS interception scope.
 * Do not post credentials, personal data or captured third-party content in issues, pull requests or
   discussions, including findings from systems you were not authorized to test.
 
@@ -62,7 +62,7 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders
 responsible for enforcement privately through GitHub:
 
-1. Open <https://github.com/noxred-research/crawlx/security/advisories/new> (the repository's **Security**
+1. Open <https://github.com/noxred-research/proxyx/security/advisories/new> (the repository's **Security**
    tab, **Report a vulnerability**) and start the title with `Conduct report:`. The form is private to the
    maintainers. Describe what happened, where, and who was involved, and include links where you can.
 2. For content hosted on GitHub, you can also use GitHub's **Report content** option on the item itself.
@@ -117,6 +117,8 @@ individuals.
 
 This Code of Conduct is adapted from the [Contributor Covenant][homepage], version 2.1, available at
 <https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>.
+
+The Contributor Covenant text is licensed under [Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/). ProxyX adds its intended-use standards and reporting channel.
 
 Community Impact Guidelines were inspired by [Mozilla's code of conduct enforcement ladder][mozilla coc].
 

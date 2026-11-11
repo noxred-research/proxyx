@@ -11,10 +11,10 @@
 //! 5. the mutation budget, an `intent` audit entry (the call is refused when it cannot be
 //!    written), then the backend call.
 //!
-//! A change never stores a secret: credentials are named references into the server's
-//! `[credentials]` table. A secret the call creates (an org key, a session's proxy URL) is shown
-//! once under `revealed_once` when the server allows it, and is otherwise written to a `0600`
-//! file whose path is returned.
+//! Stored credentials are named references into the server's `[credentials]` table, except
+//! session UUIDs retained in private pending-change files so approvals survive a restart.
+//! Model-facing session identifiers are opaque handles. Generated secrets are shown once
+//! under `revealed_once` only when policy allows, otherwise written to a `0600` file.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -515,6 +515,7 @@ fn prepare_create_session(ctx: &Ctx, args: &Args) -> Result<Prepared, ToolError>
 async fn prepare_extend_session(ctx: &Ctx, args: &Args) -> Result<Prepared, ToolError> {
     let control = ctx.control()?;
     let id = args.require_str("session_id")?;
+    let real_id = ctx.resolve_session(id)?;
     let (additional, new_ttl) = (args.u64("additional_secs"), args.u64("new_ttl_secs"));
     let secs = match (additional, new_ttl) {
         (Some(_), Some(_)) => {
@@ -531,7 +532,7 @@ async fn prepare_extend_session(ctx: &Ctx, args: &Args) -> Result<Prepared, Tool
             "{secs} seconds is above this server's limit of {cap} (limits.max_session_ttl_secs)"
         )));
     }
-    let current = control.api.get(&["rpc", "sessions", id], &[]).await?;
+    let current = control.api.get(&["rpc", "sessions", &real_id], &[]).await?;
     let expires = current["expires_at_ms"].as_i64().unwrap_or(0);
     let new_expires = match (additional, new_ttl) {
         (Some(add), _) => expires + i64::try_from(add).unwrap_or(0) * 1000,
@@ -543,10 +544,11 @@ async fn prepare_extend_session(ctx: &Ctx, args: &Args) -> Result<Prepared, Tool
         format!("extend session {id}"),
         &["PATCH /rpc/sessions/{id}"],
     );
-    p.org = current["org_id"].as_str().map(str::to_owned);
-    if let Some(org) = &p.org {
-        ctx.gate.check_org(org)?;
-    }
+    let org = current["org_id"]
+        .as_str()
+        .ok_or_else(|| ToolError::internal("session configuration has no org"))?;
+    ctx.gate.check_org(org)?;
+    p.org = Some(org.to_owned());
     p.diff = json!({"expires_at_ms": {"from": expires, "to": new_expires}});
     Ok(p)
 }
@@ -554,16 +556,18 @@ async fn prepare_extend_session(ctx: &Ctx, args: &Args) -> Result<Prepared, Tool
 async fn prepare_end_session(ctx: &Ctx, args: &Args) -> Result<Prepared, ToolError> {
     let control = ctx.control()?;
     let id = args.require_str("session_id")?;
-    let current = control.api.get(&["rpc", "sessions", id], &[]).await?;
+    let real_id = ctx.resolve_session(id)?;
+    let current = control.api.get(&["rpc", "sessions", &real_id], &[]).await?;
     let mut p = prepared(
         json!({"session_id": id}),
         format!("release session {id}"),
         &["DELETE /rpc/sessions/{id}"],
     );
-    p.org = current["org_id"].as_str().map(str::to_owned);
-    if let Some(org) = &p.org {
-        ctx.gate.check_org(org)?;
-    }
+    let org = current["org_id"]
+        .as_str()
+        .ok_or_else(|| ToolError::internal("session configuration has no org"))?;
+    ctx.gate.check_org(org)?;
+    p.org = Some(org.to_owned());
     p.diff = json!({"releases": {"source_id": current["source_id"], "org_id": current["org_id"]}});
     p.warnings.push(
         "the last holder's release starts teardown; captures drain to storage afterwards".into(),
@@ -1212,10 +1216,17 @@ async fn execute(ctx: &Ctx, action: Action, p: &Prepared, info: &CallInfo) -> To
                 body["agent"] = json!(agent);
             }
             let reply = control.api.post(&["rpc", "sessions"], &body).await?;
-            let id = reply["session_id"].as_str().unwrap_or("").to_owned();
+            let id = reply["session_id"]
+                .as_str()
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .ok_or_else(|| {
+                    ToolError::internal("the control plane returned no valid session id")
+                })?
+                .to_owned();
+            let alias = ctx.session_alias(&id)?;
             let expires = reply["expires_at_ms"].as_i64().unwrap_or(0);
             let mut out = json!({
-                "session_id": id,
+                "session_id": alias,
                 "org": p.args["org"],
                 "source": p.args["source"],
                 "source_id": p.args["source_id"],
@@ -1228,11 +1239,11 @@ async fn execute(ctx: &Ctx, action: Action, p: &Prepared, info: &CallInfo) -> To
             });
             let url = reply["proxy_url"].as_str().unwrap_or("");
             let socks = reply["proxy_url_socks5"].as_str().unwrap_or("");
-            let compact_id: String = id.chars().filter(|c| *c != '-').take(12).collect();
             deliver(
                 ctx,
-                &format!("session-{compact_id}"),
+                &alias,
                 &[
+                    ("SESSION_ID", &id),
                     ("HTTP_PROXY", url),
                     ("HTTPS_PROXY", url),
                     ("ALL_PROXY", socks),
@@ -1250,12 +1261,16 @@ async fn execute(ctx: &Ctx, action: Action, p: &Prepared, info: &CallInfo) -> To
         Action::ExtendSession => {
             let control = ctx.control()?;
             let id = args.require_str("session_id")?;
+            let real_id = ctx.resolve_session(id)?;
             let body = match (args.u64("additional_secs"), args.u64("new_ttl_secs")) {
                 (Some(add), _) => json!({"additional_secs": add}),
                 (None, Some(ttl)) => json!({"new_ttl_secs": ttl}),
                 _ => return Err(invalid("nothing to extend by")),
             };
-            let reply = control.api.patch(&["rpc", "sessions", id], &body).await?;
+            let reply = control
+                .api
+                .patch(&["rpc", "sessions", &real_id], &body)
+                .await?;
             let expires = reply["expires_at_ms"].as_i64().unwrap_or(0);
             Ok(
                 json!({"session_id": id, "expires_at_ms": expires, "expires_in_secs": (expires / 1000 - now()).max(0)}),
@@ -1264,7 +1279,8 @@ async fn execute(ctx: &Ctx, action: Action, p: &Prepared, info: &CallInfo) -> To
         Action::EndSession => {
             let control = ctx.control()?;
             let id = args.require_str("session_id")?;
-            control.api.delete(&["rpc", "sessions", id]).await?;
+            let real_id = ctx.resolve_session(id)?;
+            control.api.delete(&["rpc", "sessions", &real_id]).await?;
             Ok(json!({"session_id": id, "released": true}))
         }
         Action::CreateOrgKey => {
@@ -1553,11 +1569,19 @@ fn store_change(
             "a change that waits for approval cannot carry an inline secret; use `credential_ref` so the secret is never stored",
         ));
     }
+    let mut arguments = p.args.clone();
+    if matches!(action, Action::ExtendSession | Action::EndSession) {
+        let handle = arguments["session_id"]
+            .as_str()
+            .ok_or_else(|| ToolError::internal("session change has no handle"))?;
+        arguments["session_id"] = json!(ctx.resolve_session(handle)?);
+        arguments["org"] = json!(p.org);
+    }
     let change = Change {
         id: new_change_id(),
         action: action.name().to_owned(),
-        digest: change_digest(action.name(), &p.args),
-        arguments: p.args.clone(),
+        digest: change_digest(action.name(), &arguments),
+        arguments,
         summary: p.summary.clone(),
         diff: p.diff.clone(),
         warnings: p.warnings.clone(),
@@ -1580,6 +1604,7 @@ async fn commit(
     info: &CallInfo,
     change_id: Option<&str>,
 ) -> ToolResult {
+    ctx.check_tool(action.name())?;
     ctx.gate.admit_mutation()?;
     ctx.audit
         .record(&Entry {
@@ -1609,6 +1634,7 @@ async fn commit(
 
 /// A mutating tool called directly.
 pub async fn run_direct(ctx: &Ctx, action: Action, args: Args, info: &CallInfo) -> ToolResult {
+    ctx.check_tool(action.name())?;
     ctx.gate.check_applicable(action.capability(), None)?;
     let p = prepare(ctx, action, &args).await?;
     if let Some(org) = &p.org {
@@ -1638,12 +1664,7 @@ pub async fn propose_config_change(ctx: &Ctx, args: &Args, info: &CallInfo) -> T
     let action = Action::from_name(name)
         .filter(|action| action.proposable())
         .ok_or_else(|| invalid(format!("{name:?} is not a configuration change")))?;
-    if !ctx.gate.tool_allowed(name) {
-        return Err(ToolError::new(
-            FailKind::Refused,
-            format!("tool `{name}` is disabled by this server's allow or deny list"),
-        ));
-    }
+    ctx.check_tool(name)?;
     let def = ctx
         .def(name)
         .ok_or_else(|| ToolError::internal("missing tool definition"))?;
@@ -1691,6 +1712,7 @@ pub async fn apply_config_change(ctx: &Ctx, args: &Args, info: &CallInfo) -> Too
         .map_err(|error| invalid(error.to_string()))?;
     let action = Action::from_name(&change.action)
         .ok_or_else(|| ToolError::internal("the change names an unknown action"))?;
+    ctx.check_tool(action.name())?;
     ctx.gate.check_applicable(action.capability(), None)?;
     match ctx.store.status(&change) {
         Status::Applied { .. } => return Err(invalid(format!("change {id} was already applied"))),
@@ -1710,7 +1732,17 @@ pub async fn apply_config_change(ctx: &Ctx, args: &Args, info: &CallInfo) -> Too
         Status::Proposed | Status::Approved { .. } => {}
     }
     // Validate again against the state as it is now: the diff shown at proposal time may be stale.
-    let p = prepare(ctx, action, &Args::from_value(change.arguments.clone())).await?;
+    let mut arguments = change.arguments.clone();
+    if matches!(action, Action::ExtendSession | Action::EndSession) {
+        let id = arguments["session_id"]
+            .as_str()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .ok_or_else(|| {
+                invalid("stored session handle expired; re-list sessions and re-propose")
+            })?;
+        arguments["session_id"] = json!(ctx.session_alias(id)?);
+    }
+    let p = prepare(ctx, action, &Args::from_value(arguments)).await?;
     if let Some(org) = &p.org {
         ctx.gate.check_applicable(action.capability(), Some(org))?;
     }

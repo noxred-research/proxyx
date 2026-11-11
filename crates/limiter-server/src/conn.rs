@@ -16,6 +16,7 @@ use std::io;
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // Linux: suppress SIGPIPE on send. macOS has no MSG_NOSIGNAL; Rust's runtime
 // already sets SIGPIPE to SIG_IGN, so a flag of 0 is safe there.
@@ -30,9 +31,14 @@ unsafe extern "C" {
     fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
 }
 
-fn recv_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
+fn recv_some(stream: &TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<usize> {
     let fd = stream.as_raw_fd();
     loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(io::ErrorKind::TimedOut)?;
+        stream.set_read_timeout(Some(remaining))?;
         let received = unsafe { recv(fd, buf.as_mut_ptr(), buf.len(), 0) };
         if received == 0 {
             return Ok(0);
@@ -48,9 +54,9 @@ fn recv_some(stream: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn recv_exact(stream: &TcpStream, mut buf: &mut [u8]) -> io::Result<()> {
+fn recv_exact(stream: &TcpStream, mut buf: &mut [u8], deadline: Instant) -> io::Result<()> {
     while !buf.is_empty() {
-        let n = recv_some(stream, buf)?;
+        let n = recv_some(stream, buf, deadline)?;
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -80,9 +86,12 @@ fn send_all(stream: &TcpStream, mut buf: &[u8]) -> io::Result<()> {
 
 /// Read `MAGIC ++ VERSION`; reply `VERSION` on accept, `REJECT` then close on a
 /// bad handshake. Returns `Ok(false)` to signal the caller to drop the conn.
-fn handshake(stream: &TcpStream) -> io::Result<bool> {
+fn handshake(stream: &TcpStream, deadline: Instant) -> io::Result<bool> {
     let mut hs = [0u8; 5];
-    recv_exact(stream, &mut hs)?;
+    recv_exact(stream, &mut hs, deadline)?;
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
     if hs[0..4] != MAGIC || hs[4] != VERSION {
         let _ = send_all(stream, &[limiter_proto::REJECT]);
         return Ok(false);
@@ -199,16 +208,25 @@ pub fn handle_client(
     stream: TcpStream,
     registry: Arc<Registry>,
     stats: Arc<Stats>,
+    handshake_deadline: Instant,
+    idle_timeout: Duration,
 ) -> io::Result<()> {
-    let result = serve(&stream, &registry, &stats);
+    let result = serve(&stream, &registry, &stats, handshake_deadline, idle_timeout);
     if result.is_err() {
         Stats::add(&stats.connection_errors, 1);
     }
     result
 }
 
-fn serve(stream: &TcpStream, registry: &Registry, stats: &Stats) -> io::Result<()> {
-    if !handshake(stream)? {
+fn serve(
+    stream: &TcpStream,
+    registry: &Registry,
+    stats: &Stats,
+    handshake_deadline: Instant,
+    idle_timeout: Duration,
+) -> io::Result<()> {
+    stream.set_write_timeout(Some(idle_timeout))?;
+    if !handshake(stream, handshake_deadline)? {
         return Ok(());
     }
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
@@ -228,7 +246,7 @@ fn serve(stream: &TcpStream, registry: &Registry, stats: &Stats) -> io::Result<(
         if !resp.is_empty() {
             send_all(stream, &resp)?;
         }
-        let n = recv_some(stream, &mut chunk)?;
+        let n = recv_some(stream, &mut chunk, Instant::now() + idle_timeout)?;
         if n == 0 {
             return Ok(());
         }

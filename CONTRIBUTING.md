@@ -80,6 +80,8 @@ All Rust follows the workspace lints in [`Cargo.toml`](Cargo.toml). On top of th
 - Tests are deterministic and use no external network. Use loopback fixtures and the stand-in services the test suites already provide.
 - A behavior change needs a test that fails without it. A bug fix needs a regression test.
 - Do not put real-format provider credentials or API tokens in tests or fixtures. Build synthetic values at runtime from split parts, with a comment that they are canaries, so secret scanners do not flag the repository (`gitleaks` runs in CI).
+- Provider fixture adapters name public vendor endpoints and secret-file identifiers, not usable accounts. `crates/provider/tests/golden.rs` supplies synthetic usernames and passwords through an in-memory resolver; do not replace them with live credentials.
+- TLS tests generate disposable keys and self-signed certificates at runtime (for example, `crates/edge/tests/common/tls_fixture.rs`). Certificate-shaped strings in client and MCP tests contain dummy payloads, not trusted roots or production keys. Never reuse test or Compose CA material outside an isolated local test, and never install it into a personal or system trust store.
 - Metric families have a catalogue: [`docs/metrics/pool.md`](docs/metrics/pool.md) is parsed by a unit test and compared with the registry. Adding, removing or relabeling a metric means updating the matching `### \`metric_name\`` heading and its `- **Labels:**` line.
 
 ## Documentation
@@ -100,10 +102,15 @@ Migrations are forward-only and embedded in the binary. Never edit a migration t
 6. A code owner reviews the pull request. Expect requests for tests, documentation, or a narrower scope. Do not bypass a failing check; fix it, or describe an unrelated failure precisely enough for a reviewer to reproduce it.
 
 Keep credentials, local environment files, raw user data and generated secrets out of commits and pull requests.
+The ignore files exclude local configurations, secret containers, database files, captures and exports. Keep configuration examples under `examples/` and the tracked `data/` directories; store real inventory and traffic separately. The Docker build context excludes secrets as well: do not pass them through build arguments or copy them into images.
 
 ### Continuous integration for external pull requests
 
-GitHub Actions workflows run only for pull requests from code owners (the allow-list is [`.github/CODEOWNERS`](.github/CODEOWNERS)). For a pull request from a fork, a maintainer runs the checks above, with PostgreSQL and Valkey, and reports the result on the pull request. A green local run from you speeds this up; it does not replace the maintainer's run. Dependency-update pull requests are handled the same way.
+Pull-request CI runs only when the actor, rerun actor and pull-request author are individual code owners, and the head branch belongs to this repository. The gate reads the wildcard rule from [`.github/CODEOWNERS`](.github/CODEOWNERS) on the trusted default branch. For external contributions, including forks and dependency-update pull requests, a maintainer runs the checks above with PostgreSQL and Valkey and reports the results on the pull request. A green local run from you does not replace that review.
+
+The [security workflow](.github/workflows/security.yml) checks current Rust advisories, all fetched Git history for secrets and workflow configuration with zizmor on main-branch pushes, weekly and on manual dispatch. [CodeQL](.github/workflows/codeql.yml) scans Rust and GitHub Actions on authorized pull requests, main-branch pushes, weekly and on manual dispatch, but analysis and upload stay disabled while the repository is private. Both workflows require an owner actor and rerun actor. Keep GitHub's CodeQL default setup disabled when using this advanced setup.
+
+These workflow gates are defense in depth, not a sandbox: a pull request can change its own workflow. The repository settings are the authoritative control: workflows from forks need maintainer approval for every external contributor, Actions run only GitHub-owned and SHA-pinned allowlisted actions with a read-only default token, and `main` accepts only squash-merged pull requests with an approving code-owner review, approval of the last push, resolved review threads and a green, up-to-date `required` check. Release tags (`v*`) cannot be moved or deleted.
 
 ## Getting help
 

@@ -8,9 +8,12 @@
 //! `snapshot` propagate the error (a create cannot be silently faked).
 //!
 //! Transport behaviour is set by [`ResilienceConfig`]: bounded connect and
-//! per-exchange timeouts, TCP keepalive and a circuit breaker that stops
-//! dialing a dead service after repeated failures. [`Client::connect`] uses
-//! the defaults; [`Client::connect_with`] takes an explicit config.
+//! per-exchange timeouts, TCP keepalive, idle pool expiry and a circuit breaker
+//! that stops dialing a dead service after repeated failures. A reused socket
+//! gets one fresh connection and replay only if it disconnects before any
+//! response byte. Fresh sockets, partial responses and timeouts are not retried.
+//! [`Client::connect`] uses the defaults; [`Client::connect_with`] takes an
+//! explicit config.
 
 mod conn;
 mod resilience;
@@ -31,6 +34,7 @@ use resilience::Health;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailMode {
@@ -88,13 +92,15 @@ struct ClientInner {
 }
 
 impl ClientInner {
-    /// Check out a pooled connection, or open a new one. A failed op never
-    /// returns its connection to the pool, so dead connections are dropped and
-    /// the next checkout reconnects (one attempt per op; no retry storm).
+    /// Check out an unexpired pooled connection, or open a fresh one.
+    /// Failed operations drop their connection instead of returning it.
     fn take(&self) -> io::Result<Connection> {
         self.health.allow()?;
-        if let Some(c) = self.pool.lock().pop() {
-            return Ok(c);
+        while let Some(mut conn) = self.pool.lock().pop() {
+            if conn.last_used.elapsed() < self.health.config.max_idle {
+                conn.reused = true;
+                return Ok(conn);
+            }
         }
         let conn = Connection::connect_with(&self.addr, Arc::clone(&self.health));
         if conn.is_err() {
@@ -103,9 +109,10 @@ impl ClientInner {
         conn
     }
 
-    fn give(&self, conn: Connection) {
+    fn give(&self, mut conn: Connection) {
         let mut pool = self.pool.lock();
         if pool.len() < self.pool_size {
+            conn.last_used = Instant::now();
             pool.push(conn);
         }
     }
@@ -123,7 +130,7 @@ impl Client {
         Self::connect_with(addr, config, ResilienceConfig::default())
     }
 
-    /// Like [`Client::connect`] with explicit timeouts, keepalive and breaker.
+    /// Like [`Client::connect`] with explicit timeouts, keepalive, idle expiry and breaker.
     pub fn connect_with(
         addr: impl Into<String>,
         config: ClientConfig,

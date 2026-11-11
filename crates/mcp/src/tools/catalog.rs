@@ -450,7 +450,7 @@ pub fn build(config: &Config) -> Vec<ToolDef> {
             object(
                 vec![(
                     "session_id",
-                    json!({"type": "string", "format": "uuid", "description": "Session id."}),
+                    json!({"type": "string", "description": "Opaque session handle returned by create_session or list_sessions. Not a proxy credential."}),
                 )],
                 &["session_id"],
             ),
@@ -799,7 +799,7 @@ fn mutations() -> Vec<ToolDef> {
     use Capability::{
         Egress, Inventory, OrgBlocks, OrgKeys, OrgLimits, Policy, PoolSessions, Sessions, Signals,
     };
-    let session_id = || json!({"type": "string", "format": "uuid", "description": "Session id."});
+    let session_id = || json!({"type": "string", "description": "Opaque session handle returned by create_session or list_sessions. Not a proxy credential."});
     let mut egress_proxy_props = vec![
         ("org", org_arg()),
         (

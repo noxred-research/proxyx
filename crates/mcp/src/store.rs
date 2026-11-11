@@ -1,9 +1,9 @@
 //! The on-disk state of the MCP server: pending changes and their approvals, secrets written
 //! for out-of-band use, and the registry of sessions it created.
 //!
-//! Everything lives under one state directory (`0700`), every file is `0600`. Approval and
-//! consumption are file creations with `create_new`, so they are atomic and single-use even
-//! when the approving CLI and the server are different processes.
+//! Everything lives under one state directory (`0700`), every file is `0600`. Decisions and
+//! consumption lock the change file before checking its state, then create their marker with
+//! `create_new`, so transitions are atomic even across the approving CLI and server processes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
@@ -21,7 +21,7 @@ pub struct Change {
     pub id: String,
     /// The mutating tool the change calls.
     pub action: String,
-    /// The tool's normalized arguments. Never holds a secret: credentials are references.
+    /// Normalized arguments. Session UUIDs stay private; other credentials are references.
     pub arguments: Value,
     /// SHA-256 of the action and arguments. An approval is bound to it.
     pub digest: String,
@@ -182,6 +182,19 @@ impl Store {
         serde_json::from_str(&text).ok()
     }
 
+    fn lock_change(&self, id: &str) -> anyhow::Result<File> {
+        if !is_change_id(id) {
+            bail!("{id:?} is not a change id (chg_ and 20 hex characters)");
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path(id, "json"))
+            .with_context(|| format!("cannot lock change {id}"))?;
+        file.lock()?;
+        Ok(file)
+    }
+
     /// The status of `change` now.
     pub fn status(&self, change: &Change) -> Status {
         if self.path(&change.id, "applied").exists() {
@@ -196,6 +209,9 @@ impl Store {
                 at: decision.at,
             };
         }
+        if now_secs() >= change.expires_at {
+            return Status::Expired;
+        }
         if let Some(decision) = self.decision(&change.id, "approved")
             && decision.digest == change.digest
         {
@@ -203,9 +219,6 @@ impl Store {
                 by: decision.by,
                 at: decision.at,
             };
-        }
-        if now_secs() >= change.expires_at {
-            return Status::Expired;
         }
         Status::Proposed
     }
@@ -217,6 +230,7 @@ impl Store {
         by: &str,
         note: Option<&str>,
     ) -> anyhow::Result<Change> {
+        let _lock = self.lock_change(id)?;
         let change = self.load(id)?;
         match self.status(&change) {
             Status::Applied { .. } => bail!("change {id} was already applied"),
@@ -251,20 +265,27 @@ impl Store {
     /// Reject a change as `by`.
     ///
     /// # Errors
-    /// When the change is unknown, expired, applied, rejected or already approved.
+    /// When the change is unknown, expired, applied or already rejected.
     pub fn reject(&self, id: &str, by: &str, note: Option<&str>) -> anyhow::Result<Change> {
-        let change = self.load(id)?;
-        if matches!(self.status(&change), Status::Approved { .. }) {
-            bail!("change {id} is approved; it cannot be rejected, let it expire");
-        }
         self.decide(id, "rejected", by, note)
     }
 
-    /// Mark a change applied. Atomic: only one caller ever succeeds.
+    /// Mark an unexpired, unrejected change applied. Atomic: only one caller ever succeeds.
     ///
     /// # Errors
-    /// When the change was already applied.
+    /// When the change is unknown, edited, expired, rejected or already applied.
     pub fn consume(&self, change: &Change) -> anyhow::Result<()> {
+        let _lock = self.lock_change(&change.id)?;
+        let stored = self.load(&change.id)?;
+        if stored.digest != change.digest {
+            bail!("change {} was edited after it was loaded", change.id);
+        }
+        match self.status(&stored) {
+            Status::Applied { .. } => bail!("change {} was already applied", change.id),
+            Status::Rejected { .. } => bail!("change {} was already rejected", change.id),
+            Status::Expired => bail!("change {} expired; propose it again", change.id),
+            Status::Proposed | Status::Approved { .. } => {}
+        }
         let decision = Decision {
             by: "apply".to_owned(),
             at: now_secs(),
@@ -418,7 +439,6 @@ mod tests {
             .expect("approve");
         assert!(matches!(store.status(&change), Status::Approved { ref by, .. } if by == "alice"));
         assert!(store.approve(&change.id, "bob", None).is_err());
-        assert!(store.reject(&change.id, "bob", None).is_err());
         store.consume(&change).expect("first apply");
         assert!(store.consume(&change).is_err(), "a change applies once");
         assert!(matches!(store.status(&change), Status::Applied { .. }));
@@ -451,6 +471,108 @@ mod tests {
         store.reject(&other.id, "alice", None).expect("reject");
         assert!(matches!(store.status(&other), Status::Rejected { .. }));
         assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn approved_changes_expire_at_the_deadline() {
+        let store = store();
+        let mut change = change(&store, 3600);
+        store.approve(&change.id, "alice", None).expect("approve");
+        assert!(matches!(store.status(&change), Status::Approved { .. }));
+
+        change.expires_at = now_secs();
+        fs::write(
+            store.path(&change.id, "json"),
+            serde_json::to_vec(&change).expect("serialize expired change"),
+        )
+        .expect("expire change");
+
+        assert_eq!(store.status(&change), Status::Expired);
+        assert_eq!(store.list()[0].1, Status::Expired);
+        assert!(store.approve(&change.id, "bob", None).is_err());
+    }
+
+    #[test]
+    fn consumption_rechecks_expiry_after_approval() {
+        let store = store();
+        let change = change(&store, 3600);
+        store.approve(&change.id, "alice", None).expect("approve");
+        assert!(matches!(store.status(&change), Status::Approved { .. }));
+
+        let mut expired = change.clone();
+        expired.expires_at = now_secs();
+        fs::write(
+            store.path(&change.id, "json"),
+            serde_json::to_vec(&expired).expect("serialize expired change"),
+        )
+        .expect("expire change");
+
+        let error = store.consume(&change).expect_err("expiry prevents apply");
+        assert!(error.to_string().contains("expired"));
+        assert!(!store.path(&change.id, "applied").exists());
+        assert_eq!(store.status(&expired), Status::Expired);
+    }
+
+    #[test]
+    fn approved_changes_can_be_rejected_before_consumption() {
+        let store = store();
+        let mut change = change(&store, 3600);
+        store.approve(&change.id, "alice", None).expect("approve");
+        store
+            .reject(&change.id, "bob", Some("cancel approval"))
+            .expect("reject approved change");
+        let rejected = store.status(&change);
+        assert!(matches!(&rejected, Status::Rejected { by, .. } if by == "bob"));
+        assert!(store.consume(&change).is_err());
+        assert!(!store.path(&change.id, "applied").exists());
+        assert!(store.approve(&change.id, "alice", None).is_err());
+        assert!(store.reject(&change.id, "alice", None).is_err());
+
+        change.expires_at = now_secs() - 1;
+        assert_eq!(store.status(&change), rejected);
+    }
+
+    #[test]
+    fn applied_changes_stay_applied_after_expiry() {
+        let store = store();
+        let mut change = change(&store, 3600);
+        store.approve(&change.id, "alice", None).expect("approve");
+        store.consume(&change).expect("apply");
+        let applied = store.status(&change);
+        assert!(matches!(applied, Status::Applied { .. }));
+
+        change.expires_at = now_secs() - 1;
+        assert_eq!(store.status(&change), applied);
+        assert!(store.approve(&change.id, "bob", None).is_err());
+        assert!(store.reject(&change.id, "bob", None).is_err());
+        assert!(store.consume(&change).is_err());
+    }
+
+    #[test]
+    fn concurrent_consumption_remains_single_use() {
+        let store = store();
+        let change = change(&store, 3600);
+        store.approve(&change.id, "alice", None).expect("approve");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let store = &store;
+                    let change = &change;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.consume(change)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("consumer"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(matches!(store.status(&change), Status::Applied { .. }));
     }
 
     #[test]
