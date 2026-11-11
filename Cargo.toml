@@ -165,7 +165,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 parking_lot = "0.12"
 time = { version = "0.3", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["now"] }
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1"
 brotli = "7"
 regex = "1"
