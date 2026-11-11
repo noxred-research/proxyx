@@ -139,7 +139,7 @@ sqlx = { version = "0.9", features = [
     "macros",
     "migrate",
 ] }
-clickhouse = { version = "0.14", features = ["time", "uuid"] }
+clickhouse = { version = "0.15", features = ["time", "uuid"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 lapin = { version = "4", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs", "rustls-native-certs"] }
 futures-util = "0.3"
