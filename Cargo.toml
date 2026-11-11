@@ -116,7 +116,7 @@ boring = "5"
 tokio-boring = "5"
 tokio-rustls = "0.26"
 rcgen = { version = "0.13", features = ["x509-parser"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 rustls-pki-types = { version = "1.12", features = ["std"] }
 rustls-native-certs = "0.8"
 hmac = "0.13"
