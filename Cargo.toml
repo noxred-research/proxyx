@@ -167,7 +167,7 @@ time = { version = "0.3", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["now"] }
 base64 = "0.23"
 flate2 = "1"
-brotli = "7"
+brotli = "9"
 regex = "1"
 regex-syntax = "0.8"
 ipnet = "2"
