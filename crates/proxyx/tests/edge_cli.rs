@@ -223,3 +223,117 @@ fn serves_reloads_on_sighup_and_stops_on_sigterm() {
     assert!(status.success(), "{status:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+struct EdgeProcess(Child);
+
+impl Drop for EdgeProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn ops_body(port: u16, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn sticky_egress_affinity_survives_real_sighup_with_reordered_pool() {
+    let dir = workdir("affinity");
+    let path = dir.join("edge.toml");
+    let listen = free_port();
+    let ops = loop {
+        let port = free_port();
+        if port != listen {
+            break port;
+        }
+    };
+    let origin_port = origin();
+    let cfg = |addresses: &str| {
+        format!(
+            r#"
+[dns]
+nameservers = ["127.0.0.1"]
+[dns.hosts]
+"origin.test" = ["127.0.0.1"]
+[server]
+ops_listen = "127.0.0.1:{ops}"
+default_pool = "own"
+[selector]
+strategy = "sticky"
+[stick]
+capacity = 32
+ttl = "10m"
+[auth]
+login_options = true
+[[listener]]
+name = "main"
+listen = "127.0.0.1:{listen}"
+[[user]]
+name = "alice"
+password = "pw"
+[[pool]]
+name = "own"
+addresses = {addresses}
+strategy = "round_robin"
+[[rule]]
+action = "allow"
+allow_internal = true
+"#
+        )
+    };
+    std::fs::write(&path, cfg(r#"["127.0.0.2", "127.0.0.3"]"#)).unwrap();
+    let mut process = EdgeProcess(
+        Command::new(BIN)
+            .args(["edge", "--config"])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_port(listen);
+    wait_for_port(ops);
+    let target = format!("origin.test:{origin_port}");
+    let login = "alice-sid-signal";
+    for _ in 0..3 {
+        assert_eq!(http(listen, &target, login), (200, "127.0.0.2".to_owned()));
+    }
+
+    // A fresh table would pick the new first address; preserving only the index is also wrong.
+    std::fs::write(&path, cfg(r#"["127.0.0.3", "127.0.0.2"]"#)).unwrap();
+    signal(&process.0, "HUP");
+    let end = Instant::now() + Duration::from_secs(10);
+    while !ops_body(ops, "/metrics")
+        .contains("proxyx_edge_config_reloads_total{result=\"ok\",service=\"proxyx-edge\"} 1")
+    {
+        assert!(Instant::now() < end, "SIGHUP did not complete");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    for _ in 0..3 {
+        assert_eq!(http(listen, &target, login), (200, "127.0.0.2".to_owned()));
+    }
+
+    signal(&process.0, "TERM");
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            assert!(status.success(), "{status:?}");
+            break;
+        }
+        assert!(Instant::now() < end, "edge did not stop");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

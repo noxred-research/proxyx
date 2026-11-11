@@ -48,6 +48,17 @@ A few rules apply to all components:
 
 The gateway and the warmer read the same settings. The warmer ignores the listener keys it does not serve. Provider adapters, policies and the static inventory are not settings: they are versioned data under `data_dir` (see [providers](providers.md) and [policies](policies.md)).
 
+Data keys that shape pool behaviour (full reference in those documents):
+
+| File | Key | Default | Meaning |
+|---|---|---|---|
+| `policies/*.toml`, `[[policy]]` | `dial.race` (or `[policy.dial] race`) | `1` | Dial up to this many candidate units at once (1 to 16) and keep the first that connects; the other leases are released and the route-class breaker is charged once. |
+| `policies/*.toml`, `[[policy]]` | `max_sticky_entries_per_org` | unset | Most sticky keys one org may hold; beyond it the least recently used key is evicted. A more specific policy can only lower it. |
+| `adapters/*.toml`, `[[adapter]]` | `scheme` | `http` | `http`, `socks5`, `https` (TLS to the proxy endpoint with system roots and host name verification, then `CONNECT`) or `local` (the machine's own address). |
+| `adapters/*.toml`, `[[adapter]]` | `session_mode` | `sticky` | `sticky`: the provider keeps an exit per session id. `per_request`: the provider rotates on every request, so the units are not used for the exit-IP quorum or keepalive. |
+
+Clients choose per lease with the username options `ttl` (session lifetime, bounded by the adapter's limits) and `strict` (`true` asks the provider for a strict sticky session); see [gateway](gateway.md).
+
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `database_url` | `PROXYX_POOL_DATABASE_URL` | `postgres://proxyx@localhost/proxyx` | The relational database, the source of truth: org keys, policies, inventory, scores, blocks, audit. The scheme selects the backend: `postgres://` (default), `mariadb://` or `mysql://` (MariaDB 10.6 or newer), `sqlite://PATH?mode=rwc` (one host only). See [databases.md](databases.md). |
@@ -377,7 +388,7 @@ The fail policy still decides what a degraded `consume` means; the breaker only 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ops_listen` | none | `/metrics`, `/healthz` (live) and `/readyz` (listeners bound, config loaded, an egress path is healthy) address; absent: no ops listener. Needs a restart to change. |
+| `ops_listen` | none | `/metrics`, JSON/CSV `/stats`, `/healthz` (live) and `/readyz` (listeners bound, config loaded, a healthy egress path); absent: no ops listener. Needs a restart to change. Protect this management address. |
 | `max_connections` | `10000` | Client connections served at once over all listeners; more are closed at accept. |
 | `max_connections_per_src` | `0` | Connections of one source address (the PROXY protocol address when there is one); `0` is unlimited. |
 | `default_pool` | none | Pool used when no egress rule, login option, user or listener names one; absent: the operating system picks the source address. |
@@ -466,6 +477,7 @@ Circuit breakers, one per parent and one per explicitly listed egress address; s
 | `parent_keepalive` | `true` | Reuse connections to HTTP parents for bodyless requests. |
 | `parent_idle_timeout` | `30s` | How long an idle parent connection is kept. |
 | `parent_max_idle` | `64` | Idle parent connections kept in all (4 per key). |
+| `header_rule` | `[]` | `[[http.header_rule]]` entries with `rule` naming one unique request-stage allow rule and request/response `headers_remove`/`headers_set` fields using the full names above. Scoped hooks run after global edits and reject framing, routing, hop-by-hop and malformed edits. |
 
 ### `[auth]`
 
@@ -487,8 +499,9 @@ Circuit breakers, one per parent and one per explicitly listed egress address; s
 | `pool` | none | Default egress pool of the listener. |
 | `proxy_protocol` | `off` | `off`, `optional`, `required`. |
 | `trusted_proxies` | `[]` | Peers whose PROXY header is believed; required when `proxy_protocol` is not `off`. |
-| `udp` | `false` | Serve SOCKS5 UDP ASSOCIATE. |
+| `udp` | `false` | Serve SOCKS5 UDP ASSOCIATE. Listener TLS protects only the TCP control leg; UDP datagrams remain unencrypted. |
 | `max_connections` | `0` | Connections of this listener; `0` is unlimited. |
+| `tls` | none | `{ cert = "/path/cert.pem", key = "/path/key.pem" }`; rustls listener encryption for HTTP proxy and SOCKS5. Trusted PROXY headers precede TLS. ALPN h2 serves ordinary HTTP/2 CONNECT; HTTP/3 is not supported. |
 
 ### `[[pool]]`
 
@@ -500,7 +513,12 @@ Circuit breakers, one per parent and one per explicitly listed egress address; s
 | `ipv4`, `ipv6` | `true` | Families taken from `interface`. |
 | `exclude` | `[]` | Networks left out of the interface's addresses. |
 | `prefixes` | `[]` | Routed networks to draw addresses from, one per IP family, not mixed with `addresses` of that family. |
-| `strategy` | `round_robin` | `first`, `round_robin`, `random`, `least_connections`, `sticky`. |
+| `strategy` | `round_robin` | `first`, `fifo`, `round_robin`, `random`, `least_connections`, `sticky`, `hash`, `userhash`, `sourcehash`, `carp`, `race`, `latency`. |
+| `hash_key` | `client_ip` | Explicit hash attribute: `client_ip`, `target_host`, `user`, `session_id`; missing identity falls back to client IP. |
+| `backup_addresses` | `[]` | Local addresses used only when no primary of the destination family is available. |
+| `max_fails`, `fail_timeout` | inherit `[breaker.egress]` | Override the existing consecutive-failure threshold and breaker open interval for this pool. |
+| `latency_tolerance` | `50ms` | Retain the current address while its measured latency is within this of the fastest. |
+| `race_width` | `2` | Maximum concurrently dialed source-address candidates; must be positive. Prefix races have one candidate; prefix latency selection is rejected. |
 
 ### `[[user]]`
 
@@ -522,7 +540,7 @@ All four have an optional `name` and a `when = { ... }` table with the condition
 
 | Table | Other keys |
 |---|---|
-| `[[rule]]` | `action` (`allow` or `deny`, required), `allow_internal` (default `false`, allow rules only). First match wins; no match denies. |
+| `[[rule]]` | `action` (`allow` or `deny`, required), `allow_internal` (default `false`, allow rules only), `stage` (`request` default, `pre_negotiation`, `post_auth`, `bind`, `udp`). Each configured stage is first-match/default-deny. Early stages reject conditions unavailable before destination negotiation. |
 | `[[egress]]` | exactly one of `pool` and `address`. First match wins. |
 | `[[route]]` | `route` (`direct`, `parent`, `parent_or_direct`, required), `parents` (names). First match wins. |
 | `[[limit]]` | `scope` (`user` default, `src`, `rule`), `bandwidth_down`, `bandwidth_up` (bytes per second or `"10Mbit/s"`, `"512KiB"`, `"2MB"`), `max_connections`, `request_rate` (`"100/min"`; `/s`, `/m`, `/h`). At least one limit key; every matching table applies. |
@@ -532,13 +550,68 @@ All four have an optional `name` and a `when = { ... }` table with the condition
 | Key | Default | Meaning |
 |---|---|---|
 | `name` | required | Slug (`[a-z0-9_-]`, at most 48). |
-| `type` | required | `http` or `socks5`. |
+| `type` | required | `http`, `https`, `socks4` or `socks5`; HTTPS verifies the proxy certificate and hostname. Ordered chains may combine protocols. |
 | `address` | required | `host:port` or `[v6]:port`. |
 | `username`, `password` | none | Set together. |
 | `weight` | `1` | Share inside the priority tier. |
 | `priority` | `0` | Lower tiers first. |
 | `pool` | none | Pool for the connection to the parent (default: the request's pool). |
 | `send_proxy_protocol` | `off` | `v1` or `v2` header with the client address. |
+| `backup` | `false` | Select only when every primary is unavailable. |
+| `default` | `false` | Last-resort fallback parent. |
+| `max_fails`, `fail_timeout` | inherit `[breaker.parent]` | Node overrides for the existing breaker, not separate failure tracking. |
+| `probe` | legacy `[health]` behavior | Tagged TCP, HTTP or command probe; see below. |
+
+### `[selector]`, `[[chain]]` and `[stick]`
+
+Parent groups use `[selector]` by default. `[[chain]]` has `name`, ordered `hops` and optional
+`probe`. Each hop names `parents = ["a", "b"]` and may override `selector`. A `[[route]]`
+may name `chain` instead of a flat parent set. Chains permit at most 64 concurrent race paths;
+configuration exceeding this cap is rejected. Only the first hop controls the local egress pool.
+
+| Selector key | Default | Meaning |
+|---|---|---|
+| `strategy` | `random` | Same vocabulary as pools; parent CARP uses weights and stable node names. |
+| `hash_key` | `client_ip` | `client_ip`, `target_host`, `user`, `session_id`. |
+| `race_width` | `2` | Maximum simultaneously dialed parent candidates; cancel losers on first success. |
+| `tolerance_ms` | `50` | Latency advantage required before switching from the current healthy node. |
+| `idle_timeout` | `5m` | Pause latency probing after the group receives no traffic for this interval. |
+| `interrupt_on_switch` | `false` | Close existing selected tunnels after latency choice changes. |
+| `connect_retries` | `2` | Next-path retries after the initial connection attempt. |
+| `forward_timeout` | `30s` | Overall forwarding connection deadline, also bounded by request connect timeouts. |
+
+Probe forms:
+
+```toml
+probe = { type = "tcp", target = "probe.example.org:80" }
+probe = { type = "http", url = "http://probe.example.org/health", status = 200, body_contains = "ok", max_body_bytes = 65536 }
+probe = { type = "command", command = ["/usr/local/libexec/check-proxy", "--node", "a"] }
+```
+
+These are alternative values, not repeated keys. HTTP probes support `http://` and verified
+`https://` through the chosen route and bound the body read. Command probes execute an argument array, not a shell;
+only trusted operators may edit the configuration. `[health].interval` schedules probes and
+`[health].timeout` bounds each probe, including commands and full-chain traversals.
+
+| Affinity key | Default | Meaning |
+|---|---|---|
+| `stick.capacity` | `65536` | Maximum local entries and maximum claims in a shared Redis namespace, enforced atomically with expiry eviction. Replicas must agree on this value. |
+| `stick.ttl` | `10m` | Fixed claim lifetime, not extended on every request. |
+| `stick.redis.url` | none | Optional Redis/Valkey authoritative affinity store; secret. |
+| `stick.redis.key_prefix` | `proxyx:edge:stick` | Shared namespace; replicas must use identical node names and key semantics. |
+| `stick.redis.ttl` | inherit `stick.ttl` | Shared claim expiry. |
+| `stick.redis.timeout` | `5s` | Bound for Redis connection and claim operations. |
+
+Unchanged stick configuration preserves the table through SIGHUP. Redis claims are atomic:
+replicas consult the authoritative mapping, replace invalid paths atomically, and fail closed
+when the shared store cannot answer rather than inventing conflicting affinity. Health may
+invalidate a claim before its TTL; expiry or local capacity eviction may remap a key.
+Exact egress-IP claims cover explicit/discovered addresses only. Routed prefixes use their
+own deterministic `strategy = "sticky"`; generated prefix addresses are not replicated entries.
+Redis uses `key_prefix:claim:<digest>` keys and `key_prefix:expiry` for the bounded expiry
+index. Cleanup removes at most 64 expired and 64 capacity victims per claim. A large capacity
+reduction can temporarily fail closed while subsequent bounded cleanup calls converge. Existing
+claims may exceed the new lower limit during cleanup; new claims are refused until capacity permits.
 
 ## Session proxy network options
 

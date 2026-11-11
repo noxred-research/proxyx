@@ -9,6 +9,7 @@
 //! ([`Hot::unit_drop`]), the `due` set ([`Hot::due_done`]) and the org-block
 //! hash (its fields carry their own expiry; the snapshot rebuild restores it).
 
+mod affinity;
 mod breaker;
 mod create;
 mod fair_use;
@@ -32,6 +33,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Result, StoreError};
 
+pub use affinity::{AffinityRecord, AffinityStats};
 pub use breaker::Admit;
 pub use create::{RESERVATION_TTL, Reservation};
 pub use fair_use::FairUse;
@@ -154,6 +156,7 @@ macro_rules! scripts {
 }
 
 scripts!(
+    affinity,
     lease,
     release,
     tunnel_close,

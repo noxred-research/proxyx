@@ -4,6 +4,9 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 use anyhow::{Context as _, bail};
 use ipnet::IpNet;
@@ -16,13 +19,15 @@ use crate::egress::{Pool, check_usable};
 use crate::headers::HeaderPolicy;
 use crate::limits::LimitSet;
 use crate::metrics::Metrics;
-use crate::parent::Parents;
+use crate::parent::{Parents, Selector};
+use crate::stick::StickMap;
 
 /// A listener with its parsed extras.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ListenerRt {
     pub cfg: ListenerConfig,
     pub trusted: Vec<IpNet>,
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 struct EgressRule {
@@ -34,6 +39,7 @@ struct RouteRule {
     m: Match,
     route: Route,
     parents: Vec<usize>,
+    chain: Option<usize>,
 }
 
 /// Why an egress choice could not be made.
@@ -49,13 +55,30 @@ pub struct EgressPick {
     pub index: Option<usize>,
 }
 
+pub struct Hop {
+    pub parents: Vec<usize>,
+    pub selector: Selector,
+}
+
+pub struct Chain {
+    pub name: String,
+    pub hops: Vec<Hop>,
+    pub probe: Option<crate::config::ProbeConfig>,
+    pub health: crate::breaker::HealthTracker,
+}
+
 pub struct State {
     pub cfg: Config,
+    /// Names the runtime snapshot so idle sockets never cross a reload boundary.
+    pub(crate) generation: u64,
     pub users: Users,
     pub rules: Rules,
     pub limits: LimitSet,
     pub pools: HashMap<String, Arc<Pool>>,
     pub parents: Parents,
+    pub selector: Selector,
+    pub chains: Vec<Chain>,
+    pub stick: Arc<StickMap>,
     pub listeners: HashMap<String, ListenerRt>,
     pub headers: HeaderPolicy,
     pub resolver: Arc<Resolver>,
@@ -103,6 +126,16 @@ fn check_health(h: &crate::config::HealthConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn check_selector(selector: &crate::config::SelectorConfig) -> anyhow::Result<()> {
+    if selector.race_width == 0 || selector.race_width > 64 {
+        bail!("selector.race_width must be between 1 and 64");
+    }
+    if selector.connect_retries > 64 || selector.forward_timeout.is_zero() {
+        bail!("selector requires connect_retries <= 64 and positive forward_timeout");
+    }
+    Ok(())
+}
+
 fn is_option_value(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -128,6 +161,11 @@ impl State {
         crate::sockopt::check(&cfg.tcp.client, "tcp.client").map_err(anyhow::Error::msg)?;
         crate::sockopt::check(&cfg.tcp.upstream, "tcp.upstream").map_err(anyhow::Error::msg)?;
         check_health(&cfg.health)?;
+        check_selector(&cfg.selector)?;
+        let stick = match prev {
+            Some(p) if p.cfg.stick == cfg.stick => Arc::clone(&p.stick),
+            _ => Arc::new(StickMap::new(&cfg.stick).map_err(anyhow::Error::msg)?),
+        };
         let t = &cfg.timeouts;
         for (name, d) in [
             ("handshake", t.handshake),
@@ -257,6 +295,11 @@ impl State {
                 ListenerRt {
                     cfg: l.clone(),
                     trusted,
+                    tls: l
+                        .tls
+                        .as_ref()
+                        .map(|tls| crate::transport::tls_acceptor(tls, l.protocol))
+                        .transpose()?,
                 },
             );
         }
@@ -267,6 +310,67 @@ impl State {
         for p in &cfg.parents {
             if let Some(pool) = &p.pool {
                 pool_exists(&format!("parent {}", p.name), pool)?;
+            }
+        }
+        let mut chains = Vec::with_capacity(cfg.chains.len());
+        for chain in &cfg.chains {
+            if chain.name.is_empty() || chains.iter().any(|c: &Chain| c.name == chain.name) {
+                bail!("chain name {:?} is empty or defined twice", chain.name);
+            }
+            if chain.hops.is_empty() {
+                bail!("chain {} has no hops", chain.name);
+            }
+            let mut hops = Vec::with_capacity(chain.hops.len());
+            let mut race_paths = 1usize;
+            for hop in &chain.hops {
+                if hop.parents.is_empty() {
+                    bail!("chain {} has an empty parent group", chain.name);
+                }
+                let indexes = hop
+                    .parents
+                    .iter()
+                    .map(|name| {
+                        parents.index_of(name).ok_or_else(|| {
+                            anyhow::anyhow!("chain {}: parent {name:?} is not defined", chain.name)
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let selector = hop.selector.clone().unwrap_or_else(|| cfg.selector.clone());
+                check_selector(&selector)?;
+                if selector.strategy == Strategy::Race {
+                    race_paths = race_paths
+                        .checked_mul(selector.race_width.min(indexes.len()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("chain {} race width overflows", chain.name)
+                        })?;
+                    if race_paths > 64 {
+                        bail!(
+                            "chain {} races more than 64 complete paths; reduce hop race_width",
+                            chain.name
+                        );
+                    }
+                }
+                hops.push(Hop {
+                    parents: indexes,
+                    selector: Selector::new(selector),
+                });
+            }
+            if let Some(probe) = &chain.probe {
+                crate::connect::check_probe(probe)?;
+            }
+            chains.push(Chain {
+                name: chain.name.clone(),
+                hops,
+                probe: chain.probe.clone(),
+                health: crate::breaker::HealthTracker::new(
+                    cfg.health.unhealthy_threshold,
+                    cfg.health.healthy_threshold,
+                ),
+            });
+        }
+        for parent in &cfg.parents {
+            if let Some(probe) = &parent.probe {
+                crate::connect::check_probe(probe)?;
             }
         }
         if cfg.server.default_route != Route::Direct && parents.is_empty() {
@@ -324,6 +428,19 @@ impl State {
                         .ok_or_else(|| anyhow::anyhow!("{what}: parent {n:?} is not defined"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
+            let chain = r
+                .chain
+                .as_ref()
+                .map(|name| {
+                    chains
+                        .iter()
+                        .position(|c| &c.name == name)
+                        .ok_or_else(|| anyhow::anyhow!("{what}: chain {name:?} is not defined"))
+                })
+                .transpose()?;
+            if chain.is_some() && (!idx.is_empty() || r.route == Route::Direct) {
+                bail!("{what}: chain requires parent routing and cannot be combined with parents");
+            }
             if r.route == Route::Direct && !idx.is_empty() {
                 bail!("{what}: parents go with route = \"parent\" or \"parent_or_direct\"");
             }
@@ -332,9 +449,11 @@ impl State {
                     .map_err(|err| anyhow::anyhow!("{what}: {err}"))?,
                 route: r.route,
                 parents: idx,
+                chain,
             });
         }
 
+        crate::headers::validate_rules(&cfg.http, &cfg.rules)?;
         let headers = HeaderPolicy::compile(&cfg.http)?;
         let resolver = match prev {
             Some(p) if p.cfg.dns == cfg.dns => Arc::clone(&p.resolver),
@@ -346,16 +465,24 @@ impl State {
             || route_rules.iter().any(|r| r.m.uses_dst());
 
         Ok(Self {
-            cfg,
+            generation: NEXT_GENERATION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| anyhow::anyhow!("configuration generation exhausted"))?,
             users,
             rules,
             limits,
             pools,
             parents,
+            selector: Selector::new(cfg.selector.clone()),
+            chains,
+            stick,
             listeners,
             headers,
             resolver,
             utc_offset_secs,
+            cfg,
             uses_dst,
             egress_rules,
             route_rules,
@@ -441,13 +568,17 @@ impl State {
 
     /// The route of a request and the parents it may use (indexes into
     /// [`Parents`]; empty means every parent).
-    pub fn route_for(&self, req: &Req<'_>) -> (Route, &[usize]) {
-        self.route_rules
-            .iter()
-            .find(|r| r.m.matches(req))
-            .map_or((self.cfg.server.default_route, &[][..]), |r| {
-                (r.route, r.parents.as_slice())
-            })
+    pub fn route_for(&self, req: &Req<'_>) -> (Route, &[usize], Option<&Chain>) {
+        self.route_rules.iter().find(|r| r.m.matches(req)).map_or(
+            (self.cfg.server.default_route, &[][..], None),
+            |r| {
+                (
+                    r.route,
+                    r.parents.as_slice(),
+                    r.chain.and_then(|i| self.chains.get(i)),
+                )
+            },
+        )
     }
 }
 

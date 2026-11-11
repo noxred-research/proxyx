@@ -1,4 +1,4 @@
-# Oxylabs Residential. Grammar (read 2026-10-15):
+# Oxylabs Residential. Grammar verified 2026-11-11; conservative 30-minute cap:
 #   customer-{user}-cc-{CC}[-city-{city}]-sessid-{id}-sesstime-{min}
 # `sessid_oneip` replaces `sessid` for a strict session (502 instead of a new IP).
 # https://developers.oxylabs.io/products/proxies/residential-proxies/session-control
@@ -17,8 +17,9 @@ pass_file = "oxylabs_res_pass"
 user = "customer-{base_user}{opts}"
 pass = "{base_pass}"
 allowed_ports = [80, 443]
-# 10 minutes by default, 1440 at most, 60 s idle.
-max_session_minutes = 1440
+# Explicitly cap local/provider sessions at 30 minutes. The provider's current
+# plan-specific maximum can be higher; this example intentionally stays shorter.
+max_session_minutes = 30
 echo_url = "https://ip.oxylabs.io"
 
 [[adapter.option]]
@@ -47,4 +48,4 @@ name = "ttl"
 to = "user"
 frag = "-sesstime-{v}"
 unit = "min"
-max = 1440
+max = 30

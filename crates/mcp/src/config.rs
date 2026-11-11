@@ -38,10 +38,12 @@ pub enum Capability {
     Policy,
     /// Replace a provider's static inventory.
     Inventory,
+    /// Rotate sticky pool sessions of an org.
+    PoolSessions,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 8] = [
+    pub const ALL: [Capability; 9] = [
         Capability::Sessions,
         Capability::OrgKeys,
         Capability::OrgLimits,
@@ -50,6 +52,7 @@ impl Capability {
         Capability::Signals,
         Capability::Policy,
         Capability::Inventory,
+        Capability::PoolSessions,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -62,6 +65,7 @@ impl Capability {
             Capability::Signals => "signals",
             Capability::Policy => "policy",
             Capability::Inventory => "inventory",
+            Capability::PoolSessions => "pool_sessions",
         }
     }
 }

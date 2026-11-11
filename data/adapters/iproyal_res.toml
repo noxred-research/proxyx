@@ -1,5 +1,5 @@
-# IPRoyal Residential: the options go in the PASSWORD. Grammar (read 2026-10-15):
-#   {pass}_country-{cc}_session-{id}_lifetime-{N}m[_killswitch-1]
+# IPRoyal Residential: the options go in the PASSWORD. Verified 2026-11-11:
+#   {pass}_country-{cc}_session-{id}_lifetime-{N}s[_killswitch-1]
 # The session id is exactly 8 alphanumeric characters. Lifetime: 1 second to 7 days, one
 # unit only. `_killswitch-1` answers HTTP 410 instead of changing the IP.
 # https://docs.iproyal.com/proxies/residential/proxy/rotation
@@ -33,9 +33,9 @@ len = 8
 [[adapter.option]]
 name = "ttl"
 to = "pass"
-frag = "_lifetime-{v}m"
-unit = "min"
-max = 10080
+frag = "_lifetime-{v}s"
+unit = "sec"
+max = 604800
 
 [[adapter.option]]
 name = "strict"

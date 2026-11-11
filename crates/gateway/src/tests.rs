@@ -128,10 +128,62 @@ where
     addr
 }
 
-/// A loopback address nothing listens on.
-async fn closed_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    listener.local_addr().expect("addr")
+/// A reserved loopback port with no listener. The bound socket prevents
+/// parallel test stubs from reusing a supposedly unreachable endpoint.
+struct ClosedEndpoint(socket2::Socket);
+
+impl ClosedEndpoint {
+    fn addr(&self) -> SocketAddr {
+        self.0
+            .local_addr()
+            .expect("bound address")
+            .as_socket()
+            .expect("TCP address")
+    }
+
+    fn port(&self) -> u16 {
+        self.addr().port()
+    }
+
+    fn listen(self) -> std::io::Result<TcpListener> {
+        self.0.listen(1024)?;
+        self.0.set_nonblocking(true)?;
+        TcpListener::from_std(self.0.into())
+    }
+}
+
+fn closed_endpoint() -> ClosedEndpoint {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("TCP socket");
+    socket
+        .bind(
+            &"127.0.0.1:0"
+                .parse::<SocketAddr>()
+                .expect("loopback")
+                .into(),
+        )
+        .expect("bind reserved endpoint");
+    ClosedEndpoint(socket)
+}
+
+#[tokio::test]
+async fn closed_endpoint_refuses_connections_and_reserves_its_port_until_revived() {
+    let endpoint = closed_endpoint();
+    let addr = endpoint.addr();
+    let error = TcpStream::connect(addr).await.expect_err("not listening");
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        TcpListener::bind(addr).await.is_err(),
+        "port remains reserved"
+    );
+    let listener = endpoint.listen().expect("revive the reserved socket");
+    let stream = TcpStream::connect(addr).await.expect("revived listener");
+    let _accepted = listener.accept().await.expect("accept");
+    drop(stream);
 }
 
 /// Answer with a complete `Connection: close` reply and end the connection.
@@ -826,6 +878,9 @@ async fn metered_bytes(h: &Harness, provider: &str) -> Result<u64, BoxErr> {
     Ok(used.bytes_today)
 }
 
+mod acquire_race;
+mod affinity;
+mod affinity_rotate;
 mod authlimit;
 mod customer;
 mod hardening;
@@ -1063,7 +1118,7 @@ async fn an_open_route_class_is_skipped_for_the_next_provider_probed_and_closed_
     let target = stub_target().await;
     let live = stub_provider(PROVIDER_PASS, target, uniq_ip()).await;
     // the dead provider: a port nothing listens on
-    let dead_addr = closed_addr().await;
+    let dead_addr = closed_endpoint();
     // Two dead IPs: one dead IP no longer opens the route class, the
     // failure of a second one does
     let (dead_ip, dead_ip2, live_ip) = (uniq_ip(), uniq_ip(), uniq_ip());
@@ -1159,12 +1214,7 @@ async fn an_open_route_class_is_skipped_for_the_next_provider_probed_and_closed_
     // after closes the route class, and the dead provider serves again.
     sleep(Duration::from_millis(450)).await;
     ready_dead().await?;
-    let revived = stub_provider_on(
-        TcpListener::bind(dead_addr).await?,
-        PROVIDER_PASS,
-        target,
-        uniq_ip(),
-    );
+    let revived = stub_provider_on(dead_addr.listen()?, PROVIDER_PASS, target, uniq_ip());
     let r = tunnel().await?;
     assert!(
         [Some(dead_ip.to_string()), Some(dead_ip2.to_string())].contains(&exit_of(&r)),
@@ -1416,7 +1466,8 @@ async fn unreachable_provider_gets_502_provider_unavailable() -> TestResult {
     let Some(env) = env() else { return Ok(()) };
     let setup = Setup::new();
     // an inventory entry that points at a closed port
-    let (h, _) = static_unit(&env, &setup, closed_addr().await, true).await?;
+    let dead = closed_endpoint();
+    let (h, _) = static_unit(&env, &setup, dead.addr(), true).await?;
 
     let r = connect_via(h.connect, "px", &setup.key).await?;
     assert_eq!(r.answer(), (502, "provider_unavailable"));
@@ -1543,8 +1594,19 @@ async fn empty_rotating_partition_creates_a_session_on_demand_and_reuses_it() ->
     let connects = provider.connects();
     assert_eq!(connects.len(), 1);
     let login = &connects[0].1;
+    let session_id = {
+        let loaded = h.loaded.borrow();
+        let provider = setup.provider.parse()?;
+        loaded
+            .adapters
+            .get(&provider)
+            .ok_or("adapter")?
+            .decode_session(&sessions[0])?
+            .session_id
+            .to_owned()
+    };
     assert!(
-        login.starts_with(&format!("{PROVIDER_USER}-cc-FR-sid-{}-t-60:", sessions[0])),
+        login.starts_with(&format!("{PROVIDER_USER}-cc-FR-sid-{session_id}-t-60:")),
         "the session id and region are in the provider credential: {login}"
     );
     assert!(

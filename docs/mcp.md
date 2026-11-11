@@ -137,7 +137,7 @@ ProxyX serves authorized security research. The MCP server is built so that an a
 | Control | What it does |
 |---|---|
 | **Read-only by default** | No `[safety]` section means no mutating tool is listed or callable. A mutation needs its capability. |
-| **Capabilities** | `sessions`, `org_keys`, `org_limits`, `egress`, `org_blocks`, `signals`, `policy`, `inventory`. `profile = "operator"` enables `sessions`, `org_blocks`, `signals`; `"admin"` enables all; `capabilities = [...]` overrides the profile. Only the operator's file changes them. |
+| **Capabilities** | `sessions`, `org_keys`, `org_limits`, `egress`, `org_blocks`, `signals`, `policy`, `inventory`, `pool_sessions`. `profile = "operator"` enables `sessions`, `org_blocks`, `signals`; `"admin"` enables all; `capabilities = [...]` overrides the profile. Only the operator's file changes them. |
 | **Tool allow and deny lists** | `allow_tools` and `deny_tools`, with a trailing `*` as prefix. |
 | **Engagement scope** | `scope.engagement` is recorded in every audit entry; `scope.expires` ends mutations at a moment; `scope.require_engagement` refuses mutations without a recorded engagement; `scope.allowed_orgs` confines tools to those orgs and refuses changes to shared resources (global policies, inventory, operator block signals). |
 | **Dry run** | Every mutating tool takes `dry_run`: it validates, computes the diff and calls nothing. `safety.force_dry_run` makes every mutation a dry run. |
@@ -176,6 +176,8 @@ A model cannot enable a capability, read a credential file, approve its own chan
 | `list_inventory`, `inventory_replacements` | R | pool | Static IP rows by provider and state; IPs awaiting replacement |
 | `list_policies` | R | pool | Stored policies, their versions and who wrote them (documents on request) |
 | `list_org_blocks` | R | pool | Active org blocks |
+| `list_pool_sessions` | R | pool | An org's sticky pool sessions (sid, provider, region, exit IP, age, bytes) and the affinity counters (entries, hits, misses, evictions, rotations) |
+| `generate_pool_endpoints` | R | pool | Gateway endpoints for an org (HTTP CONNECT or SOCKS5) with proxy usernames built from kind, country, city, provider, rotation and ttl, checked with the gateway's username grammar first. The request never carries the org key and the URLs carry the username only: add the key client-side as the proxy password. An endpoint that carries a password is refused. Needs the matching explicit port (`http_port` for `http`, `socks5_port` for `socks5`); `count` is capped by `limits.max_rows` |
 | `get_customer_upstream` | R | pool | An org's own upstream (the login is never returned) |
 | `get_org` | R | control | Rate limit, live bucket and egress proxy (password redacted) |
 | `list_sessions`, `session_status` | R | control | Sessions this server created; one session's configuration and lifecycle (header values hidden) |
@@ -221,9 +223,10 @@ A model cannot enable a capability, read a credential file, approve its own chan
 | `create_org_block`, `lift_org_block` | `org_blocks` | Stop an org from an IP, provider, route class or pool, with a recorded reason and optional ttl |
 | `report_block_signal` | `signals` | Tell the pool a target blocked an exit IP (org-key route, or operator route) |
 | `put_policy`, `put_org_policy`, `delete_policy` | `policy` | Policy documents, validated first with the gateway's rules and the merged set |
+| `rotate_pool_session` | `pool_sessions` | Drop an org's sticky pool session (`sid`, `[a-z0-9_]{1,128}`) so its next tunnel leases a new unit and exit IP; open tunnels are not cut; the gateway limits the route to 60 requests a minute per org |
 | `put_inventory` | `inventory` | Make a provider's static inventory equal to the entries; the diff names the IPs added and retired |
 
-`put_policy`, `put_org_policy`, `delete_policy`, `put_inventory`, the egress, org block and rate-limit changes can be proposed with `propose_config_change`. Sessions, org keys, upstream validation and block signals act at run time or return a secret, so they are direct calls.
+`put_policy`, `put_org_policy`, `delete_policy`, `put_inventory`, `rotate_pool_session`, the egress, org block and rate-limit changes can be proposed with `propose_config_change`. Sessions, org keys, upstream validation and block signals act at run time or return a secret, so they are direct calls.
 
 ## Resources and prompts
 

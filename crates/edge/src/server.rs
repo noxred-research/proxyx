@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use parking_lot::Mutex;
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,7 @@ use crate::health;
 use crate::metrics::Metrics;
 use crate::proxy_protocol::{self, ProxyProtocolError};
 use crate::state::{ListenerRt, State};
+use crate::transport::Transport;
 use crate::{http, socks};
 
 /// The conditions of readiness.
@@ -374,30 +376,62 @@ async fn connection(shared: Arc<Shared>, rt: ListenerRt, stream: TcpStream, tcp_
         .inc();
     let open = metrics.connections_open.with_label_values(&[&name]);
     open.inc();
-    let kind = match rt.cfg.protocol {
-        ListenerProtocol::Http => Kind::Http,
-        ListenerProtocol::Socks => Kind::Socks,
-        ListenerProtocol::Auto => {
-            let mut b = [0u8; 1];
-            match timeout(state.cfg.timeouts.handshake, stream.peek(&mut b)).await {
-                Ok(Ok(1)) if b[0] == 4 || b[0] == 5 => Kind::Socks,
-                Ok(Ok(1)) => Kind::Http,
+    let local_ip = stream.local_addr().map_or(rt.cfg.listen.ip(), |a| a.ip());
+    if crate::conn::check_stage(
+        &shared,
+        &state,
+        &rt,
+        peer,
+        None,
+        crate::config::RuleStage::PreNegotiation,
+        crate::acl::Proto::Http,
+    )
+    .is_ok()
+    {
+        if let Some(acceptor) = &rt.tls {
+            match timeout(state.cfg.timeouts.handshake, acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => {
+                    let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                    if h2 {
+                        crate::h2_connect::serve(Arc::clone(&shared), rt, tls, peer).await;
+                    } else {
+                        dispatch(Arc::clone(&shared), rt, tls, local_ip, peer).await;
+                    }
+                }
                 _ => {
-                    open.dec();
-                    return;
+                    metrics
+                        .connections_total
+                        .with_label_values(&[&name, "tls_error"])
+                        .inc();
                 }
             }
+        } else {
+            dispatch(Arc::clone(&shared), rt, stream, local_ip, peer).await;
         }
-    };
-    drop(state);
-    match kind {
-        Kind::Http => http::serve(Arc::clone(&shared), rt, stream, peer, Vec::new()).await,
-        Kind::Socks => socks::serve(Arc::clone(&shared), rt, stream, peer).await,
     }
     open.dec();
 }
 
-enum Kind {
-    Http,
-    Socks,
+async fn dispatch<S: Transport>(
+    shared: Arc<Shared>,
+    rt: ListenerRt,
+    stream: S,
+    local_ip: std::net::IpAddr,
+    peer: SocketAddr,
+) {
+    let mut stream = BufReader::new(stream);
+    let handshake = shared.state().cfg.timeouts.handshake;
+    let socks = match rt.cfg.protocol {
+        ListenerProtocol::Http => false,
+        ListenerProtocol::Socks => true,
+        ListenerProtocol::Auto => match timeout(handshake, stream.fill_buf()).await {
+            Ok(Ok(b)) if !b.is_empty() => matches!(b[0], 4 | 5),
+            _ => return,
+        },
+    };
+    if socks {
+        socks::serve(shared, rt, stream, local_ip, peer).await;
+    } else {
+        http::serve(shared, rt, stream, peer, Vec::new()).await;
+    }
 }

@@ -836,3 +836,304 @@ async fn audit_log_records_every_call_with_caller_and_a_valid_chain() {
     let unknown = ask(&server, call(5, "nope", json!({}))).await;
     assert_eq!(unknown["error"]["code"], -32602);
 }
+
+#[tokio::test]
+async fn pool_sessions_are_listed_and_rotated_behind_their_own_capability() {
+    let fx = Fixture::start().await;
+    // reads work on a read-only server
+    let read_only = fx.read_only();
+    let listed = tool_ok(
+        &read_only,
+        "list_pool_sessions",
+        json!({"org": "acme", "limit": 2}),
+    )
+    .await;
+    assert_eq!(listed["org"], "acme");
+    assert_eq!(
+        listed["sessions"].as_array().expect("sessions").len(),
+        2,
+        "rows are capped by the request"
+    );
+    assert_eq!(listed["total"], 3);
+    assert_eq!(listed["truncated"], true);
+    assert_eq!(listed["affinity"]["rotations"], 1);
+    assert_eq!(
+        fx.pool.log.calls("GET", "/v1/orgs/acme/sessions")[0]
+            .authorization
+            .as_deref(),
+        Some(format!("Bearer {ADMIN}").as_str())
+    );
+    let outside = fx.server("", "[scope]\nallowed_orgs = [\"acme\"]");
+    assert!(
+        tool_err(&outside, "list_pool_sessions", json!({"org": "other"}))
+            .await
+            .to_string()
+            .contains("outside")
+    );
+
+    // rotating is refused and not even listed without the capability
+    let names = tool_names(&ask(&read_only, modern(1, "tools/list", json!({}))).await);
+    assert!(!names.contains(&"rotate_pool_session".to_owned()));
+    let refused = tool_err(
+        &read_only,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42"}),
+    )
+    .await;
+    assert!(
+        refused.to_string().contains("pool_sessions")
+            && refused.to_string().contains("rotate sticky pool sessions")
+    );
+    let other_cap = fx.server("capabilities = [\"sessions\"]", "");
+    assert!(
+        tool_err(
+            &other_cap,
+            "rotate_pool_session",
+            json!({"org": "acme", "sid": "scan42"})
+        )
+        .await
+        .to_string()
+        .contains("pool_sessions")
+    );
+    assert!(fx.pool.log.mutations().is_empty());
+
+    let server = fx.server("capabilities = [\"pool_sessions\"]", "");
+    assert!(
+        tool_names(&ask(&server, modern(2, "tools/list", json!({}))).await)
+            .contains(&"rotate_pool_session".to_owned())
+    );
+    // the sid pattern is enforced locally
+    for bad in ["Scan42", "a-b", "", &"x".repeat(129)] {
+        assert!(
+            tool_err(
+                &server,
+                "rotate_pool_session",
+                json!({"org": "acme", "sid": bad})
+            )
+            .await
+            .to_string()
+            .contains("sid"),
+            "{bad:?}"
+        );
+    }
+    // dry run shows what would be dropped and calls nothing
+    let preview = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42", "dry_run": true}),
+    )
+    .await;
+    assert_eq!(preview["status"], "dry_run");
+    assert_eq!(preview["diff"]["drops"]["exit_ip"], "203.0.113.50");
+    assert_eq!(
+        preview["would_call"][0],
+        "DELETE /v1/orgs/{org}/sessions/{sid}"
+    );
+    assert!(fx.pool.log.mutations().is_empty());
+    // a sid that is not listed still validates, with a warning
+    let unknown = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "gone", "dry_run": true}),
+    )
+    .await;
+    assert!(unknown["warnings"].to_string().contains("expired already"));
+
+    // a sid the gateway no longer knows is its 404, passed on as a backend error
+    let gone = tool_err(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "gone"}),
+    )
+    .await;
+    assert!(
+        gone.to_string().contains("no live session with this sid"),
+        "{gone}"
+    );
+    let done = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "scan42"}),
+    )
+    .await;
+    assert_eq!(done["status"], "applied");
+    assert_eq!(done["result"]["result"]["rotated"], true);
+    let calls = fx.pool.log.calls("DELETE", "/v1/orgs/acme/sessions/scan42");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].operator.as_deref(), Some("mcp-test"));
+    let log = audit_text(&fx);
+    assert!(
+        log.contains("\"tool\":\"rotate_pool_session\"") && log.contains("\"phase\":\"intent\"")
+    );
+}
+
+#[tokio::test]
+async fn rotating_a_pool_session_follows_the_approval_flow() {
+    let fx = Fixture::start().await;
+    let server = fx.server("capabilities = [\"pool_sessions\"]\napproval = \"all\"", "");
+    let held = tool_ok(
+        &server,
+        "rotate_pool_session",
+        json!({"org": "acme", "sid": "job_7"}),
+    )
+    .await;
+    assert_eq!(held["status"], "pending_approval");
+    let id = held["change_id"].as_str().expect("id").to_owned();
+    assert!(fx.pool.log.mutations().is_empty());
+    assert!(
+        tool_err(&server, "apply_config_change", json!({"change_id": id}))
+            .await
+            .to_string()
+            .contains("approval")
+    );
+    Store::open(fx.state_dir())
+        .expect("store")
+        .approve(&id, "alice", None)
+        .expect("approve");
+    let applied = tool_ok(&server, "apply_config_change", json!({"change_id": id})).await;
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(
+        fx.pool
+            .log
+            .calls("DELETE", "/v1/orgs/acme/sessions/job_7")
+            .len(),
+        1
+    );
+    // it can also be proposed on a server that may not apply it
+    let read_only = fx.read_only();
+    let proposal = tool_ok(
+        &read_only,
+        "propose_config_change",
+        json!({"action": "rotate_pool_session", "arguments": {"org": "acme", "sid": "job_8"}}),
+    )
+    .await;
+    assert_eq!(proposal["status"], "proposed");
+    assert_eq!(proposal["can_apply_here"], false);
+}
+
+#[tokio::test]
+async fn generated_endpoints_never_carry_or_request_the_org_key() {
+    let fx = Fixture::start().await;
+    let server = fx.read_only();
+    let out = tool_ok(&server, "generate_pool_endpoints", json!({
+        "org": "acme", "gateway_host": "gw.example.net", "style": "socks5", "count": 3,
+        "country": "fr", "city": "paris", "kind": "rotating", "rotation": "sticky", "ttl": "5m", "strict": true, "socks5_port": 1080
+    })).await;
+    assert_eq!(out["total"], 3);
+    assert_eq!(
+        out["endpoints"][0]["url"], "socks5://px-cc-fr-sid-gen0@gw.example.net:8080",
+        "the field called url survives redaction"
+    );
+    assert_eq!(
+        out["username_pattern"],
+        "px-kind-rotating-cc-fr-city-paris-ttl-5m"
+    );
+    assert!(
+        out["credential_note"]
+            .as_str()
+            .expect("note")
+            .contains("org key")
+    );
+    let sent = &fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints")[0];
+    assert_eq!(sent.body["format"], "json");
+    assert_eq!(sent.body["style"], "socks5");
+    assert_eq!(sent.body["count"], 3);
+    assert_eq!(sent.body["strict"], true);
+    assert_eq!(sent.body["ttl"], "5m");
+    assert_eq!(sent.body["socks5_port"], 1080);
+    let text = sent.body.to_string();
+    assert!(
+        sent.body.get("org_key").is_none() && !text.contains(ORG_KEY) && !text.contains("ak_"),
+        "{text}"
+    );
+    assert_eq!(
+        sent.authorization.as_deref(),
+        Some(format!("Bearer {ADMIN}").as_str())
+    );
+    // an org_key argument is not part of the tool at all
+    let with_key = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"gateway_host": "gw.example.net", "org": "acme", "org_key": ORG_KEY}),
+    )
+    .await;
+    assert!(with_key.to_string().contains("unknown property"));
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints").len(),
+        1
+    );
+    assert!(!audit_text(&fx).contains(ORG_KEY));
+
+    // local validation: the gateway grammar and the server's row limit
+    let bad = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "city": "paris"}),
+    )
+    .await;
+    assert!(bad.to_string().contains("city_needs_cc"), "{bad}");
+    let dash = tool_err(&server, "generate_pool_endpoints", json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "provider": "vpn_pool", "ttl": "0"})).await;
+    assert!(dash.to_string().contains("ttl"), "{dash}");
+    let many = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080, "count": 101}),
+    )
+    .await;
+    assert!(many.to_string().contains("limits.max_rows"));
+    let host = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "http_port": 8080, "gateway_host": "https://gw.example.net/x"}),
+    )
+    .await;
+    assert!(host.to_string().contains("plain DNS name"));
+    let no_port = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "style": "socks5", "http_port": 8080}),
+    )
+    .await;
+    assert!(no_port.to_string().contains("socks5_port"), "{no_port}");
+    assert_eq!(
+        fx.pool.log.calls("POST", "/v1/orgs/acme/endpoints").len(),
+        1,
+        "invalid requests never reach the gateway"
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_that_carries_a_credential_is_refused() {
+    let fx = Fixture::start().await;
+    // an endpoint list that contains a password in the userinfo is never passed on
+    let (pool, _) = fake_pool().await;
+    drop(pool);
+    let app_url = {
+        use axum::routing::post;
+        let router = axum::Router::new().route(
+            "/v1/orgs/{org}/endpoints",
+            post(|| async { axum::Json(json!({"endpoints": [{"url": "http://px:ak_leakedleakedleakedleaked@gw:8080"}]})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    };
+    let text = fx.config_text("", "").replace(&fx.pool.url(), &app_url);
+    let config = proxyx_mcp::config::Config::parse(&text).expect("config");
+    let server = std::sync::Arc::new(proxyx_mcp::server::Server::new(
+        proxyx_mcp::tools::Ctx::new(config).expect("ctx"),
+    ));
+    let error = tool_err(
+        &server,
+        "generate_pool_endpoints",
+        json!({"org": "acme", "gateway_host": "gw.example.net", "http_port": 8080}),
+    )
+    .await;
+    assert!(error.to_string().contains("carries a credential"));
+    assert!(!error.to_string().contains("leakedleaked"));
+}

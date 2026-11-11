@@ -53,7 +53,7 @@ fn target(host: &str, port: u16) -> Target {
 }
 
 /// Dial `host:443` through `up` with the [`SHORT`] timeouts.
-async fn try_dial(up: &UpstreamEndpoint, host: &str) -> Result<TcpStream, DialError> {
+async fn try_dial(up: &UpstreamEndpoint, host: &str) -> Result<ProxyStream, DialError> {
     dial(up, &target(host, 443), &SHORT, &Metrics::new("test")).await
 }
 
@@ -1131,16 +1131,12 @@ async fn a_local_dial_refuses_a_name_that_resolves_to_an_internal_address() {
 async fn handshake_has_no_proxy_to_talk_to_for_a_local_endpoint() {
     let (l, port) = stub().await;
     let _peer = accept_peer(l);
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+    let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect");
-    let err = handshake(
-        &mut stream,
-        &local("127.0.0.2"),
-        &target("example.com", 443),
-    )
-    .await
-    .expect_err("no proxy");
+    let err = handshake(stream, &local("127.0.0.2"), &target("example.com", 443))
+        .await
+        .expect_err("no proxy");
     assert!(matches!(err, DialError::LocalSource(_)), "{err:?}");
 }
 

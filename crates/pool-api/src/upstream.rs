@@ -8,7 +8,8 @@
 //! a check makes its result stale (`409`, nothing changes).
 //!
 //! The unit is an inventory row owned by the org (provider `customer` for
-//! `http`, `customer_socks5` for `socks5`), so only that org can lease it.
+//! `http`, `customer_https` for `https`, `customer_socks5` for `socks5`), so
+//! only that org can lease it.
 //! An org with an upstream is served by it alone: when it is not leasable the
 //! tunnel fails closed and never leaves through a shared provider IP. The
 //! gateway pins the org from its snapshot, which reloads every 30 s, so a
@@ -62,6 +63,8 @@ use crate::wire::{is_unusable_exit, parse_org, plain_host, unix_opt};
 
 /// Provider of an `http` upstream.
 const HTTP_PROVIDER: &str = "customer";
+/// Provider of an `https` upstream, with TLS certificate verification.
+const HTTPS_PROVIDER: &str = "customer_https";
 /// Provider of a `socks5` upstream.
 const SOCKS5_PROVIDER: &str = "customer_socks5";
 
@@ -75,12 +78,15 @@ const MAX_LOGIN_BYTES: usize = 255;
 fn provider_for(scheme: UpstreamScheme) -> Result<ProviderId, ApiError> {
     let id = match scheme {
         UpstreamScheme::Http => HTTP_PROVIDER,
+        UpstreamScheme::Https => HTTPS_PROVIDER,
         UpstreamScheme::Socks5 => SOCKS5_PROVIDER,
         // A customer must never pick the machine's own addresses as the exit:
         // `local` dials straight from a local source address and the customer
         // would choose which one.
         UpstreamScheme::Local => {
-            return Err(ApiError::bad_request("scheme must be http or socks5"));
+            return Err(ApiError::bad_request(
+                "scheme must be http, https or socks5",
+            ));
         }
     };
     Ok(id.parse().map_err(anyhow::Error::new)?)
@@ -89,6 +95,8 @@ fn provider_for(scheme: UpstreamScheme) -> Result<ProviderId, ApiError> {
 fn scheme_of(provider: &ProviderId) -> &'static str {
     if provider.as_str() == SOCKS5_PROVIDER {
         "socks5"
+    } else if provider.as_str() == HTTPS_PROVIDER {
+        "https"
     } else {
         "http"
     }
@@ -545,6 +553,19 @@ async fn probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn customer_proxy_schemes_round_trip_without_losing_tls() {
+        for (scheme, text) in [
+            (UpstreamScheme::Http, "http"),
+            (UpstreamScheme::Https, "https"),
+            (UpstreamScheme::Socks5, "socks5"),
+        ] {
+            let provider = provider_for(scheme).expect("customer provider");
+            assert_eq!(scheme_of(&provider), text);
+        }
+        assert!(provider_for(UpstreamScheme::Local).is_err());
+    }
 
     #[test]
     fn hosts_are_plain_names_or_addresses() {

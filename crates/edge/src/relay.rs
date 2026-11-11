@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::time::Instant;
 
 use crate::limits::Shaper;
@@ -39,9 +37,9 @@ impl Activity {
     }
 }
 
-async fn pump(
-    mut r: OwnedReadHalf,
-    mut w: OwnedWriteHalf,
+async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut r: R,
+    mut w: W,
     first: Vec<u8>,
     shaper: Shaper,
     moved: Arc<AtomicU64>,
@@ -75,9 +73,9 @@ async fn pump(
 /// `client_first` holds bytes the client sent before the tunnel opened (they
 /// go to the upstream first); `upstream_first` the same the other way.
 #[allow(clippy::too_many_arguments)]
-pub async fn relay(
-    client: TcpStream,
-    upstream: TcpStream,
+pub async fn relay<C: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin>(
+    client: C,
+    upstream: U,
     client_first: Vec<u8>,
     upstream_first: Vec<u8>,
     up: Shaper,
@@ -85,8 +83,8 @@ pub async fn relay(
     idle: Duration,
     total: Duration,
 ) -> Totals {
-    let (cr, cw) = client.into_split();
-    let (ur, uw) = upstream.into_split();
+    let (cr, cw) = tokio::io::split(client);
+    let (ur, uw) = tokio::io::split(upstream);
     let act = Arc::new(Activity {
         started: Instant::now(),
         last_ms: AtomicU64::new(0),
@@ -142,7 +140,7 @@ pub async fn relay(
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncReadExt as _;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 
@@ -151,6 +149,39 @@ mod tests {
         let addr = l.local_addr().expect("addr");
         let (a, b) = tokio::join!(TcpStream::connect(addr), l.accept());
         (a.expect("connect"), b.expect("accept").0)
+    }
+
+    #[tokio::test]
+    async fn generic_duplex_transport_preserves_half_close() {
+        let (mut client, incoming) = tokio::io::duplex(128);
+        let (mut target, outgoing) = tokio::io::duplex(128);
+        let task = tokio::spawn(relay(
+            incoming,
+            outgoing,
+            Vec::new(),
+            Vec::new(),
+            Shaper::none(),
+            Shaper::none(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ));
+        client.write_all(b"request").await.expect("request");
+        client.shutdown().await.expect("half close");
+        let mut received = Vec::new();
+        target
+            .read_to_end(&mut received)
+            .await
+            .expect("request EOF");
+        assert_eq!(received, b"request");
+        target.write_all(b"response").await.expect("response");
+        target.shutdown().await.expect("half close");
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("response EOF");
+        assert_eq!(received, b"response");
+        assert_eq!(task.await.expect("relay"), Totals { up: 7, down: 8 });
     }
 
     #[tokio::test]

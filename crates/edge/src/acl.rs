@@ -11,6 +11,7 @@ use std::time::SystemTime;
 use ipnet::IpNet;
 use regex::Regex;
 
+pub use crate::config::RuleStage;
 use crate::config::{Action, MatchConfig, RuleConfig, TimeWindowConfig};
 
 /// The wire protocol a request arrived on.
@@ -345,6 +346,32 @@ impl Match {
         })
     }
 
+    fn validate_stage(c: &MatchConfig, stage: RuleStage) -> Result<(), String> {
+        if matches!(stage, RuleStage::PreNegotiation | RuleStage::PostAuth) {
+            if !c.dst.is_empty()
+                || !c.domain.is_empty()
+                || !c.port.is_empty()
+                || !c.method.is_empty()
+            {
+                return Err("destination and method conditions require a request stage".into());
+            }
+            if stage == RuleStage::PreNegotiation
+                && (!c.protocol.is_empty()
+                    || !c.user.is_empty()
+                    || !c.group.is_empty()
+                    || c.authenticated.is_some())
+            {
+                return Err(
+                    "protocol and identity conditions are unavailable before negotiation".into(),
+                );
+            }
+        }
+        if let Some(nested) = c.not.as_deref() {
+            Self::validate_stage(nested, stage)?;
+        }
+        Ok(())
+    }
+
     /// True when a `dst` condition needs the resolved addresses.
     pub fn uses_dst(&self) -> bool {
         !self.dst.is_empty() || self.not.as_ref().is_some_and(|n| n.uses_dst())
@@ -418,6 +445,7 @@ pub struct Known<'a> {
 pub struct Rule {
     pub name: Option<String>,
     pub action: Action,
+    pub stage: RuleStage,
     pub allow_internal: bool,
     m: Match,
 }
@@ -446,9 +474,19 @@ impl Rules {
                     i + 1
                 ));
             }
+            Match::validate_stage(&r.when, r.stage).map_err(|e| format!("rule #{}: {e}", i + 1))?;
+            if r.allow_internal
+                && matches!(r.stage, RuleStage::PreNegotiation | RuleStage::PostAuth)
+            {
+                return Err(format!(
+                    "rule #{}: allow_internal requires a request stage",
+                    i + 1
+                ));
+            }
             rules.push(Rule {
                 name: r.name.clone(),
                 action: r.action,
+                stage: r.stage,
                 allow_internal: r.allow_internal,
                 m: Match::compile(&r.when, known).map_err(|e| format!("rule #{}: {e}", i + 1))?,
             });
@@ -465,8 +503,18 @@ impl Rules {
     }
 
     pub fn evaluate(&self, r: &Req<'_>) -> Verdict {
+        self.evaluate_stage(RuleStage::Request, r)
+    }
+
+    /// An absent non-request stage adds no policy; a configured stage defaults to deny.
+    pub fn has_stage(&self, stage: RuleStage) -> bool {
+        self.rules.iter().any(|rule| rule.stage == stage)
+    }
+
+    /// Evaluate only rules explicitly assigned to this stage.
+    pub fn evaluate_stage(&self, stage: RuleStage, r: &Req<'_>) -> Verdict {
         for (i, rule) in self.rules.iter().enumerate() {
-            if rule.m.matches(r) {
+            if rule.stage == stage && rule.m.matches(r) {
                 return Verdict {
                     action: rule.action,
                     rule: Some(rule.name.clone().unwrap_or_else(|| format!("#{}", i + 1))),
@@ -725,6 +773,91 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn stages_are_isolated_and_configured_stages_default_to_deny() {
+        let rules = compile(
+            r#"
+[[rule]]
+stage = "pre_negotiation"
+action = "allow"
+when = { src = ["192.0.2.0/24"] }
+[[rule]]
+stage = "post_auth"
+action = "allow"
+when = { user = ["bob"], authenticated = true }
+[[rule]]
+stage = "bind"
+action = "allow"
+when = { port = ["443"] }
+[[rule]]
+stage = "udp"
+action = "allow"
+when = { port = ["53"] }
+[[rule]]
+action = "allow"
+"#,
+        );
+        let mut r = req("example.com", 443);
+        assert_eq!(rules.evaluate(&r).action, Action::Allow);
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::PreNegotiation, &r).action,
+            Action::Deny
+        );
+        r.src = "192.0.2.1".parse().expect("ip");
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::PreNegotiation, &r).action,
+            Action::Allow
+        );
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::PostAuth, &r).action,
+            Action::Deny
+        );
+        r.user = Some("bob");
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::PostAuth, &r).action,
+            Action::Allow
+        );
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::Bind, &r).action,
+            Action::Allow
+        );
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::Udp, &r).action,
+            Action::Deny
+        );
+        r.port = 53;
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::Bind, &r).action,
+            Action::Deny
+        );
+        assert_eq!(
+            rules.evaluate_stage(RuleStage::Udp, &r).action,
+            Action::Allow
+        );
+        assert!(!compile("[[rule]]\naction = \"allow\"").has_stage(RuleStage::PostAuth));
+    }
+
+    #[test]
+    fn early_stages_reject_unavailable_fields_even_under_negation() {
+        for (stage, condition) in [
+            ("pre_negotiation", "user = [\"alice\"]"),
+            ("pre_negotiation", "authenticated = false"),
+            ("pre_negotiation", "protocol = [\"socks5\"]"),
+            ("post_auth", "dst = [\"127.0.0.1\"]"),
+            ("post_auth", "domain = [\"example.com\"]"),
+            ("post_auth", "port = [\"443\"]"),
+            ("post_auth", "method = [\"CONNECT\"]"),
+        ] {
+            for when in [condition.to_owned(), format!("not = {{ {condition} }}")] {
+                let text = format!(
+                    "[[rule]]\nstage = \"{stage}\"\naction = \"allow\"\nwhen = {{ {when} }}"
+                );
+                let cfg = Config::parse(&text).expect("parse");
+                assert!(Rules::compile(&cfg.rules, &known()).is_err(), "{text}");
+            }
+        }
     }
 
     #[test]

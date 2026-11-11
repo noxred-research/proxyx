@@ -58,7 +58,7 @@ url = "http://127.0.0.1:8890"
 [safety]
 profile = "read_only"              # read_only (default) | operator (sessions, org blocks, block signals) | admin (everything)
 # capabilities = ["sessions", "org_blocks"]   # replaces the profile; one or more of:
-#   sessions org_keys org_limits egress org_blocks signals policy inventory
+#   sessions org_keys org_limits egress org_blocks signals policy inventory pool_sessions
 # allow_tools = ["list_*", "health", "assess"]  # when set, only these tools exist; a trailing * is a prefix
 # deny_tools = ["put_inventory"]
 approval = "off"                   # off | all | listed. all: every mutation waits for `proxyx mcp approve <id>`

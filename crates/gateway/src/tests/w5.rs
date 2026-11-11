@@ -12,7 +12,7 @@ async fn one_dead_static_ip_leaves_leasing_without_opening_the_route_class() -> 
     let cfg = breaker(2);
     setup.pacing.breaker = cfg;
     let live = stub_provider(PROVIDER_PASS, stub_target().await, uniq_ip()).await;
-    let dead_addr = closed_addr().await;
+    let dead_addr = closed_endpoint();
     // "198.18" sorts before "198.19": the dead IP is leased first
     let dead_ip = IpAddr::from([198, 18, 7, 7]);
     let live_ip = IpAddr::from([198, 19, 7, 7]);
@@ -48,10 +48,10 @@ async fn dead_class(
     env: &Env,
     setup: &Setup,
     n: u8,
-) -> Result<(Harness, Vec<(IpAddr, SocketAddr)>), BoxErr> {
+) -> Result<(Harness, Vec<(IpAddr, ClosedEndpoint)>), BoxErr> {
     let mut dead = Vec::new();
     for i in 0..n {
-        dead.push((IpAddr::from([198, 18, 8, i + 1]), closed_addr().await));
+        dead.push((IpAddr::from([198, 18, 8, i + 1]), closed_endpoint()));
     }
     let rows = dead
         .iter()
@@ -91,13 +91,8 @@ async fn a_provider_wide_dial_failure_withdraws_no_more_than_one_ip_and_recovers
     let target = stub_target().await;
     let revived: Vec<StubProvider> = {
         let mut v = Vec::new();
-        for (ip, addr) in &dead {
-            v.push(stub_provider_on(
-                TcpListener::bind(addr).await?,
-                PROVIDER_PASS,
-                target,
-                *ip,
-            ));
+        for (ip, addr) in dead {
+            v.push(stub_provider_on(addr.listen()?, PROVIDER_PASS, target, ip));
         }
         v
     };

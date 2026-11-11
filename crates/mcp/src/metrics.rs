@@ -367,6 +367,60 @@ pub const CATALOG: &[Family] = &[
         "Requests admitted without a rate-limit verdict because the backend failed and the policy fails open.",
     ),
     fam(
+        "proxyx_limiter_buckets",
+        Gauge,
+        &[],
+        "Token buckets currently allocated: one per org with live traffic.",
+    ),
+    fam(
+        "proxyx_limiter_buckets_capacity",
+        Gauge,
+        &[],
+        "Size of the bucket slab; new orgs cannot be created once buckets reach it.",
+    ),
+    fam(
+        "proxyx_limiter_connections",
+        Gauge,
+        &[],
+        "Open client connections to the rate-limit service.",
+    ),
+    fam(
+        "proxyx_limiter_connections_refused_total",
+        Counter,
+        &[],
+        "Connections dropped above the connection limit.",
+    ),
+    fam(
+        "proxyx_limiter_requests_total",
+        Counter,
+        &["op"],
+        "Requests served by operation (create, consume, drain, snapshot, ping).",
+    ),
+    fam(
+        "proxyx_limiter_consume_denied_total",
+        Counter,
+        &[],
+        "Consume requests answered with a denial.",
+    ),
+    fam(
+        "proxyx_limiter_create_rejected_total",
+        Counter,
+        &["reason"],
+        "Bucket creates rejected, for example because the slab is full.",
+    ),
+    fam(
+        "proxyx_limiter_connection_errors_total",
+        Counter,
+        &[],
+        "Client connections that ended in a protocol or I/O error.",
+    ),
+    fam(
+        "proxyx_limiter_uptime_seconds",
+        Gauge,
+        &[],
+        "Seconds since the rate-limit service started.",
+    ),
+    fam(
         "proxyx_ingester_messages_total",
         Counter,
         &["outcome"],
@@ -455,6 +509,138 @@ pub const CATALOG: &[Family] = &[
         Counter,
         &["reason"],
         "Control API requests refused by the request limits (rate_limited, over_capacity, timeout).",
+    ),
+    fam(
+        "proxyx_edge_connections_total",
+        Counter,
+        &["listener", "outcome"],
+        "Client connections by listener and outcome.",
+    ),
+    fam(
+        "proxyx_edge_connections_open",
+        Gauge,
+        &["listener"],
+        "Client connections currently being served.",
+    ),
+    fam(
+        "proxyx_edge_requests_total",
+        Counter,
+        &["listener", "protocol", "result"],
+        "Completed edge requests and tunnels by result.",
+    ),
+    fam(
+        "proxyx_edge_bytes_total",
+        Counter,
+        &["listener", "direction"],
+        "Payload bytes passed upstream or downstream.",
+    ),
+    fam(
+        "proxyx_edge_auth_failures_total",
+        Counter,
+        &["listener", "reason"],
+        "Proxy logins refused by reason.",
+    ),
+    fam(
+        "proxyx_edge_acl_decisions_total",
+        Counter,
+        &["action"],
+        "Access-rule authorization decisions.",
+    ),
+    fam(
+        "proxyx_edge_destination_denied_total",
+        Counter,
+        &[],
+        "Requests refused by private/internal destination protection.",
+    ),
+    fam(
+        "proxyx_edge_limit_rejections_total",
+        Counter,
+        &["kind"],
+        "Connections and requests refused by limits.",
+    ),
+    fam(
+        "proxyx_edge_egress_connections_total",
+        Counter,
+        &["pool", "outcome"],
+        "Connection attempts from each local egress pool.",
+    ),
+    fam(
+        "proxyx_edge_connect_duration_seconds",
+        Histogram,
+        &["pool"],
+        "Successful target or parent connection duration.",
+    ),
+    fam(
+        "proxyx_edge_egress_addresses",
+        Gauge,
+        &["pool", "state"],
+        "Configured local egress addresses by health state.",
+    ),
+    fam(
+        "proxyx_edge_parent_requests_total",
+        Counter,
+        &["parent", "outcome"],
+        "Parent connection and handshake attempts by outcome.",
+    ),
+    fam(
+        "proxyx_edge_parent_up",
+        Gauge,
+        &["parent"],
+        "One while a parent is eligible for traffic.",
+    ),
+    fam(
+        "proxyx_edge_dns_lookups_total",
+        Counter,
+        &["result"],
+        "Target and parent name resolutions by result.",
+    ),
+    fam(
+        "proxyx_edge_breaker_transitions_total",
+        Counter,
+        &["kind", "state"],
+        "Circuit breaker state transitions.",
+    ),
+    fam(
+        "proxyx_edge_parent_breaker_state",
+        Gauge,
+        &["parent"],
+        "Parent circuit breaker state: closed zero, half-open one, open two.",
+    ),
+    fam(
+        "proxyx_edge_parent_healthy",
+        Gauge,
+        &["parent"],
+        "One while a parent passes active probes.",
+    ),
+    fam(
+        "proxyx_edge_health_checks_total",
+        Counter,
+        &["kind", "result"],
+        "Active node and chain health probes by result.",
+    ),
+    fam(
+        "proxyx_edge_parent_conn_reuse_total",
+        Counter,
+        &["outcome"],
+        "HTTP parent requests using new or reused connections.",
+    ),
+    fam(
+        "proxyx_edge_config_reloads_total",
+        Counter,
+        &["result"],
+        "Atomic configuration reloads by result.",
+    ),
+    fam(
+        "proxyx_edge_access_log_dropped_total",
+        Counter,
+        &[],
+        "Access-log entries dropped by the bounded writer.",
+    ),
+    fam(
+        "proxyx_edge_udp_associations_open",
+        Gauge,
+        &["listener"],
+        "SOCKS5 UDP associations currently open.",
     ),
 ];
 
@@ -1030,88 +1216,119 @@ weird{a="q\"uote\\n"} 1.5 1700000000
         );
     }
 
+    /// The label names of a documented `- **Labels:**` line: `` `a`, `b` (x, y) `` is `a`, `b`.
+    fn documented_labels(line: &str) -> Vec<String> {
+        if line.trim() == "none" {
+            return Vec::new();
+        }
+        let (mut depth, mut item, mut items) = (0_i32, String::new(), Vec::new());
+        for c in line.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(std::mem::take(&mut item));
+                    continue;
+                }
+                _ => {}
+            }
+            item.push(c);
+        }
+        items.push(item);
+        items
+            .iter()
+            .map(|item| {
+                item.trim()
+                    .trim_start_matches('`')
+                    .split('`')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Every `docs/metrics/*.md`, read at test time so a new document is covered without an
+    /// edit here. The pool document's Python prober section is not a Rust family and is cut.
+    fn metric_documents() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/metrics");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("docs/metrics exists")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        files.sort();
+        files
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).expect("read metrics document");
+                let text = text.split("\n## Prober").next().unwrap_or("").to_owned();
+                (
+                    path.file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                    text,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn catalogue_matches_the_documents() {
-        for (doc, prober_cut) in [
-            (include_str!("../../../docs/metrics/pool.md"), true),
-            (
-                include_str!("../../../docs/metrics/session-proxy.md"),
-                false,
-            ),
-        ] {
-            let doc = if prober_cut {
-                doc.split("## Prober").next().unwrap_or(doc)
-            } else {
-                doc
-            };
+        let documents = metric_documents();
+        assert!(
+            documents.len() >= 4,
+            "expected pool, session-proxy, edge and limiter documents, found {:?}",
+            documents.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+        let mut documented_names: Vec<String> = Vec::new();
+        for (file, doc) in &documents {
             let mut documented = 0;
             for section in doc.split("\n### `").skip(1) {
                 let name = section.split('`').next().expect("family name");
-                let family = family(name).unwrap_or_else(|| panic!("{name} is not in CATALOG"));
+                let family = family(name)
+                    .unwrap_or_else(|| panic!("{file}: {name} is documented but not in CATALOG"));
                 let kind = section
                     .lines()
                     .find_map(|line| line.strip_prefix("- **Type:** "))
-                    .expect("type line");
+                    .unwrap_or_else(|| panic!("{file}: {name} has no type line"));
                 assert!(
                     kind.starts_with(family.kind.as_str()),
-                    "{name}: documented {kind}, catalogued {}",
+                    "{file}: {name}: documented {kind}, catalogued {}",
                     family.kind.as_str()
                 );
                 let labels_line = section
                     .lines()
                     .find_map(|line| line.strip_prefix("- **Labels:** "))
-                    .expect("labels line");
-                let mut documented_labels = Vec::new();
-                if labels_line.trim() != "none" {
-                    let mut depth = 0;
-                    let mut item = String::new();
-                    let mut items = Vec::new();
-                    for c in labels_line.chars() {
-                        match c {
-                            '(' => depth += 1,
-                            ')' => depth -= 1,
-                            ',' if depth == 0 => {
-                                items.push(std::mem::take(&mut item));
-                                continue;
-                            }
-                            _ => {}
-                        }
-                        item.push(c);
-                    }
-                    items.push(item);
-                    for item in items {
-                        let label = item.trim().trim_start_matches('`');
-                        documented_labels.push(label.split('`').next().expect("label").to_owned());
-                    }
-                }
+                    .unwrap_or_else(|| panic!("{file}: {name} has no labels line"));
+                let mut expected = documented_labels(labels_line);
+                // the documents list `requests_total` and `unmatched` as detail, not as labels
+                expected.retain(|label| label != "requests_total" && label != "unmatched");
                 let catalogued: Vec<String> = family
                     .labels
                     .iter()
                     .map(|label| (*label).to_owned())
                     .collect();
-                let mut expected = documented_labels.clone();
-                // the documents list `requests_total` and `unmatched` as detail, not as labels
-                expected.retain(|label| label != "requests_total" && label != "unmatched");
-                assert_eq!(catalogued, expected, "{name}: label names differ");
+                assert_eq!(catalogued, expected, "{file}: {name}: label names differ");
+                assert!(
+                    !documented_names.iter().any(|seen| seen == name),
+                    "{name} is documented twice"
+                );
+                documented_names.push(name.to_owned());
                 documented += 1;
             }
-            assert!(documented > 10);
+            assert!(documented > 0, "{file} documents no family");
         }
-        // and the other way: nothing is catalogued that the documents do not describe
-        let documents = format!(
-            "{}{}",
-            include_str!("../../../docs/metrics/pool.md")
-                .split("## Prober")
-                .next()
-                .unwrap_or(""),
-            include_str!("../../../docs/metrics/session-proxy.md")
-        );
+        // and the other way: nothing is catalogued that no document describes
         for family in CATALOG {
             assert!(
-                documents.contains(&format!("### `{}`", family.name)),
-                "{} is catalogued but not documented",
+                documented_names.iter().any(|name| name == family.name),
+                "{} is catalogued but not documented in docs/metrics",
                 family.name
             );
         }
+        assert_eq!(documented_names.len(), CATALOG.len());
     }
 }

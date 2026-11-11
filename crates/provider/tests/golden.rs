@@ -3,11 +3,12 @@
 //! byte for byte.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::Secret;
 use common::types::{InventoryEntry, ProviderId, Region, Subtype, UpstreamScheme};
 use proxyx_provider::{
-    Adapter, AdapterFile, AdapterSet, ProviderError, UnitSpec, ensure_public_address,
+    Adapter, AdapterFile, AdapterSet, ProviderError, SessionMode, UnitSpec, ensure_public_address,
 };
 
 fn root() -> PathBuf {
@@ -22,6 +23,10 @@ fn secrets(name: &str) -> anyhow::Result<Secret> {
         "oxylabs_res_pass" => "resp",
         "iproyal_res_user" => "ipu",
         "iproyal_res_pass" => "ipp",
+        "webshare_res_user" => "webuser",
+        "webshare_res_pass" => "webpass",
+        "brightdata_zone_user" => "brd-customer-example-zone-residential",
+        "brightdata_zone_pass" => "zonepass",
         "bd_res_user" => "brd-customer-hl_abc-zone-res1",
         "bd_res_pass" => "bdrp",
         "bd_isp_user" => "brd-customer-hl_abc-zone-isp1",
@@ -139,7 +144,7 @@ fn assert_endpoint(
 fn rotating<'a>(sid: &'a str, ttl: u32, region: &'a Region, strict: bool) -> UnitSpec<'a> {
     UnitSpec::Rotating {
         session_id: sid,
-        ttl_minutes: ttl,
+        ttl: Duration::from_secs(u64::from(ttl) * 60),
         region,
         strict,
     }
@@ -168,13 +173,19 @@ fn shipped_adapters_load() {
     assert_eq!(
         ids,
         [
+            "brightdata_zone",
             "customer",
+            "customer_https",
             "customer_socks5",
             "iproyal_res",
             "local",
             "oxylabs_isp",
             "oxylabs_res",
-            "vpn-pool"
+            "vpn-pool",
+            "webshare_rotating_http",
+            "webshare_rotating_socks5",
+            "webshare_sticky_http",
+            "webshare_sticky_socks5"
         ]
     );
 }
@@ -241,8 +252,8 @@ fn oxylabs_residential_golden() {
     );
     // strict swaps the session key, never adds a second one
     assert_eq!(
-        render(&a, &rotating(sid, 1440, &fr, true)).0,
-        "customer-resu-cc-FR-sessid_oneip-abcd1234abcd1234-sesstime-1440"
+        render(&a, &rotating(sid, 30, &fr, true)).0,
+        "customer-resu-cc-FR-sessid_oneip-abcd1234abcd1234-sesstime-30"
     );
     let paris = region("fr/paris");
     assert_eq!(
@@ -271,13 +282,13 @@ fn iproyal_puts_the_options_in_the_password() {
         &a,
         &rotating("sgn34f3e", 10, &br, false),
         "ipu",
-        "ipp_country-br_session-sgn34f3e_lifetime-10m",
+        "ipp_country-br_session-sgn34f3e_lifetime-600s",
         "geo.iproyal.com",
         12321,
     );
     assert_eq!(
         render(&a, &rotating("sgn34f3e", 30, &br, true)).1,
-        "ipp_country-br_session-sgn34f3e_lifetime-30m_killswitch-1"
+        "ipp_country-br_session-sgn34f3e_lifetime-1800s_killswitch-1"
     );
     assert_eq!(a.session_id_len(), Some(8));
 }
@@ -660,8 +671,8 @@ fn refuses_durations_above_the_provider_maximum() {
     let a = shipped_adapter("oxylabs_res");
     let fr = region("fr");
     let sid = "abcd1234abcd1234";
-    assert!(a.recipe(&rotating(sid, 1440, &fr, false)).is_ok());
-    assert_eq!(refused(&a, &rotating(sid, 1441, &fr, false)), "ttl");
+    assert!(a.recipe(&rotating(sid, 30, &fr, false)).is_ok());
+    assert_eq!(refused(&a, &rotating(sid, 31, &fr, false)), "ttl");
     assert_eq!(refused(&a, &rotating(sid, 0, &fr, false)), "ttl");
 }
 
@@ -895,4 +906,353 @@ fn broken_adapter_files_are_refused_at_load() {
             .adapter
             .is_empty()
     );
+}
+
+fn rotating_seconds<'a>(
+    sid: &'a str,
+    seconds: u64,
+    region: &'a Region,
+    strict: bool,
+) -> UnitSpec<'a> {
+    UnitSpec::Rotating {
+        session_id: sid,
+        ttl: Duration::from_secs(seconds),
+        region,
+        strict,
+    }
+}
+
+#[test]
+fn iproyal_seconds_and_seven_day_bounds_are_exact() {
+    let adapter = shipped_adapter("iproyal_res");
+    let br = region("br");
+    for seconds in [1, 59, 60, 61, 604_800] {
+        assert_eq!(
+            render(&adapter, &rotating_seconds("sgn34f3e", seconds, &br, false)).1,
+            format!("ipp_country-br_session-sgn34f3e_lifetime-{seconds}s"),
+        );
+    }
+    assert_eq!(
+        refused(&adapter, &rotating_seconds("sgn34f3e", 0, &br, false)),
+        "ttl"
+    );
+    assert_eq!(
+        refused(&adapter, &rotating_seconds("sgn34f3e", 604_801, &br, false)),
+        "ttl"
+    );
+}
+
+#[test]
+fn minute_provider_rounds_up_without_exceeding_thirty_minutes() {
+    let adapter = shipped_adapter("oxylabs_res");
+    let fr = region("fr");
+    let sid = "abcd1234abcd1234";
+    for (seconds, minutes) in [(1, 1), (59, 1), (60, 1), (61, 2), (1800, 30)] {
+        assert_eq!(
+            render(&adapter, &rotating_seconds(sid, seconds, &fr, false)).0,
+            format!("customer-resu-cc-FR-sessid-{sid}-sesstime-{minutes}"),
+        );
+        assert_eq!(
+            adapter
+                .normalize_session_ttl(Duration::from_secs(seconds))
+                .expect("normalize"),
+            Duration::from_secs(minutes * 60),
+        );
+    }
+    assert_eq!(
+        refused(&adapter, &rotating_seconds(sid, 1801, &fr, false)),
+        "ttl"
+    );
+    let fractional = UnitSpec::Rotating {
+        session_id: sid,
+        ttl: Duration::from_millis(1500),
+        region: &fr,
+        strict: false,
+    };
+    assert_eq!(refused(&adapter, &fractional), "ttl");
+}
+
+#[test]
+fn webshare_sticky_http_and_socks5_golden() {
+    let us = region("us/los_angeles");
+    for (id, scheme, port) in [
+        ("webshare_sticky_http", UpstreamScheme::Http, 80),
+        ("webshare_sticky_socks5", UpstreamScheme::Socks5, 1080),
+    ] {
+        let adapter = shipped_adapter(id);
+        let spec = rotating_seconds("1234567890123456", 61, &us, false);
+        assert_endpoint(
+            &adapter,
+            &spec,
+            "webuser-us-city_los_angeles-1234567890123456",
+            "webpass",
+            "p.webshare.io",
+            port,
+        );
+        assert_eq!(adapter.recipe(&spec).expect("recipe").scheme, scheme);
+        assert_eq!(adapter.session_mode(), SessionMode::Sticky);
+        assert_eq!(adapter.session_id_alphabet(), b"0123456789");
+        assert_eq!(adapter.session_id_len(), Some(16));
+        assert!(is_mismatch(
+            &adapter,
+            &rotating_seconds("1234567890123456", 61, &us, true)
+        ));
+        assert_eq!(
+            refused(
+                &adapter,
+                &rotating_seconds("abcdef1234567890", 61, &us, false)
+            ),
+            "sid"
+        );
+        assert_eq!(
+            refused(
+                &adapter,
+                &rotating_seconds("1234567890123456", 61, &region("us/city2"), false)
+            ),
+            "city",
+        );
+        assert!(
+            adapter
+                .recipe(&rotating("1234567890123456", 1440, &us, false))
+                .is_ok()
+        );
+        assert_eq!(
+            refused(&adapter, &rotating("1234567890123456", 1441, &us, false)),
+            "ttl"
+        );
+    }
+}
+
+#[test]
+fn webshare_per_request_http_and_socks5_golden() {
+    let us = region("us");
+    for (id, scheme, port) in [
+        ("webshare_rotating_http", UpstreamScheme::Http, 80),
+        ("webshare_rotating_socks5", UpstreamScheme::Socks5, 1080),
+    ] {
+        let adapter = shipped_adapter(id);
+        let spec = rotating_seconds("localTracking1", 30, &us, false);
+        assert_endpoint(
+            &adapter,
+            &spec,
+            "webuser-us-rotate",
+            "webpass",
+            "p.webshare.io",
+            port,
+        );
+        assert_eq!(adapter.recipe(&spec).expect("recipe").scheme, scheme);
+        assert_eq!(adapter.session_mode(), SessionMode::PerRequest);
+        assert_eq!(
+            render(&adapter, &spec),
+            render(&adapter, &rotating_seconds("differentId", 60, &us, false)),
+        );
+        assert_eq!(
+            render(
+                &adapter,
+                &rotating_seconds("localTracking1", 30, &region("us/houston"), false)
+            )
+            .0,
+            "webuser-us-city_houston-rotate",
+        );
+        assert!(is_mismatch(
+            &adapter,
+            &rotating_seconds("localTracking1", 30, &us, true)
+        ));
+    }
+}
+
+#[test]
+fn brightdata_full_zone_username_golden() {
+    let adapter = shipped_adapter("brightdata_zone");
+    let us = region("us/sanfrancisco");
+    assert_endpoint(
+        &adapter,
+        &rotating_seconds("scan42", 61, &us, true),
+        "brd-customer-example-zone-residential-country-us-city-sanfrancisco-session-scan42-const",
+        "zonepass",
+        "brd.superproxy.io",
+        33335,
+    );
+    assert_eq!(
+        render(&adapter, &rotating("scan42", 10, &region("us"), false)).0,
+        "brd-customer-example-zone-residential-country-us-session-scan42",
+    );
+    assert_eq!(
+        refused(&adapter, &rotating("scan-42", 10, &us, false)),
+        "sid"
+    );
+}
+
+#[test]
+fn https_adapter_preserves_tls_transport_and_public_address_rules() {
+    let adapter = shipped_adapter("customer_https");
+    let public = entry(
+        "customer_https",
+        Subtype::Datacenter,
+        "proxy.example.com",
+        443,
+        "us",
+    );
+    let endpoint = adapter
+        .recipe(&login_spec(&public, "tlsuser", "tlspass"))
+        .expect("recipe");
+    assert_eq!(endpoint.scheme, UpstreamScheme::Https);
+    assert_endpoint(
+        &adapter,
+        &login_spec(&public, "tlsuser", "tlspass"),
+        "tlsuser",
+        "tlspass",
+        "proxy.example.com",
+        443,
+    );
+    let private = entry(
+        "customer_https",
+        Subtype::Datacenter,
+        "127.0.0.1",
+        443,
+        "us",
+    );
+    assert!(is_not_public(&adapter, &static_spec(&private)));
+}
+
+#[test]
+fn session_identity_roundtrips_normalized_lifetime_and_strictness() {
+    let adapter = shipped_adapter("oxylabs_res");
+    let sid = "abcd1234abcd1234";
+    let encoded = adapter
+        .encode_session(sid, Duration::from_secs(61), true)
+        .expect("encode");
+    assert_eq!(encoded, "abcd1234abcd1234~120~1");
+    let decoded = adapter.decode_session(&encoded).expect("decode");
+    assert_eq!(decoded.session_id, sid);
+    assert_eq!(decoded.ttl, Duration::from_secs(120));
+    assert!(decoded.strict);
+    let fr = region("fr");
+    assert_eq!(
+        render(
+            &adapter,
+            &UnitSpec::Rotating {
+                session_id: decoded.session_id,
+                ttl: decoded.ttl,
+                region: &fr,
+                strict: decoded.strict,
+            }
+        ),
+        render(&adapter, &rotating_seconds(sid, 61, &fr, true)),
+    );
+    let legacy = adapter.decode_session(sid).expect("legacy");
+    assert_eq!(legacy.ttl, adapter.session_life());
+    assert!(!legacy.strict);
+    let seconds = shipped_adapter("iproyal_res");
+    let encoded = seconds
+        .encode_session("12345678", Duration::from_secs(1), false)
+        .expect("seconds");
+    assert_eq!(encoded, "12345678~1~0");
+    assert_eq!(
+        seconds.decode_session(&encoded).expect("decode").ttl,
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
+fn session_identity_refuses_malformed_or_unsupported_inputs() {
+    let adapter = shipped_adapter("oxylabs_res");
+    for bad in [
+        "abcd1234abcd1234~",
+        "abcd1234abcd1234~60",
+        "abcd1234abcd1234~0~0",
+        "abcd1234abcd1234~61~0",
+        "abcd1234abcd1234~60~2",
+        "abcd1234abcd1234~60~0~extra",
+        "abcd1234abcd1234~no~0",
+        "abcd1234abcd1234~18446744073709551615~0",
+        "abcd1234abcd1234~1801~0",
+        "bad-sid~60~0",
+    ] {
+        assert!(adapter.decode_session(bad).is_err(), "{bad}");
+    }
+    assert!(
+        adapter
+            .encode_session("bad~sid", Duration::from_secs(60), false)
+            .is_err()
+    );
+    assert!(
+        adapter
+            .encode_session("abcd1234abcd1234", Duration::ZERO, false)
+            .is_err()
+    );
+    let webshare = shipped_adapter("webshare_sticky_http");
+    assert!(
+        webshare
+            .encode_session("1234567890123456", Duration::from_secs(60), true)
+            .is_err()
+    );
+    assert!(webshare.decode_session("1234567890123456~60~1").is_err());
+    assert!(
+        shipped_adapter("customer")
+            .decode_session("12345678")
+            .is_err()
+    );
+}
+
+#[test]
+fn per_request_session_options_and_static_session_mode_are_refused() {
+    let text = std::fs::read_to_string(root().join("../../data/adapters/webshare_res.toml"))
+        .expect("read");
+    let file: AdapterFile = toml::from_str(&text).expect("parse");
+    let sticky = file
+        .adapter
+        .iter()
+        .find(|c| c.id.as_str() == "webshare_sticky_http")
+        .expect("sticky");
+    let mut config = sticky.clone();
+    config.session_mode = SessionMode::PerRequest;
+    assert!(matches!(
+        AdapterSet::from_configs(vec![config], &secrets),
+        Err(ProviderError::Config { .. })
+    ));
+    assert!(config_error(
+        "[[adapter]]\nid = \"x\"\nkind = \"static\"\nsubtype = \"isp\"\nsession_mode = \"per_request\""
+    ).contains("session_mode"));
+}
+
+#[test]
+fn lifetime_option_maximum_applies_without_an_explicit_adapter_cap() {
+    let adapter = fixture_adapter("soax_res");
+    assert_eq!(
+        adapter
+            .normalize_session_ttl(Duration::from_secs(604_800))
+            .expect("option maximum"),
+        Duration::from_secs(604_800),
+    );
+    assert!(
+        adapter
+            .normalize_session_ttl(Duration::from_secs(604_801))
+            .is_err()
+    );
+    assert!(
+        adapter
+            .normalize_session_ttl(Duration::from_secs(u64::MAX))
+            .is_err()
+    );
+    let minutes = fixture_adapter("decodo_res");
+    assert_eq!(
+        minutes
+            .normalize_session_ttl(Duration::from_secs(61))
+            .expect("round"),
+        Duration::from_secs(120),
+    );
+    assert!(
+        minutes
+            .normalize_session_ttl(Duration::from_secs(1440 * 60 + 1))
+            .is_err()
+    );
+}
+
+#[test]
+fn adapter_unknown_transport_names_are_not_coerced_to_http() {
+    let result = toml::from_str::<AdapterFile>(
+        "[[adapter]]\nid = \"x\"\nkind = \"static\"\nsubtype = \"isp\"\nscheme = \"httpps\"",
+    );
+    assert!(result.is_err());
 }

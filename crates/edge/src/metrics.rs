@@ -3,7 +3,10 @@
 //! addresses, users, hosts, session ids or egress addresses. The families are
 //! documented in `docs/metrics/edge.md`, and a test keeps the two in step.
 
+use std::collections::HashMap;
+
 use crate::breaker::Transitions;
+use prometheus::core::Collector as _;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts, Registry,
     TextEncoder,
@@ -16,6 +19,21 @@ const SERVICE: &str = "proxyx-edge";
 
 /// `Content-Type` of `/metrics`.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// Activity read from existing metric series, without creating new series.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub(crate) struct Activity {
+    pub active: u64,
+    pub total_connections: u64,
+    pub failures: u64,
+    pub latency_seconds: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ActivitySnapshot {
+    pub listeners: HashMap<String, Activity>,
+    pub pools: HashMap<String, Activity>,
+}
 
 pub struct Metrics {
     registry: Registry,
@@ -263,6 +281,80 @@ impl Metrics {
         }
     }
 
+    /// Read the same samples exposed by Prometheus. Missing series remain absent.
+    pub(crate) fn activity_snapshot(&self) -> ActivitySnapshot {
+        let mut snapshot = ActivitySnapshot::default();
+        for family in [
+            self.connections_total.collect(),
+            self.connections_open.collect(),
+            self.requests_total.collect(),
+            self.egress_connections_total.collect(),
+            self.connect_duration_seconds.collect(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let (entries, key) = match family.get_name() {
+                "proxyx_edge_connections_total"
+                | "proxyx_edge_connections_open"
+                | "proxyx_edge_requests_total" => (&mut snapshot.listeners, "listener"),
+                "proxyx_edge_egress_connections_total" | "proxyx_edge_connect_duration_seconds" => {
+                    (&mut snapshot.pools, "pool")
+                }
+                _ => continue,
+            };
+            for metric in family.get_metric() {
+                let label = |name| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .find(|label| label.get_name() == name)
+                        .map(|label| label.get_value())
+                };
+                let Some(name) = label(key) else {
+                    continue;
+                };
+                let activity = entries.entry(name.to_owned()).or_default();
+                let count = metric.get_counter().get_value() as u64;
+                match family.get_name() {
+                    "proxyx_edge_connections_total" => {
+                        activity.total_connections =
+                            activity.total_connections.saturating_add(count);
+                        if label("outcome") != Some("accepted") {
+                            activity.failures = activity.failures.saturating_add(count);
+                        }
+                    }
+                    "proxyx_edge_connections_open" => {
+                        activity.active =
+                            u64::try_from(metric.get_gauge().get_value() as i64).unwrap_or(0);
+                    }
+                    "proxyx_edge_requests_total" => {
+                        if label("result") != Some("ok") {
+                            activity.failures = activity.failures.saturating_add(count);
+                        }
+                    }
+                    "proxyx_edge_egress_connections_total" => {
+                        activity.total_connections =
+                            activity.total_connections.saturating_add(count);
+                        if label("outcome") != Some("ok") {
+                            activity.failures = activity.failures.saturating_add(count);
+                        }
+                    }
+                    "proxyx_edge_connect_duration_seconds" => {
+                        let histogram = metric.get_histogram();
+                        let count = histogram.get_sample_count();
+                        if count != 0 {
+                            activity.latency_seconds =
+                                Some(histogram.get_sample_sum() / count as f64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        snapshot
+    }
+
     /// Text exposition for `/metrics`; serve it as [`CONTENT_TYPE`]. No I/O.
     pub fn render(&self) -> String {
         let mut buf = Vec::with_capacity(4096);
@@ -390,6 +482,44 @@ mod tests {
                 assert!(!labels.contains(forbidden), "{name} has label {forbidden}");
             }
         }
+    }
+
+    #[test]
+    fn activity_snapshot_aggregates_existing_samples_without_registering_series() {
+        let m = Metrics::new();
+        m.connections_total
+            .with_label_values(&["busy", "accepted"])
+            .inc_by(2);
+        m.connections_total
+            .with_label_values(&["busy", "over_limit"])
+            .inc_by(3);
+        m.connections_open.with_label_values(&["busy"]).set(2);
+        m.requests_total
+            .with_label_values(&["busy", "http", "ok"])
+            .inc_by(4);
+        m.requests_total
+            .with_label_values(&["busy", "socks5", "connect_error"])
+            .inc_by(5);
+        for (outcome, count) in [("ok", 3), ("failed", 2), ("no_address", 1)] {
+            m.egress_connections_total
+                .with_label_values(&["local", outcome])
+                .inc_by(count);
+        }
+        let latency = m.connect_duration_seconds.with_label_values(&["local"]);
+        latency.observe(0.1);
+        latency.observe(0.3);
+        let before = m.render();
+        let snapshot = m.activity_snapshot();
+        let listener = &snapshot.listeners["busy"];
+        assert_eq!(listener.active, 2);
+        assert_eq!(listener.total_connections, 5);
+        assert_eq!(listener.failures, 8);
+        assert!(listener.latency_seconds.is_none());
+        let pool = &snapshot.pools["local"];
+        assert_eq!(pool.total_connections, 6);
+        assert_eq!(pool.failures, 3);
+        assert!((pool.latency_seconds.unwrap_or_default() - 0.2).abs() < f64::EPSILON);
+        assert_eq!(m.render(), before);
     }
 
     #[test]

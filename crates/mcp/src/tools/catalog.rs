@@ -321,6 +321,99 @@ pub fn build(config: &Config) -> Vec<ToolDef> {
             POOL,
         ),
         read(
+            "list_pool_sessions",
+            "Sticky pool sessions of an org",
+            "List the org's sticky pool sessions (sid, provider, region, exit IP, age, bytes) and the affinity counters (entries, hits, misses, evictions, rotations). Use rotate_pool_session to move one to a new unit.",
+            object(vec![("org", org_arg()), ("limit", limit_arg())], &[]),
+            POOL,
+        ),
+        read(
+            "generate_pool_endpoints",
+            "Generate gateway endpoints",
+            "Ask the gateway for a list of proxy endpoints for an org (HTTP CONNECT or SOCKS5), each with a proxy username built from the options (kind, country, city, provider, rotation, ttl). The URLs carry the username only: the org key is never sent or returned, so add it client-side as the proxy password (keep it out of this conversation). Options are checked with the gateway's username grammar before the request.",
+            object(
+                vec![
+                    ("org", org_arg()),
+                    (
+                        "gateway_host",
+                        string_max(
+                            "Public host name or IP clients use to reach the gateway.",
+                            253,
+                        ),
+                    ),
+                    (
+                        "http_port",
+                        integer(
+                            "HTTP CONNECT port clients use; required for style http.",
+                            1,
+                            65_535,
+                        ),
+                    ),
+                    (
+                        "socks5_port",
+                        integer(
+                            "SOCKS5 port clients use; required for style socks5.",
+                            1,
+                            65_535,
+                        ),
+                    ),
+                    (
+                        "style",
+                        choice("Endpoint protocol (default http).", &["http", "socks5"]),
+                    ),
+                    (
+                        "count",
+                        integer(
+                            "How many endpoints (default 10, at most the server's limits.max_rows).",
+                            1,
+                            10_000,
+                        ),
+                    ),
+                    (
+                        "kind",
+                        choice("Restrict to one kind of unit.", &["static", "rotating"]),
+                    ),
+                    (
+                        "country",
+                        pattern("Country, two lowercase letters.", "^[a-z]{2}$"),
+                    ),
+                    (
+                        "city",
+                        pattern("City slug; needs country.", "^[a-z0-9_]{1,48}$"),
+                    ),
+                    (
+                        "provider",
+                        pattern(
+                            "Provider id (an id containing `-` cannot be selected this way).",
+                            "^[a-z0-9_]{1,48}$",
+                        ),
+                    ),
+                    (
+                        "rotation",
+                        choice(
+                            "sticky (default): endpoints keep their unit; each: every tunnel gets its own.",
+                            &["sticky", "each"],
+                        ),
+                    ),
+                    (
+                        "ttl",
+                        pattern(
+                            "Lease idle time such as 30s, 5m, 2h, 1d.",
+                            "^[0-9]{1,6}[smhd]?$",
+                        ),
+                    ),
+                    (
+                        "strict",
+                        boolean(
+                            "Refuse instead of widening when the policy cannot honour an option (default false).",
+                        ),
+                    ),
+                ],
+                &["gateway_host"],
+            ),
+            POOL,
+        ),
+        read(
             "get_customer_upstream",
             "Org customer upstream",
             "The org's own upstream proxy (scheme, host, port, region, state, exit IP, whether it has a login). The login is never returned.",
@@ -703,7 +796,9 @@ pub fn build(config: &Config) -> Vec<ToolDef> {
 }
 
 fn mutations() -> Vec<ToolDef> {
-    use Capability::{Egress, Inventory, OrgBlocks, OrgKeys, OrgLimits, Policy, Sessions, Signals};
+    use Capability::{
+        Egress, Inventory, OrgBlocks, OrgKeys, OrgLimits, Policy, PoolSessions, Sessions, Signals,
+    };
     let session_id = || json!({"type": "string", "format": "uuid", "description": "Session id."});
     let mut egress_proxy_props = vec![
         ("org", org_arg()),
@@ -1102,6 +1197,28 @@ fn mutations() -> Vec<ToolDef> {
             Policy,
             POOL,
             Hints::DESTRUCTIVE,
+        ),
+        write(
+            "rotate_pool_session",
+            "Rotate a sticky pool session",
+            "Drop an org's sticky pool session so its next tunnel with that sid leases a new unit and exit IP. Open tunnels are not cut. The gateway limits this route to 60 requests a minute per org.",
+            object(
+                vec![
+                    ("org", pattern("Org id.", "^[a-z0-9_-]{1,64}$")),
+                    (
+                        "sid",
+                        pattern(
+                            "The sticky session id (see list_pool_sessions).",
+                            "^[a-z0-9_]{1,128}$",
+                        ),
+                    ),
+                    ("dry_run", dry_run_arg()),
+                ],
+                &["org", "sid"],
+            ),
+            PoolSessions,
+            POOL,
+            Hints::WRITE,
         ),
         write(
             "put_inventory",

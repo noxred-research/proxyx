@@ -3,8 +3,7 @@
 use std::net::IpAddr;
 
 use common::types::UpstreamEndpoint;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::DialError;
 
@@ -17,8 +16,8 @@ const ATYP_V4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_V6: u8 = 0x04;
 
-pub(crate) async fn connect(
-    stream: &mut TcpStream,
+pub(crate) async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     up: &UpstreamEndpoint,
     host: &str,
     port: u16,
@@ -54,7 +53,10 @@ pub(crate) async fn connect(
     read_reply(stream).await
 }
 
-async fn password_auth(stream: &mut TcpStream, up: &UpstreamEndpoint) -> Result<(), DialError> {
+async fn password_auth<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    up: &UpstreamEndpoint,
+) -> Result<(), DialError> {
     let user = up.username.expose().as_bytes();
     let pass = up.password.expose().as_bytes();
     let (Ok(user_len), Ok(pass_len)) = (u8::try_from(user.len()), u8::try_from(pass.len())) else {
@@ -107,7 +109,7 @@ fn request(host: &str, port: u16) -> Result<Vec<u8>, DialError> {
 
 /// Read the reply and the bound address that follows it, so the stream is
 /// left at the first tunnel byte.
-async fn read_reply(stream: &mut TcpStream) -> Result<(), DialError> {
+async fn read_reply<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(), DialError> {
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await.map_err(DialError::Io)?;
     if head[0] != VERSION {

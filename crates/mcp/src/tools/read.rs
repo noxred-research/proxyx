@@ -322,3 +322,147 @@ pub fn list_changes(ctx: &Ctx, args: &Args) -> ToolResult {
         .collect();
     Ok(json!({"changes": rows}))
 }
+
+pub async fn list_pool_sessions(ctx: &Ctx, args: &Args) -> ToolResult {
+    let pool = ctx.pool()?;
+    let org = ctx.org(args)?;
+    let body = pool.api.get(&["v1", "orgs", &org, "sessions"], &[]).await?;
+    let (sessions, truncated, total) = cap_items(&body, "sessions", ctx.rows(args.u64("limit")));
+    Ok(json!({
+        "org": org,
+        "sessions": sessions,
+        "total": total,
+        "truncated": truncated,
+        "affinity": body["affinity"],
+        "note": "Use rotate_pool_session (capability pool_sessions) to move a sid to a new unit.",
+    }))
+}
+
+/// The gateway proxy username for the options of `generate_pool_endpoints`, without a sticky
+/// key (the gateway adds one per endpoint).
+pub fn endpoint_username(args: &Args) -> String {
+    let mut name = String::from("px");
+    for (key, field) in [
+        ("kind", "kind"),
+        ("cc", "country"),
+        ("city", "city"),
+        ("prov", "provider"),
+    ] {
+        if let Some(value) = args.str(field) {
+            name.push_str(&format!("-{key}-{value}"));
+        }
+    }
+    if let Some(ttl) = args.str("ttl") {
+        name.push_str(&format!("-ttl-{ttl}"));
+    }
+    if args.str("rotation") == Some("each") {
+        name.push_str("-rot-each");
+    }
+    name
+}
+
+/// True when `text` carries a password in URL userinfo, or an org key.
+fn carries_credential(text: &str) -> bool {
+    let userinfo_password = text.split("://").skip(1).any(|rest| {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        authority.rsplit_once('@').is_some_and(|(info, _)| {
+            info.split_once(':')
+                .is_some_and(|(_, pass)| !pass.is_empty())
+        })
+    });
+    userinfo_password || text.contains("ak_")
+}
+
+fn strings_carry_credential(value: &Value) -> bool {
+    match value {
+        Value::String(text) => carries_credential(text),
+        Value::Array(items) => items.iter().any(strings_carry_credential),
+        Value::Object(map) => map.values().any(strings_carry_credential),
+        _ => false,
+    }
+}
+
+pub async fn generate_pool_endpoints(ctx: &Ctx, args: &Args) -> ToolResult {
+    let pool = ctx.pool()?;
+    let org = ctx.org(args)?;
+    let host = args.require_str("gateway_host")?;
+    if !super::manage::plain_host(host) {
+        return Err(ToolError::invalid(
+            "gateway_host must be a plain DNS name or IP literal, without scheme, port, path or login",
+        ));
+    }
+    let style = args.str("style").unwrap_or("http");
+    let port_field = if style == "socks5" {
+        "socks5_port"
+    } else {
+        "http_port"
+    };
+    if args.u64(port_field).is_none() {
+        return Err(ToolError::invalid(format!(
+            "style {style} needs the matching explicit port `{port_field}`: the gateway does not guess the port clients reach it on"
+        )));
+    }
+    let count = args.u64("count").unwrap_or(10);
+    let cap = ctx.cfg.limits.max_rows as u64;
+    if count == 0 || count > cap.min(10_000) {
+        return Err(ToolError::invalid(format!(
+            "count {count} is above this server's limit of {cap} (limits.max_rows); ask for fewer or page by calling again"
+        )));
+    }
+    // Check the options with the gateway's own username grammar before asking.
+    let username = endpoint_username(args);
+    if policy::InboundOptions::parse(&username).is_err() {
+        let mut verdict = crate::explain::explain_username(&username);
+        verdict["note"] = json!(
+            "the options would build this username, which the gateway grammar refuses; fix the options listed in issues"
+        );
+        return Err(ToolError::invalid(format!(
+            "these options do not form a valid proxy username ({username}): {}",
+            verdict["issues"]
+        ))
+        .with_detail(verdict));
+    }
+    let mut body = json!({
+        "gateway_host": host,
+        "style": style,
+        "format": "json",
+        "count": count,
+        "rotation": args.str("rotation").unwrap_or("sticky"),
+        "strict": args.bool("strict").unwrap_or(false),
+    });
+    for key in ["http_port", "socks5_port"] {
+        if let Some(port) = args.u64(key) {
+            body[key] = json!(port);
+        }
+    }
+    for key in ["kind", "country", "city", "provider", "ttl"] {
+        if let Some(value) = args.str(key) {
+            body[key] = json!(value);
+        }
+    }
+    // The org key is deliberately never part of this request: URLs are username-only.
+    let reply = pool
+        .api
+        .post(&["v1", "orgs", &org, "endpoints"], &body)
+        .await?;
+    let key = if reply["endpoints"].is_array() {
+        "endpoints"
+    } else {
+        "items"
+    };
+    let (endpoints, truncated, total) = cap_items(&reply, key, ctx.rows(Some(count)));
+    if strings_carry_credential(&Value::Array(endpoints.clone())) {
+        return Err(ToolError::internal(
+            "the gateway returned an endpoint that carries a credential; refusing to pass it on",
+        ));
+    }
+    Ok(json!({
+        "org": org,
+        "style": body["style"],
+        "username_pattern": username,
+        "total": total,
+        "truncated": truncated,
+        crate::redact::ENDPOINTS: endpoints,
+        "credential_note": "These endpoints carry the proxy username only. Add the org key as the proxy password in your client or secret store; do not paste it into this conversation.",
+    }))
+}

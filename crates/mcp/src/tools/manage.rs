@@ -57,10 +57,11 @@ pub enum Action {
     PutOrgPolicy,
     DeletePolicy,
     PutInventory,
+    RotatePoolSession,
 }
 
 impl Action {
-    pub const ALL: [Action; 18] = [
+    pub const ALL: [Action; 19] = [
         Action::CreateSession,
         Action::ExtendSession,
         Action::EndSession,
@@ -79,6 +80,7 @@ impl Action {
         Action::PutOrgPolicy,
         Action::DeletePolicy,
         Action::PutInventory,
+        Action::RotatePoolSession,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -101,6 +103,7 @@ impl Action {
             Action::PutOrgPolicy => "put_org_policy",
             Action::DeletePolicy => "delete_policy",
             Action::PutInventory => "put_inventory",
+            Action::RotatePoolSession => "rotate_pool_session",
         }
     }
 
@@ -124,6 +127,7 @@ impl Action {
             Action::ReportBlockSignal => Capability::Signals,
             Action::PutPolicy | Action::PutOrgPolicy | Action::DeletePolicy => Capability::Policy,
             Action::PutInventory => Capability::Inventory,
+            Action::RotatePoolSession => Capability::PoolSessions,
         }
     }
 
@@ -229,7 +233,7 @@ fn resolve_credential(
 
 // --- validation helpers --------------------------------------------------------------------------
 
-fn plain_host(host: &str) -> bool {
+pub(super) fn plain_host(host: &str) -> bool {
     host.parse::<IpAddr>().is_ok()
         || (!host.is_empty()
             && host.len() <= 253
@@ -398,6 +402,7 @@ pub async fn prepare(ctx: &Ctx, action: Action, args: &Args) -> Result<Prepared,
         Action::PutPolicy | Action::PutOrgPolicy => prepare_put_policy(ctx, action, args).await,
         Action::DeletePolicy => prepare_delete_policy(ctx, args).await,
         Action::PutInventory => prepare_inventory(ctx, args).await,
+        Action::RotatePoolSession => prepare_rotate(ctx, args).await,
     }
 }
 
@@ -758,6 +763,57 @@ fn region_ok(region: &str) -> bool {
                 && t.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         })
+}
+
+/// A pool sticky session id: `[a-z0-9_]{1,128}`.
+pub fn is_sid(text: &str) -> bool {
+    (1..=128).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+async fn prepare_rotate(ctx: &Ctx, args: &Args) -> Result<Prepared, ToolError> {
+    let pool = ctx.pool()?;
+    let org = org_required(ctx, args)?;
+    let sid = args.require_str("sid")?;
+    if !is_sid(sid) {
+        return Err(invalid(format!(
+            "{sid:?} is not a sticky session id ([a-z0-9_], 1 to 128)"
+        )));
+    }
+    let mut p = prepared(
+        json!({"org": org, "sid": sid}),
+        format!(
+            "drop the sticky pool session {sid} of org {org}, so its next tunnel leases a new unit"
+        ),
+        &["DELETE /v1/orgs/{org}/sessions/{sid}"],
+    );
+    // Show what is dropped. The listing is rate limited and best effort: a failure is a
+    // warning, not a reason to refuse.
+    match pool.api.get(&["v1", "orgs", &org, "sessions"], &[]).await {
+        Ok(listing) => {
+            match listing["sessions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s["sid"] == sid)
+            {
+                Some(found) => p.diff = json!({"drops": found}),
+                None => p.warnings.push(
+                    "no active session with this sid was listed: it may have expired already"
+                        .into(),
+                ),
+            }
+        }
+        Err(error) => p.warnings.push(format!(
+            "the session could not be looked up first ({error}); the drop is still valid"
+        )),
+    }
+    p.warnings.push(
+        "open tunnels on the session are not cut; the org's next tunnel with this sid gets a new unit and a new exit IP".into(),
+    );
+    Ok(p)
 }
 
 async fn prepare_lift(ctx: &Ctx, args: &Args) -> Result<Prepared, ToolError> {
@@ -1379,6 +1435,15 @@ async fn execute(ctx: &Ctx, action: Action, p: &Prepared, info: &CallInfo) -> To
                 ])
                 .await?;
             Ok(json!({"result": reply}))
+        }
+        Action::RotatePoolSession => {
+            let pool = ctx.pool()?;
+            let (org, sid) = (args.require_str("org")?, args.require_str("sid")?);
+            let reply = pool
+                .api
+                .delete(&["v1", "orgs", org, "sessions", sid])
+                .await?;
+            Ok(json!({"org": org, "sid": sid, "result": reply}))
         }
         Action::PutInventory => {
             let pool = ctx.pool()?;

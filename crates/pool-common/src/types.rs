@@ -421,6 +421,9 @@ impl SignalSource {
 pub enum UpstreamScheme {
     Http,
     Socks5,
+    /// HTTP proxy reached over TLS (an `https://` proxy endpoint): TLS to the
+    /// proxy, then `CONNECT` inside it. The proxy's certificate is verified.
+    Https,
     /// No upstream proxy: the machine's own address is the exit. The
     /// endpoint's `host` is a local IP literal; the dial binds that address
     /// as the source and connects straight to the target.

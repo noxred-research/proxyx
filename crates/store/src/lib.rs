@@ -26,10 +26,10 @@ pub use db::{
 };
 pub use error::{Result, StoreError};
 pub use hot::{
-    Admit, CostUsage, ExitIpClaim, FAILED_LEASE_MEMO_TTL, FairUse, Grant, Hot, LeaseLimits,
-    LeaseOutcome, LeaseRequest, MAX_RANK, RESERVATION_TTL, ReleaseRule, Reservation, Retired,
-    SampleJob, SessionRecord, Swept, TunnelRef, UNIT_PENALTY_BASE, UNIT_PENALTY_MAX, UnitCounts,
-    UnitLoad, UnitRecord, Verdict, sid_sticky,
+    Admit, AffinityRecord, AffinityStats, CostUsage, ExitIpClaim, FAILED_LEASE_MEMO_TTL, FairUse,
+    Grant, Hot, LeaseLimits, LeaseOutcome, LeaseRequest, MAX_RANK, RESERVATION_TTL, ReleaseRule,
+    Reservation, Retired, SampleJob, SessionRecord, Swept, TunnelRef, UNIT_PENALTY_BASE,
+    UNIT_PENALTY_MAX, UnitCounts, UnitLoad, UnitRecord, Verdict, sid_sticky,
 };
 pub use session_job::{Phase, SessionJob};
 pub use snapshot::{RebuildReport, Snapshot, rebuild_hot};

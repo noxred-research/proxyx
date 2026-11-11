@@ -15,7 +15,7 @@ use common::session::JOB_JITTER;
 use common::types::{Kind, OrgId, Partition, ProviderId};
 use parking_lot::Mutex;
 use policy::EffectivePolicy;
-use provider::MobileBoxClient;
+use provider::{MobileBoxClient, SessionMode};
 use store::loaded::Loaded;
 use store::{Db, Hot, InventoryRow};
 use time::OffsetDateTime;
@@ -158,14 +158,14 @@ pub(crate) fn keepalive_delay(policy: &EffectivePolicy) -> Duration {
     common::retry::jittered(policy.keepalive_interval(), JOB_JITTER)
 }
 
-/// Rotating partitions to keep filled: for every rotating adapter the
+/// Stable rotating partitions to keep filled: for every sticky adapter the
 /// policy allows, one partition per policy region.
 pub(crate) fn rotating_partitions(loaded: &Loaded) -> Vec<(Partition, EffectivePolicy)> {
     let mut out = Vec::new();
     for adapter in loaded
         .adapters
         .iter()
-        .filter(|a| a.kind() == Kind::Rotating)
+        .filter(|a| a.kind() == Kind::Rotating && a.session_mode() == SessionMode::Sticky)
     {
         let policy = policy_for(loaded, adapter.id());
         let listed = policy.providers.is_empty() || policy.providers.contains(adapter.id());

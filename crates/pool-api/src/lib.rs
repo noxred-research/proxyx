@@ -33,6 +33,7 @@ mod orgs;
 mod policies;
 mod probe;
 mod react;
+mod sessions;
 mod signals;
 mod state;
 mod upstream;
@@ -83,6 +84,16 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// The `/v1` router.
 fn router(state: Arc<ApiState>) -> Router {
     let admin = Router::new()
+        .merge(
+            Router::new()
+                .route("/v1/orgs/{org}/endpoints", post(sessions::generate))
+                .route("/v1/orgs/{org}/sessions", get(sessions::list))
+                .route("/v1/orgs/{org}/sessions/{sid}", delete(sessions::rotate))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    sessions::guard,
+                )),
+        )
         .route("/v1/inventory", get(inventory::list))
         .route("/v1/inventory/replacements", get(inventory::replacements))
         .route("/v1/inventory/{provider}", put(inventory::put))

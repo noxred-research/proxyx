@@ -23,7 +23,7 @@ fn bare_prefix_means_no_options() {
 #[test]
 fn every_key_parses() {
     let o = InboundOptions::parse(
-        "px-kind-rotating-cc-fr-city-paris-prov-oxy_res-ttl-5m-sid-scan_42-rot-sticky",
+        "px-kind-rotating-cc-fr-city-paris-prov-oxy_res-ttl-5m-sid-scan_42-rot-sticky-strict-true",
     )
     .expect("valid");
     assert_eq!(o.kind, Some(Kind::Rotating));
@@ -32,6 +32,7 @@ fn every_key_parses() {
     assert_eq!(o.ttl, Some(Duration::from_secs(300)));
     assert_eq!(o.sid.as_deref(), Some("scan_42"));
     assert_eq!(o.rotation, Some(Rotation::Sticky));
+    assert_eq!(o.strict, Some(true));
 }
 
 #[test]
@@ -40,6 +41,31 @@ fn proposal_example_and_key_order_independence() {
     let b = InboundOptions::parse("px-sid-scan42-cc-fr-kind-rotating").expect("valid");
     assert_eq!(a, b);
     assert_eq!(a.region, Some(region("fr")));
+}
+
+#[test]
+fn strict_accepts_only_explicit_lowercase_booleans() {
+    for (value, want) in [("true", true), ("false", false)] {
+        let o = InboundOptions::parse(&format!("px-strict-{value}")).expect("valid");
+        assert_eq!(o.strict, Some(want));
+    }
+    for username in [
+        "px-strict",
+        "px-strict-",
+        "px-strict-1",
+        "px-strict-0",
+        "px-strict-yes",
+        "px-strict-TRUE",
+        "px-strict-False",
+        "px-strict-true-strict-false",
+        "px-strict-false-strict-false",
+    ] {
+        assert_eq!(
+            InboundOptions::parse(username),
+            Err(Cause::OptionDenied),
+            "{username}"
+        );
+    }
 }
 
 #[test]
@@ -173,6 +199,7 @@ fn no_options_leaves_the_whole_policy() {
             ttl: Duration::from_secs(600),
             sticky: StickyKeySource::Scope(StickyScope::Target),
             rotation: Rotation::Sticky,
+            strict: false,
         })
     );
 }
@@ -260,4 +287,18 @@ fn sid_and_rotation_set_the_lease_key() {
     let r = p.narrow(&opts("px-rot-each")).expect("narrow");
     assert_eq!(r.sticky, StickyKeySource::Scope(StickyScope::Org));
     assert_eq!(r.rotation, Rotation::Each);
+}
+
+#[test]
+fn strict_is_forwarded_and_defaults_to_false() {
+    let p = policy("");
+    for (username, want) in [
+        ("px", false),
+        ("px-strict-true", true),
+        ("px-strict-false", false),
+        ("px-rot-each-strict-true", true),
+        ("px-sid-scan42-strict-true", true),
+    ] {
+        assert_eq!(narrowed(&p, username, |r| r.strict), Ok(want), "{username}");
+    }
 }

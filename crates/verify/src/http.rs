@@ -55,6 +55,13 @@ pub(crate) async fn upstream_client(
     let checked = public_address(up, timeout).await?;
     let proxy = Proxy::all(proxy_url(up, checked).ok_or(ClientError::BadUpstream)?)?;
     let mut builder = base_builder(timeout).proxy(proxy);
+    if up.scheme == UpstreamScheme::Https
+        && let Some(address) = checked
+    {
+        // Keep the certificate's DNS name in the URL while pinning the socket
+        // to the address that passed the public-destination check.
+        builder = builder.resolve(&up.host, SocketAddr::new(address, up.port));
+    }
     if fresh_connections {
         builder = builder.pool_max_idle_per_host(0);
     }
@@ -161,11 +168,13 @@ async fn public_address(
 fn proxy_url(up: &UpstreamEndpoint, address: Option<IpAddr>) -> Option<Url> {
     let scheme = match up.scheme {
         UpstreamScheme::Http => "http",
+        UpstreamScheme::Https => "https",
         UpstreamScheme::Socks5 => "socks5h",
         // no proxy to point at: `local_client` handles it
         UpstreamScheme::Local => return None,
     };
     let mut url = Url::parse(&format!("{scheme}://localhost")).ok()?;
+    let address = address.filter(|_| up.scheme != UpstreamScheme::Https);
     // An IPv6 literal is stored without brackets; the url needs it as an IP host.
     match address.map_or_else(|| up.host.parse::<IpAddr>(), Ok) {
         Ok(ip) => url.set_ip_host(ip).ok()?,
@@ -272,6 +281,16 @@ mod tests {
         let pinned = proxy_url(&up, Some("8.8.8.8".parse().expect("ip"))).expect("url");
         assert_eq!(pinned.host_str(), Some("8.8.8.8"));
         assert_eq!(pinned.username(), named.username());
+    }
+
+    #[tokio::test]
+    async fn an_https_proxy_keeps_its_certificate_name_when_its_socket_address_is_pinned() {
+        let mut up = upstream(&Stub::hanging());
+        up.scheme = UpstreamScheme::Https;
+        up.host = "proxy.customer.example".to_owned();
+        let url = proxy_url(&up, Some("8.8.8.8".parse().expect("ip"))).expect("url");
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("proxy.customer.example"));
     }
 }
 

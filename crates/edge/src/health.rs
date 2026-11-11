@@ -78,10 +78,37 @@ pub async fn round(shared: &Arc<Shared>, state: &Arc<State>) {
         .map(|(host, port)| Target { host, port });
     let budget = state.cfg.health.timeout;
     let mut set = JoinSet::new();
-    for parent in state.parents.all() {
+    for (index, parent) in state.parents.all().iter().enumerate() {
+        let root_used = state.cfg.server.default_route != crate::config::Route::Direct
+            || state.cfg.routes.iter().any(|route| {
+                route.chain.is_none()
+                    && route.route != crate::config::Route::Direct
+                    && (route.parents.is_empty() || route.parents.contains(&parent.name))
+            });
+        let root_active = root_used
+            && (state.selector.cfg.strategy != crate::config::Strategy::Latency
+                || !state.selector.idle());
+        let referenced = state
+            .chains
+            .iter()
+            .any(|chain| chain.hops.iter().any(|hop| hop.parents.contains(&index)));
+        let active_chain = state.chains.iter().any(|chain| {
+            chain.hops.iter().any(|hop| {
+                hop.parents.contains(&index)
+                    && (hop.selector.cfg.strategy != crate::config::Strategy::Latency
+                        || !hop.selector.idle())
+            })
+        });
+        if !root_active && (root_used || referenced) && !active_chain {
+            continue;
+        }
         let (state, parent, target) = (Arc::clone(state), Arc::clone(parent), target.clone());
         set.spawn(async move {
+            let started = tokio::time::Instant::now();
             let r = connect::probe_parent(&state, &parent, target.as_ref(), budget).await;
+            if r.is_ok() {
+                parent.record_latency(started.elapsed());
+            }
             (parent, r)
         });
     }
@@ -98,6 +125,42 @@ pub async fn round(shared: &Arc<Shared>, state: &Arc<State>) {
             }
             Some(true) => tracing::info!(parent = %parent.name, "parent is healthy again"),
             None => {}
+        }
+    }
+    let mut chains = JoinSet::new();
+    for (index, chain) in state.chains.iter().enumerate() {
+        if chain.probe.is_none()
+            || (chain
+                .hops
+                .iter()
+                .any(|hop| hop.selector.cfg.strategy == crate::config::Strategy::Latency)
+                && chain.hops.iter().all(|hop| hop.selector.idle()))
+        {
+            continue;
+        }
+        let state = Arc::clone(state);
+        chains.spawn(async move {
+            let result = connect::probe_chain(&state, &state.chains[index], budget).await;
+            (index, result)
+        });
+    }
+    while let Some(done) = chains.join_next().await {
+        let Ok((index, result)) = done else {
+            continue;
+        };
+        let chain = &state.chains[index];
+        let ok = result.is_ok();
+        m.health_checks_total
+            .with_label_values(&["chain", if ok { "ok" } else { "failed" }])
+            .inc();
+        if let Some(healthy) = chain.health.observe(ok) {
+            tracing::info!(chain=%chain.name, healthy, "chain health changed");
+        }
+    }
+    state.selector.refresh(&state.parents, &[]);
+    for chain in &state.chains {
+        for hop in &chain.hops {
+            hop.selector.refresh(&state.parents, &hop.parents);
         }
     }
 }

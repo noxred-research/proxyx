@@ -1,0 +1,46 @@
+# Bright Data generic residential zone. Verified 2026-11-11:
+# https://docs.brightdata.com/proxy-networks/config-options
+# Store the FULL dashboard-generated brd-customer-<customer>-zone-<zone> username
+# in brightdata_zone_user. Do not guess a product-specific account prefix.
+# Verify gateway host, port and enabled targeting against your zone's examples:
+# https://brightdata.com/cp/zones/proxy_examples
+# `-const` binds the session peer; unavailable peers return 502, not a new IP.
+# No duration parameter is documented here; max_session_minutes is a local cap,
+# not a promise that the provider retains a live peer for that entire duration.
+
+[[adapter]]
+id = "brightdata_zone"
+kind = "rotating"
+subtype = "residential"
+scheme = "http"
+host = "brd.superproxy.io"
+port = 33335
+user_file = "brightdata_zone_user"
+pass_file = "brightdata_zone_pass"
+user = "{base_user}{opts}"
+pass = "{base_pass}"
+max_session_minutes = 30
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-country-{v}"
+case = "lower"
+
+[[adapter.option]]
+name = "city"
+to = "user"
+frag = "-city-{v}"
+charset = "alpha"
+case = "lower"
+
+[[adapter.option]]
+name = "sid"
+to = "user"
+frag = "-session-{v}"
+max_len = 32
+
+[[adapter.option]]
+name = "strict"
+to = "user"
+frag = "-const"

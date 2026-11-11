@@ -56,6 +56,9 @@ pub struct AdapterConfig {
     pub allowed_ports: Vec<u16>,
     pub max_conns_per_ip: Option<u32>,
     pub max_session_minutes: Option<u32>,
+    /// Whether the provider pins an exit or rotates it on every request.
+    #[serde(default)]
+    pub session_mode: SessionMode,
     /// Provider echo endpoint that returns the exit IP.
     pub echo_url: Option<String>,
     /// The upstream address of every entry must be public routable
@@ -78,6 +81,15 @@ fn default_pass() -> String {
     "{base_pass}{opts}".to_owned()
 }
 
+/// Provider exit selection behavior, independent of the local lease lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    #[default]
+    Sticky,
+    PerRequest,
+}
+
 /// What an option carries. A closed list: each key has one source in the
 /// lease spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -89,7 +101,7 @@ pub enum OptionKey {
     City,
     /// Session id (rotating).
     Sid,
-    /// Session duration (rotating), from `ttl_minutes`.
+    /// Session duration (rotating), from the requested `Duration`.
     Ttl,
     /// Strict mode flag (rotating): written only when the lease is strict.
     Strict,
@@ -130,6 +142,8 @@ pub enum Charset {
     Alnum,
     /// Letters, digits and `_`.
     Word,
+    /// ASCII letters and `_`, as required by Webshare city targeting.
+    AlphaUnderscore,
     /// Hex digits, `.` and `:` (an IP literal).
     Ip,
 }
@@ -141,6 +155,7 @@ impl Charset {
             Charset::Alpha => c.is_ascii_alphabetic(),
             Charset::Alnum => c.is_ascii_alphanumeric(),
             Charset::Word => c.is_ascii_alphanumeric() || c == '_',
+            Charset::AlphaUnderscore => c.is_ascii_alphabetic() || c == '_',
             Charset::Ip => c.is_ascii_hexdigit() || c == '.' || c == ':',
         }
     }
@@ -151,6 +166,7 @@ impl Charset {
             Charset::Alpha => "alpha",
             Charset::Alnum => "alnum",
             Charset::Word => "word",
+            Charset::AlphaUnderscore => "alpha_underscore",
             Charset::Ip => "ip",
         }
     }
@@ -166,7 +182,7 @@ pub enum Case {
     Lower,
 }
 
-/// Unit of a `ttl` option. The lease asks in minutes; `sec` converts.
+/// Unit of a `ttl` option. Durations round up to a whole provider unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Unit {

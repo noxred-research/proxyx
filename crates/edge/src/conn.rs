@@ -11,7 +11,6 @@ use std::time::SystemTime;
 
 use common::types::Target;
 use parking_lot::RwLock;
-use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -428,7 +427,9 @@ impl Held {
 
 /// A request that passed every check, with its upstream connection.
 pub struct Opened {
-    pub stream: TcpStream,
+    pub stream: dial::ProxyStream,
+    pub bound_addr: Option<SocketAddr>,
+    pub chain: Vec<String>,
     pub held: Held,
     pub rule: Option<String>,
     pub pool: Option<String>,
@@ -450,6 +451,83 @@ pub struct Checked {
     /// Resolved destination addresses (never empty).
     pub ips: Vec<IpAddr>,
     pub rule: Option<String>,
+}
+
+/// Evaluate an early lifecycle stage without destination data or any connection side effect.
+pub fn check_stage(
+    shared: &Arc<Shared>,
+    state: &Arc<State>,
+    listener: &ListenerRt,
+    client: SocketAddr,
+    login: Option<&Login>,
+    stage: crate::acl::RuleStage,
+    proto: Proto,
+) -> Result<(), Refusal> {
+    if !matches!(
+        stage,
+        crate::acl::RuleStage::PreNegotiation | crate::acl::RuleStage::PostAuth
+    ) {
+        return Err(Refusal::of(RefusalKind::Internal));
+    }
+    if !state.rules.has_stage(stage) {
+        return Ok(());
+    }
+    let req = Req {
+        src: client.ip(),
+        listener: &listener.cfg.name,
+        proto,
+        method: "",
+        host: "",
+        port: 0,
+        dst_ips: &[],
+        user: login.map(|l| l.user.name.as_str()),
+        groups: login.map_or(&[], |l| l.user.groups.as_slice()),
+        clock: Clock::at(SystemTime::now(), state.utc_offset_secs),
+    };
+    let verdict = state.rules.evaluate_stage(stage, &req);
+    enforce_verdict(shared, &verdict)
+}
+
+fn enforce_verdict(shared: &Shared, verdict: &crate::acl::Verdict) -> Result<(), Refusal> {
+    let allowed = verdict.action == Action::Allow;
+    shared
+        .metrics
+        .acl_decisions_total
+        .with_label_values(&[if allowed { "allow" } else { "deny" }])
+        .inc();
+    if allowed {
+        Ok(())
+    } else {
+        Err(Refusal {
+            kind: RefusalKind::Forbidden,
+            rule: verdict.rule.clone(),
+        })
+    }
+}
+
+fn check_destination_stage(
+    c: &ReqCtx<'_>,
+    checked: &mut Checked,
+    stage: crate::acl::RuleStage,
+) -> Result<(), Refusal> {
+    if !c.state.rules.has_stage(stage) {
+        return Ok(());
+    }
+    let verdict = c.state.rules.evaluate_stage(stage, &c.req(&checked.ips));
+    enforce_verdict(c.shared, &verdict)?;
+    if !verdict.allow_internal
+        && std::iter::once(c.host.to_owned())
+            .chain(checked.ips.iter().map(ToString::to_string))
+            .any(|host| dial::is_denied_destination(&Target { host, port: c.port }))
+    {
+        c.shared.metrics.destination_denied_total.inc();
+        return Err(Refusal {
+            kind: RefusalKind::DestinationDenied,
+            rule: verdict.rule,
+        });
+    }
+    checked.rule = verdict.rule;
+    Ok(())
 }
 
 /// Resolve the destination, run the access rules and refuse private and
@@ -501,20 +579,19 @@ pub async fn check(c: &ReqCtx<'_>) -> Result<Checked, Refusal> {
         metrics.destination_denied_total.inc();
         return Err(deny(RefusalKind::DestinationDenied));
     }
-    Ok(Checked { ips, rule })
+    let mut checked = Checked { ips, rule };
+    if c.proto == Proto::Udp {
+        check_destination_stage(c, &mut checked, crate::acl::RuleStage::Udp)?;
+    }
+    Ok(checked)
 }
 
-/// Run the pipeline up to and including the connect.
-pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
-    let state = c.state;
+fn admit(c: &ReqCtx<'_>, ips: &[IpAddr], rule: Option<&str>) -> Result<Held, Refusal> {
     let metrics = &c.shared.metrics;
-    let Checked { ips, rule } = check(c).await?;
     let deny = |kind| Refusal {
         kind,
-        rule: rule.clone(),
+        rule: rule.map(str::to_owned),
     };
-
-    // Limits.
     let user_slot = match c
         .login
         .and_then(|l| l.user.max_connections.map(|m| (&l.user.name, m)))
@@ -534,7 +611,7 @@ pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
         ),
         None => None,
     };
-    let admission = state.limits.admit(&c.req(&ips)).map_err(|r| {
+    let admission = c.state.limits.admit(&c.req(ips)).map_err(|r| {
         let (kind, label) = match r {
             Reject::Connections => (RefusalKind::LimitConnections, "limit_connections"),
             Reject::Rate => (RefusalKind::LimitRate, "limit_rate"),
@@ -545,17 +622,41 @@ pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
             .inc();
         deny(kind)
     })?;
+    Ok(Held {
+        admission,
+        lease: None,
+        _user_slot: user_slot,
+    })
+}
+
+/// Run the pipeline up to and including the connect.
+pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
+    open_pinned(c, None).await
+}
+
+/// HTTP keep-alive requests retain the parent chain selected for the client connection.
+pub async fn open_pinned(c: &ReqCtx<'_>, pinned: Option<&[String]>) -> Result<Opened, Refusal> {
+    let state = c.state;
+    let metrics = &c.shared.metrics;
+    let Checked { ips, rule } = check(c).await?;
+    let deny = |kind| Refusal {
+        kind,
+        rule: rule.clone(),
+    };
+
+    let mut held = admit(c, &ips, rule.as_deref())?;
 
     // Egress and route.
     let req = c.req(&ips);
     let pick = state
         .egress_for(&req, c.login, c.listener)
         .map_err(|EgressError::UnknownPool(_)| deny(RefusalKind::OptionDenied))?;
-    let (route, parents) = state.route_for(&req);
+    let (route, parents, chain) = state.route_for(&req);
     let key = PickKey {
         session: c.login.and_then(|l| l.options.sid.as_deref()),
         user: c.user(),
         client: c.client.ip(),
+        target_host: c.host,
     };
     let plan = Plan {
         host: c.host,
@@ -566,6 +667,8 @@ pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
         key,
         route,
         parents,
+        chain,
+        pinned,
         mode: c.mode,
         client: c.client,
         reuse: c.reuse,
@@ -580,22 +683,122 @@ pub async fn open(c: &ReqCtx<'_>) -> Result<Opened, Refusal> {
     .await
     .map_err(|e| deny(RefusalKind::Connect(e)))?;
     let egress = upstream.local_ip();
+    held.lease = upstream.lease;
     Ok(Opened {
         egress,
+        bound_addr: upstream.bound_addr,
+        chain: upstream.chain,
         peer: upstream.peer,
         parent: upstream.parent,
         http_proxy: upstream.http_proxy,
         reuse_key: upstream.reuse_key,
         reused: upstream.reused,
         stream: upstream.stream,
-        held: Held {
-            admission,
-            lease: upstream.lease,
-            _user_slot: user_slot,
-        },
+        held,
         rule,
         pool: pick.pool.map(|p| p.name().to_owned()),
     })
+}
+
+/// A checked BIND listener. Its guards remain held until the reverse tunnel ends.
+pub struct Bound {
+    pub listener: tokio::net::TcpListener,
+    pub held: Held,
+    pub rule: Option<String>,
+    pub pool: Option<String>,
+    pub egress: Option<IpAddr>,
+    /// Pinned addresses permitted to connect to the BIND listener.
+    pub expected_ips: Vec<IpAddr>,
+}
+
+/// Check and reserve a BIND request without connecting to the requested peer.
+pub async fn bind_prepare(c: &ReqCtx<'_>) -> Result<Bound, Refusal> {
+    let mut checked = check(c).await?;
+    for ip in &mut checked.ips {
+        if let IpAddr::V6(v6) = ip
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            *ip = IpAddr::V4(v4);
+        }
+    }
+    check_destination_stage(c, &mut checked, crate::acl::RuleStage::Bind)?;
+    let deny = |kind| Refusal {
+        kind,
+        rule: checked.rule.clone(),
+    };
+    if checked.ips.iter().any(|ip| ip.is_unspecified()) {
+        return Err(deny(RefusalKind::DestinationDenied));
+    }
+    let req = c.req(&checked.ips);
+    if c.state.route_for(&req).0 != crate::config::Route::Direct {
+        return Err(deny(RefusalKind::OptionDenied));
+    }
+    let mut held = admit(c, &checked.ips, checked.rule.as_deref())?;
+    let pick = c
+        .state
+        .egress_for(&req, c.login, c.listener)
+        .map_err(|EgressError::UnknownPool(_)| deny(RefusalKind::OptionDenied))?;
+    let key = PickKey {
+        session: c.login.and_then(|l| l.options.sid.as_deref()),
+        user: c.user(),
+        client: c.client.ip(),
+        target_host: c.host,
+    };
+    let mut last = ConnectError::NoAddressOfFamily;
+    for peer in &checked.ips {
+        let family = crate::egress::Family::of(*peer);
+        let mut lease = match &pick.pool {
+            Some(pool) => match pool.pick(family, &key, pick.index, &[]) {
+                Ok(lease) => Some(lease),
+                Err(crate::egress::PickError::BadIndex) => {
+                    return Err(deny(RefusalKind::Connect(ConnectError::BadIndex)));
+                }
+                Err(crate::egress::PickError::NoAddressOfFamily) => continue,
+                Err(crate::egress::PickError::Unavailable) => {
+                    last = ConnectError::EgressUnavailable;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let local = lease.as_ref().map_or_else(
+            || {
+                let configured = c.listener.cfg.listen.ip();
+                if crate::egress::Family::of(configured) == family {
+                    configured
+                } else {
+                    match family {
+                        crate::egress::Family::V4 => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        crate::egress::Family::V6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    }
+                }
+            },
+            Lease::ip,
+        );
+        match tokio::net::TcpListener::bind(SocketAddr::new(local, 0)).await {
+            Ok(listener) => {
+                if let Some(lease) = &mut lease {
+                    lease.report(true);
+                }
+                held.lease = lease;
+                return Ok(Bound {
+                    listener,
+                    held,
+                    rule: checked.rule,
+                    pool: pick.pool.as_ref().map(|p| p.name().to_owned()),
+                    egress: (!local.is_unspecified()).then_some(local),
+                    expected_ips: checked.ips,
+                });
+            }
+            Err(error) => {
+                if let Some(lease) = &mut lease {
+                    lease.report(false);
+                }
+                last = ConnectError::Connect(error);
+            }
+        }
+    }
+    Err(deny(RefusalKind::Connect(last)))
 }
 
 async fn resolve(c: &ReqCtx<'_>) -> Result<Vec<IpAddr>, Refusal> {

@@ -11,15 +11,17 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use ipnet::IpNet;
 use nix::ifaddrs::getifaddrs;
 use nix::net::if_::InterfaceFlags;
+use parking_lot::Mutex;
 use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::breaker::{Breaker, BreakerState, HealthTracker, Transitions};
-use crate::config::{BreakerConfig, PoolConfig, Strategy};
+use crate::config::{BreakerConfig, HashKey, PoolConfig, Strategy};
 
 /// IP family of a destination address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,6 +50,8 @@ pub struct Addr {
     breaker: Option<Breaker>,
     /// Is the address still assigned to this host (the active check)?
     health: HealthTracker,
+    backup: bool,
+    stats: Mutex<AddrStats>,
 }
 
 impl Addr {
@@ -60,11 +64,46 @@ impl Addr {
     }
 }
 
+#[derive(Debug, Default)]
+struct AddrStats {
+    attempts: u64,
+    failures: u64,
+    latency_total: Duration,
+    latency_samples: u32,
+}
+
+impl AddrStats {
+    fn latency(&self) -> Option<Duration> {
+        self.latency_total.checked_div(self.latency_samples)
+    }
+
+    fn record_latency(&mut self, elapsed: Duration) {
+        if self.latency_samples < u32::MAX {
+            self.latency_total = self.latency_total.saturating_add(elapsed);
+            self.latency_samples += 1;
+        }
+    }
+}
+
+/// One address's current health and completed-dial statistics.
+#[derive(Debug, Clone)]
+pub struct AddrSnapshot {
+    pub ip: IpAddr,
+    pub backup: bool,
+    pub healthy: bool,
+    pub state: BreakerState,
+    pub active: usize,
+    pub attempts: u64,
+    pub failures: u64,
+    pub latency: Option<Duration>,
+}
+
 /// An address in use. Dropping it closes the count of open connections.
 #[derive(Debug)]
 pub struct Lease {
     addr: Arc<Addr>,
     pool: Arc<str>,
+    pool_active: Arc<AtomicUsize>,
     settled: bool,
 }
 
@@ -72,12 +111,23 @@ impl Lease {
     /// The result of the connect from this address: a bind or routing failure
     /// is the address's, anything else the destination's and not reported.
     pub fn report(&mut self, ok: bool) {
-        if !self.settled
-            && let Some(b) = &self.addr.breaker
-        {
-            b.record(ok);
+        if !self.settled {
+            let mut stats = self.addr.stats.lock();
+            stats.attempts = stats.attempts.saturating_add(1);
+            if !ok {
+                stats.failures = stats.failures.saturating_add(1);
+            }
+            drop(stats);
+            if let Some(b) = &self.addr.breaker {
+                b.record(ok);
+            }
         }
         self.settled = true;
+    }
+
+    /// Record a successful dial's elapsed time for latency selection.
+    pub fn report_latency(&self, elapsed: Duration) {
+        self.addr.stats.lock().record_latency(elapsed);
     }
 
     pub fn ip(&self) -> IpAddr {
@@ -97,6 +147,7 @@ impl Drop for Lease {
             b.cancel();
         }
         self.addr.open.fetch_sub(1, Ordering::Relaxed);
+        self.pool_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -106,12 +157,65 @@ pub struct PickKey<'a> {
     pub session: Option<&'a str>,
     pub user: Option<&'a str>,
     pub client: IpAddr,
+    /// Destination hostname without its port; used only by host affinity.
+    pub target_host: &'a str,
 }
 
 impl PickKey<'_> {
     /// The key as text, for filing idle connections.
     pub fn bytes_for_reuse(&self) -> Vec<u8> {
         self.bytes()
+    }
+
+    /// Hash an explicit request attribute without allocating.
+    ///
+    /// Missing users or session IDs fall back to the client address, rather
+    /// than putting all unauthenticated requests on one address.
+    pub fn hash_bytes(&self, key: HashKey) -> [u8; 32] {
+        let mut h = Sha256::new();
+        match key {
+            HashKey::ClientIp => self.hash_client(&mut h),
+            HashKey::TargetHost => {
+                h.update(b"h:");
+                // DNS names are case-insensitive; a trailing root dot is optional.
+                for b in self.target_host.trim_end_matches('.').bytes() {
+                    h.update([b.to_ascii_lowercase()]);
+                }
+            }
+            HashKey::User => match self.user {
+                Some(user) => {
+                    h.update(b"u:");
+                    h.update(user.as_bytes());
+                }
+                None => self.hash_client(&mut h),
+            },
+            HashKey::SessionId => match self.session {
+                Some(session) => {
+                    h.update(b"s:");
+                    h.update(session.as_bytes());
+                }
+                None => self.hash_client(&mut h),
+            },
+        }
+        h.finalize().into()
+    }
+
+    fn hash_client(&self, h: &mut Sha256) {
+        h.update(b"c:");
+        match self.client {
+            IpAddr::V4(ip) => h.update(ip.octets()),
+            IpAddr::V6(ip) => h.update(ip.octets()),
+        }
+    }
+
+    fn sticky_hash(&self) -> [u8; 32] {
+        self.hash_bytes(if self.session.is_some() {
+            HashKey::SessionId
+        } else if self.user.is_some() {
+            HashKey::User
+        } else {
+            HashKey::ClientIp
+        })
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -145,6 +249,11 @@ pub struct Pool {
     prefix_health: HealthTracker,
     strategy: Strategy,
     rr: AtomicUsize,
+    hash_key: HashKey,
+    latency_tolerance: Duration,
+    race_width: usize,
+    latency_choice: Mutex<[Option<IpAddr>; 2]>,
+    active: Arc<AtomicUsize>,
 }
 
 impl Pool {
@@ -166,6 +275,8 @@ impl Pool {
                         open: AtomicUsize::new(0),
                         breaker: Some(Breaker::new(breaker, tr.clone())),
                         health: HealthTracker::new(1, 1),
+                        backup: false,
+                        stats: Mutex::default(),
                     })
                 })
                 .collect(),
@@ -173,6 +284,11 @@ impl Pool {
             prefix_health: HealthTracker::new(1, 1),
             strategy,
             rr: AtomicUsize::new(0),
+            hash_key: HashKey::ClientIp,
+            latency_tolerance: Duration::from_millis(50),
+            race_width: 2,
+            latency_choice: Mutex::new([None, None]),
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -239,11 +355,20 @@ impl Pool {
             at(n)
         } else {
             let offset = match self.strategy {
-                Strategy::First => 1,
-                Strategy::RoundRobin => self.rr.fetch_add(1, Ordering::Relaxed) as u128 + 1,
-                Strategy::Sticky => {
-                    let d = Sha256::digest(key.bytes());
-                    u128::from_be_bytes(d[..16].try_into().unwrap_or([0; 16]))
+                Strategy::First | Strategy::Fifo => 1,
+                Strategy::RoundRobin | Strategy::Race | Strategy::Latency => {
+                    self.rr.fetch_add(1, Ordering::Relaxed) as u128 + 1
+                }
+                Strategy::Sticky
+                | Strategy::Hash
+                | Strategy::Userhash
+                | Strategy::Sourcehash
+                | Strategy::Carp => {
+                    let d = self.affinity_key(key);
+                    u128::from_be_bytes([
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11],
+                        d[12], d[13], d[14], d[15],
+                    ])
                 }
                 Strategy::Random | Strategy::LeastConnections => rand::thread_rng().r#gen::<u128>(),
             };
@@ -261,10 +386,14 @@ impl Pool {
             open: AtomicUsize::new(1),
             breaker: None,
             health: HealthTracker::new(1, 1),
+            backup: false,
+            stats: Mutex::default(),
         });
+        self.active.fetch_add(1, Ordering::Relaxed);
         Ok(Lease {
             addr,
             pool: Arc::clone(&self.name),
+            pool_active: Arc::clone(&self.active),
             settled: true,
         })
     }
@@ -276,6 +405,17 @@ impl Pool {
         breaker: BreakerConfig,
         tr: &Transitions,
     ) -> Result<Self, String> {
+        let mut breaker = breaker;
+        if let Some(max_fails) = c.max_fails {
+            breaker.failure_threshold = max_fails;
+        }
+        if let Some(fail_timeout) = c.fail_timeout {
+            breaker.open_duration = fail_timeout;
+        }
+        breaker.check(&format!("pool {}", c.name))?;
+        if c.race_width == 0 {
+            return Err(format!("pool {}: race_width must be above zero", c.name));
+        }
         let exclude: Vec<IpNet> = c
             .exclude
             .iter()
@@ -300,6 +440,13 @@ impl Pool {
                 }
             }
         }
+        let primary_count = ips.len();
+        for ip in &c.backup_addresses {
+            if ips.contains(ip) {
+                return Err(format!("pool {}: duplicate backup address {ip}", c.name));
+            }
+            ips.push(*ip);
+        }
         let prefixes: Vec<IpNet> = c
             .prefixes
             .iter()
@@ -309,6 +456,12 @@ impl Pool {
                     .map_err(|_| format!("pool {}: bad prefix {p:?}", c.name))
             })
             .collect::<Result<_, _>>()?;
+        if c.strategy == Strategy::Latency && !prefixes.is_empty() {
+            return Err(format!(
+                "pool {}: latency selection requires persistent addresses, not prefixes",
+                c.name
+            ));
+        }
         if ips.is_empty() && prefixes.is_empty() {
             return Err(format!(
                 "pool {}: no addresses (list `addresses` or `prefixes`, or name an `interface` that has some)",
@@ -337,11 +490,172 @@ impl Pool {
             }
             check_prefix(net).map_err(|e| format!("pool {}: {e}", c.name))?;
         }
-        Ok(Self::new(&c.name, ips, c.strategy, breaker, tr).with_prefixes(prefixes))
+        let mut pool = Self::new(&c.name, ips, c.strategy, breaker, tr).with_prefixes(prefixes);
+        for addr in pool.addrs.iter_mut().skip(primary_count) {
+            if let Some(addr) = Arc::get_mut(addr) {
+                addr.backup = true;
+            }
+        }
+        pool.hash_key = c.hash_key;
+        pool.latency_tolerance = c.latency_tolerance;
+        pool.race_width = c.race_width;
+        Ok(pool)
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn strategy(&self) -> Strategy {
+        self.strategy
+    }
+
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshots(&self) -> Vec<AddrSnapshot> {
+        self.addrs
+            .iter()
+            .map(|a| {
+                let stats = a.stats.lock();
+                AddrSnapshot {
+                    ip: a.ip,
+                    backup: a.backup,
+                    healthy: a.health.is_healthy(),
+                    state: a
+                        .breaker
+                        .as_ref()
+                        .map_or(BreakerState::Closed, Breaker::state),
+                    active: a.open.load(Ordering::Relaxed),
+                    attempts: stats.attempts,
+                    failures: stats.failures,
+                    latency: stats.latency(),
+                }
+            })
+            .collect()
+    }
+
+    /// Record a successful active probe without altering breaker or health state.
+    /// Returns false when the address is not a persistent member of this pool.
+    pub fn record_latency(&self, ip: IpAddr, elapsed: Duration) -> bool {
+        let Some(addr) = self.addrs.iter().find(|a| a.ip == ip) else {
+            return false;
+        };
+        addr.stats.lock().record_latency(elapsed);
+        true
+    }
+
+    fn affinity_key(&self, key: &PickKey<'_>) -> [u8; 32] {
+        match self.strategy {
+            Strategy::Sticky => key.sticky_hash(),
+            Strategy::Userhash => key.hash_bytes(HashKey::User),
+            Strategy::Sourcehash => key.hash_bytes(HashKey::ClientIp),
+            _ => key.hash_bytes(self.hash_key),
+        }
+    }
+
+    /// The 1-based explicit-address position used by a pinned pick.
+    /// Addresses generated from routed prefixes have no persistent position.
+    pub fn index_of(&self, ip: IpAddr) -> Option<usize> {
+        self.addrs.iter().position(|a| a.ip == ip).map(|i| i + 1)
+    }
+
+    fn eligible<'a>(
+        &'a self,
+        family: Family,
+        backup: bool,
+        avoid: &'a [IpAddr],
+    ) -> impl Iterator<Item = &'a Arc<Addr>> + Clone {
+        let fresh = self.addrs.iter().any(|a| {
+            Family::of(a.ip) == family && a.backup == backup && a.usable() && !avoid.contains(&a.ip)
+        });
+        self.addrs.iter().filter(move |a| {
+            Family::of(a.ip) == family
+                && a.backup == backup
+                && a.usable()
+                && (!fresh || !avoid.contains(&a.ip))
+        })
+    }
+
+    fn has_primary(&self, family: Family) -> bool {
+        self.addrs
+            .iter()
+            .any(|a| Family::of(a.ip) == family && !a.backup && a.usable())
+    }
+
+    fn latency_pick<'a>(
+        &self,
+        family: Family,
+        mut candidates: impl Iterator<Item = &'a Arc<Addr>> + Clone,
+    ) -> Option<&'a Arc<Addr>> {
+        // Warm unknown nodes through real dials before comparing measured nodes.
+        if let Some(unknown) = candidates
+            .clone()
+            .find(|a| a.stats.lock().latency().is_none())
+        {
+            return Some(unknown);
+        }
+        let (best, best_time) = candidates
+            .clone()
+            .filter_map(|a| a.stats.lock().latency().map(|elapsed| (a, elapsed)))
+            .min_by_key(|(_, elapsed)| *elapsed)?;
+        let mut choice = self.latency_choice.lock();
+        let slot = match family {
+            Family::V4 => 0,
+            Family::V6 => 1,
+        };
+        if let Some(current) = candidates.find(|a| Some(a.ip) == choice[slot])
+            && current
+                .stats
+                .lock()
+                .latency()
+                .is_some_and(|elapsed| elapsed <= best_time.saturating_add(self.latency_tolerance))
+        {
+            return Some(current);
+        }
+        choice[slot] = Some(best.ip);
+        Some(best)
+    }
+
+    /// Lease up to `race_width` eligible addresses for parallel dialing.
+    /// The caller must drop losing leases after the first successful dial.
+    /// Dropping releases counts and any half-open probe reservations.
+    /// Explicit indices and routed prefixes yield only one candidate.
+    pub fn candidates(
+        &self,
+        family: Family,
+        key: &PickKey<'_>,
+        index: Option<usize>,
+        avoid: &[IpAddr],
+    ) -> Result<Vec<Lease>, PickError> {
+        if index.is_some() || self.prefixes.iter().any(|n| Family::of(n.addr()) == family) {
+            return self
+                .pick(family, key, index, avoid)
+                .map(|lease| vec![lease]);
+        }
+        if !self.addrs.iter().any(|a| Family::of(a.ip) == family) {
+            return Err(PickError::NoAddressOfFamily);
+        }
+        for backup in [false, true] {
+            if backup && self.has_primary(family) {
+                break;
+            }
+            let eligible = self.eligible(family, backup, avoid);
+            let mut leases = Vec::with_capacity(eligible.clone().count().min(self.race_width));
+            for addr in eligible {
+                if addr.acquire() {
+                    leases.push(self.lease(addr));
+                    if leases.len() == self.race_width {
+                        break;
+                    }
+                }
+            }
+            if !leases.is_empty() {
+                return Ok(leases);
+            }
+        }
+        Err(PickError::Unavailable)
     }
 
     pub fn addresses(&self) -> Vec<IpAddr> {
@@ -413,9 +727,11 @@ impl Pool {
 
     fn lease(&self, a: &Arc<Addr>) -> Lease {
         a.open.fetch_add(1, Ordering::Relaxed);
+        self.active.fetch_add(1, Ordering::Relaxed);
         Lease {
             addr: Arc::clone(a),
             pool: Arc::clone(&self.name),
+            pool_active: Arc::clone(&self.active),
             settled: false,
         }
     }
@@ -450,46 +766,54 @@ impl Pool {
                 Err(PickError::Unavailable)
             };
         }
-        let all: Vec<&Arc<Addr>> = self
-            .addrs
-            .iter()
-            .filter(|a| Family::of(a.ip) == family)
-            .collect();
-        if all.is_empty() {
+        if !self.addrs.iter().any(|a| Family::of(a.ip) == family) {
             return Err(PickError::NoAddressOfFamily);
         }
-        let mut cands: Vec<&Arc<Addr>> = all.into_iter().filter(|a| a.usable()).collect();
-        let fresh: Vec<&Arc<Addr>> = cands
-            .iter()
-            .copied()
-            .filter(|a| !avoid.contains(&a.ip))
-            .collect();
-        if !fresh.is_empty() {
-            cands = fresh;
-        }
-        let sticky_key = key.bytes();
-        while !cands.is_empty() {
-            let i = match self.strategy {
-                Strategy::First => 0,
-                Strategy::RoundRobin => self.rr.fetch_add(1, Ordering::Relaxed) % cands.len(),
-                Strategy::Random => rand::thread_rng().gen_range(0..cands.len()),
-                Strategy::LeastConnections => cands
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, a)| a.open.load(Ordering::Relaxed))
-                    .map_or(0, |(i, _)| i),
-                Strategy::Sticky => cands
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, a)| rendezvous(&sticky_key, a.ip))
-                    .map_or(0, |(i, _)| i),
-            };
-            // A half-open breaker lets only a few probes through: take the slot
-            // or move on to the next address.
-            if cands[i].acquire() {
-                return Ok(self.lease(cands[i]));
+        for backup in [false, true] {
+            if backup && self.has_primary(family) {
+                break;
             }
-            cands.remove(i);
+            let candidates = self.eligible(family, backup, avoid);
+            let count = candidates.clone().count();
+            if count == 0 {
+                continue;
+            }
+            let selected = match self.strategy {
+                Strategy::First | Strategy::Fifo | Strategy::Race => candidates.clone().next(),
+                Strategy::RoundRobin => {
+                    let n = self.rr.fetch_add(1, Ordering::Relaxed) % count;
+                    candidates.clone().nth(n)
+                }
+                Strategy::Random => candidates
+                    .clone()
+                    .nth(rand::thread_rng().gen_range(0..count)),
+                Strategy::LeastConnections => candidates
+                    .clone()
+                    .min_by_key(|a| a.open.load(Ordering::Relaxed)),
+                Strategy::Sticky
+                | Strategy::Hash
+                | Strategy::Userhash
+                | Strategy::Sourcehash
+                | Strategy::Carp => {
+                    let affinity = self.affinity_key(key);
+                    candidates
+                        .clone()
+                        .max_by_key(|a| rendezvous(&affinity, a.ip))
+                }
+                Strategy::Latency => self.latency_pick(family, candidates.clone()),
+            };
+            if let Some(addr) = selected {
+                if addr.acquire() {
+                    return Ok(self.lease(addr));
+                }
+                // A concurrent pick may take the last half-open reservation.
+                // Try remaining candidates without allocating another collection.
+                for other in candidates.filter(|other| other.ip != addr.ip) {
+                    if other.acquire() {
+                        return Ok(self.lease(other));
+                    }
+                }
+            }
         }
         Err(PickError::Unavailable)
     }
@@ -510,7 +834,10 @@ fn rendezvous(key: &[u8], ip: IpAddr) -> u64 {
     let mut h = Sha256::new();
     h.update(key);
     h.update([0]);
-    h.update(ip.to_string().as_bytes());
+    match ip {
+        IpAddr::V4(ip) => h.update(ip.octets()),
+        IpAddr::V6(ip) => h.update(ip.octets()),
+    }
     let d = h.finalize();
     u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
 }
@@ -669,6 +996,7 @@ mod tests {
             session: None,
             user: None,
             client: "198.51.100.7".parse().expect("ip"),
+            target_host: "origin.test",
         }
     }
 
@@ -751,6 +1079,7 @@ mod tests {
                     session: Some(s),
                     user: Some("u"),
                     client: ip("1.1.1.1"),
+                    target_host: "origin.test",
                 },
                 None,
                 &[],
@@ -769,6 +1098,7 @@ mod tests {
                     session: None,
                     user: Some(u),
                     client: ip(c),
+                    target_host: "origin.test",
                 },
                 None,
                 &[],
@@ -788,6 +1118,7 @@ mod tests {
                 session: Some(&format!("s{i}")),
                 user: None,
                 client: ip("1.1.1.1"),
+                target_host: "origin.test",
             };
             let before = full.pick(Family::V4, &k, None, &[]).expect("pick").ip();
             let after = less.pick(Family::V4, &k, None, &[]).expect("pick").ip();
@@ -1019,6 +1350,7 @@ mod prefix_tests {
             session: Some(s),
             user: None,
             client: ip("198.51.100.7"),
+            target_host: "origin.test",
         }
     }
 
@@ -1141,5 +1473,134 @@ mod prefix_tests {
         let _ = Pool::from_config_test(&cfg(
             "[[pool]]\nname = \"p\"\naddresses = [\"127.0.0.2\"]\nprefixes = [\"::1/128\"]\n",
         ));
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("IP")
+    }
+
+    fn key() -> PickKey<'static> {
+        PickKey {
+            session: None,
+            user: None,
+            client: ip("198.51.100.1"),
+            target_host: "origin.test",
+        }
+    }
+
+    fn pool(strategy: Strategy) -> Pool {
+        Pool::new(
+            "p",
+            vec![ip("127.0.0.2"), ip("127.0.0.3")],
+            strategy,
+            BreakerConfig::default(),
+            &Transitions::detached(),
+        )
+    }
+
+    #[test]
+    fn race_and_latency_never_select_an_unhealthy_address() {
+        let p = pool(Strategy::Latency);
+        p.record_latency(ip("127.0.0.2"), Duration::from_millis(1));
+        p.record_latency(ip("127.0.0.3"), Duration::from_millis(100));
+        p.addrs[0].health.observe(false);
+        assert_eq!(
+            p.pick(Family::V4, &key(), None, &[]).expect("pick").ip(),
+            ip("127.0.0.3")
+        );
+        let candidates = p.candidates(Family::V4, &key(), None, &[]).expect("race");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ip(), ip("127.0.0.3"));
+        drop(candidates);
+        p.addrs[0].health.observe(true);
+        assert_eq!(
+            p.pick(Family::V4, &key(), None, &[]).expect("pick").ip(),
+            ip("127.0.0.2")
+        );
+    }
+
+    #[test]
+    fn backup_tier_tracks_primary_health_without_mixing_candidates() {
+        let mut p = pool(Strategy::Race);
+        Arc::get_mut(&mut p.addrs[1])
+            .expect("unique address")
+            .backup = true;
+        let primary = p
+            .candidates(Family::V4, &key(), None, &[])
+            .expect("primary");
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].ip(), ip("127.0.0.2"));
+        drop(primary);
+        p.addrs[0].health.observe(false);
+        let backup = p.candidates(Family::V4, &key(), None, &[]).expect("backup");
+        assert_eq!(backup.len(), 1);
+        assert_eq!(backup[0].ip(), ip("127.0.0.3"));
+        drop(backup);
+        p.addrs[0].health.observe(true);
+        let primary = p
+            .candidates(Family::V4, &key(), None, &[])
+            .expect("recovered");
+        assert_eq!(primary[0].ip(), ip("127.0.0.2"));
+    }
+
+    #[test]
+    fn active_count_includes_transient_prefix_leases() {
+        let p = Pool::new(
+            "p",
+            Vec::new(),
+            Strategy::Race,
+            BreakerConfig::default(),
+            &Transitions::detached(),
+        )
+        .with_prefixes(vec!["127.0.2.0/24".parse().expect("prefix")]);
+        let a = p.pick(Family::V4, &key(), None, &[]).expect("prefix lease");
+        assert_eq!(p.active(), 1);
+        assert_eq!(p.index_of(a.ip()), None);
+        let candidates = p
+            .candidates(Family::V4, &key(), None, &[])
+            .expect("prefix candidate");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(p.active(), 2);
+        drop(a);
+        drop(candidates);
+        assert_eq!(p.active(), 0);
+    }
+
+    #[test]
+    fn latency_choice_and_backup_tiers_are_family_specific() {
+        let mut p = Pool::new(
+            "p",
+            vec![ip("127.0.0.2"), ip("127.0.0.3"), ip("::1")],
+            Strategy::Latency,
+            BreakerConfig::default(),
+            &Transitions::detached(),
+        );
+        Arc::get_mut(&mut p.addrs[2])
+            .expect("unique address")
+            .backup = true;
+        p.record_latency(ip("127.0.0.2"), Duration::from_millis(100));
+        p.record_latency(ip("127.0.0.3"), Duration::from_millis(1));
+        p.record_latency(ip("::1"), Duration::from_millis(5));
+        assert_eq!(
+            p.pick(Family::V4, &key(), None, &[]).expect("IPv4").ip(),
+            ip("127.0.0.3")
+        );
+        assert_eq!(
+            p.pick(Family::V6, &key(), None, &[])
+                .expect("IPv6 backup")
+                .ip(),
+            ip("::1")
+        );
+        assert_eq!(
+            p.pick(Family::V4, &key(), None, &[])
+                .expect("IPv4 again")
+                .ip(),
+            ip("127.0.0.3")
+        );
     }
 }

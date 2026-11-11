@@ -238,8 +238,8 @@ async fn on_demand_creates_open_and_obey_the_route_class_breaker() -> TestResult
     let mut setup = Setup::new();
     setup.pacing.breaker = breaker(2);
     // a provider nothing listens on
-    let port = closed_addr().await.port();
-    setup.rotating_via(port);
+    let dead = closed_endpoint();
+    setup.rotating_via(dead.port());
     let h = start(&env, &setup, vec![]).await?;
     let p = setup.partition();
 

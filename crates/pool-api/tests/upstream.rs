@@ -551,7 +551,7 @@ async fn bad_requests_are_refused_before_anything_is_stored() -> TestResult {
         body
     };
     for (what, body) in [
-        ("unknown scheme", with("scheme", json!("https"))),
+        ("unknown scheme", with("scheme", json!("ftp"))),
         ("port zero", with("port", json!(0))),
         (
             "url as host",
@@ -580,15 +580,16 @@ async fn bad_requests_are_refused_before_anything_is_stored() -> TestResult {
     let (status, _) = call(&h, Method::GET, &acme, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored");
 
-    // A socks5 upstream uses the socks5 adapter.
-    let mut socks = good.clone();
-    socks["scheme"] = json!("socks5");
-    let (status, body) = put_upstream(&h, &acme, socks).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (body["scheme"].clone(), body["provider"].clone()),
-        (json!("socks5"), json!("customer_socks5"))
-    );
+    for (scheme, provider) in [("socks5", "customer_socks5"), ("https", "customer_https")] {
+        let mut configured = good.clone();
+        configured["scheme"] = json!(scheme);
+        let (status, body) = put_upstream(&h, &acme, configured).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (body["scheme"].clone(), body["provider"].clone()),
+            (json!(scheme), json!(provider))
+        );
+    }
     Ok(())
 }
 

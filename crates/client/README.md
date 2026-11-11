@@ -179,7 +179,7 @@ let client = reqwest::Client::builder().proxy(gateway.reqwest_proxy(&selector, &
 ```
 
 Rules (from the gateway): keys are `kind` (`static`|`rotating`), `cc` (two lowercase letters), `city` (needs `cc`), `prov`,
-`ttl` (`30`, `30s`, `5m`, `2h`, `1d`; not zero), `sid`, `rot` (`sticky`|`each`; `each` cannot be combined with `sid`).
+`ttl` (`30`, `30s`, `5m`, `2h`, `1d`; not zero), `sid`, `rot` (`sticky`|`each`; `each` cannot be combined with `sid`), `strict` (`true`|`false`: ask the provider for a strict sticky session whose exit IP must not change; `PoolSelector::strict`).
 Values are lowercase `[a-z0-9_]` and never contain `-`, so a provider id with `-` cannot be selected. The whole username
 is at most 128 bytes. The gateway refuses a bad username instead of repairing it, so the builder refuses `FR` instead of
 folding it to `fr`. `PoolSelector::parse` reads a username back with the same rules.

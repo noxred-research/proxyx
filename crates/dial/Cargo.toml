@@ -13,6 +13,12 @@ base64.workspace = true
 common = { path = "../pool-common", package = "proxyx-pool-common" }
 libc.workspace = true
 nix.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

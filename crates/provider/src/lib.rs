@@ -12,8 +12,8 @@ mod error;
 mod rotate;
 mod set;
 
-pub use adapter::{Adapter, UnitSpec, ensure_public_address};
-pub use config::{AdapterConfig, AdapterFile};
+pub use adapter::{Adapter, SessionRecipe, UnitSpec, ensure_public_address};
+pub use config::{AdapterConfig, AdapterFile, SessionMode};
 pub use error::ProviderError;
 pub use rotate::MobileBoxClient;
 pub use set::AdapterSet;

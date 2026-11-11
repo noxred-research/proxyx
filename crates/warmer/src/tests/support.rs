@@ -103,6 +103,7 @@ pub(crate) struct Fake {
     risk: Mutex<HashMap<Ipv4Addr, u32>>,
     default_risk: AtomicU32,
     hits: Mutex<HashMap<String, u64>>,
+    auth_users: Mutex<HashMap<String, String>>,
     rotate: Mutex<Option<RotateMode>>,
     modes: Mutex<HashMap<String, UserMode>>,
 }
@@ -191,6 +192,11 @@ impl Fake {
 
     pub(crate) fn hits(&self, path: &str) -> u64 {
         self.hits.lock().get(path).copied().unwrap_or(0)
+    }
+
+    /// Last proxy user name received for a path.
+    pub(crate) fn auth_user(&self, path: &str) -> Option<String> {
+        self.auth_users.lock().get(path).cloned()
     }
 
     /// Most `/ipify` requests that were in flight at once: one per create.
@@ -346,6 +352,9 @@ async fn serve(st: Arc<Fake>, mut sock: TcpStream) {
         .and_then(|raw| String::from_utf8(raw).ok())
         .map(|creds| creds.split(':').next().unwrap_or_default().to_owned())
         .unwrap_or_default();
+    if !direct {
+        st.auth_users.lock().insert(path.clone(), user.clone());
+    }
     let mode = st.modes.lock().get(&user).copied();
     match mode {
         Some(UserMode::Drop) if !direct => return,

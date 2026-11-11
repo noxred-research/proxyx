@@ -49,12 +49,14 @@ fn agree(username: &str) -> bool {
                 client.get_rotation(),
                 "{username:?}"
             );
+            assert_eq!(server.strict, client.get_strict(), "{username:?}");
             // what the client renders is what the gateway reads
             let rendered = client.username().expect("a parsed selector renders");
             let again = policy::InboundOptions::parse(&rendered)
                 .expect("the gateway accepts the rendering");
             assert_eq!(again.ttl, server.ttl, "{username:?} -> {rendered:?}");
             assert_eq!(again.sid, server.sid, "{username:?} -> {rendered:?}");
+            assert_eq!(again.strict, server.strict, "{username:?} -> {rendered:?}");
             true
         }
         (Err(_), Err(_)) => false,
@@ -89,6 +91,9 @@ fn table_of_usernames() {
         "px-kind-rotating-cc-fr-sid-scan42",
         "px-kind-static-cc-de-city-berlin-prov-dc_one-ttl-10m-sid-k1-rot-sticky",
         "px-cc-fr-city-paris_15",
+        "px-strict-true",
+        "px-strict-false",
+        "px-kind-rotating-cc-fr-sid-s1-ttl-20m-strict-true",
     ];
     let refused = [
         "",
@@ -140,6 +145,11 @@ fn table_of_usernames() {
         "xx-kind-static",
         " px",
         "px ",
+        "px-strict",
+        "px-strict-yes",
+        "px-strict-True",
+        "px-strict-1",
+        "px-strict-true-strict-false",
     ];
     for username in accepted {
         assert!(agree(username), "the gateway should accept {username:?}");
@@ -179,7 +189,7 @@ impl Rng {
 }
 
 const KEYS: &[&str] = &[
-    "kind", "cc", "city", "prov", "ttl", "sid", "rot", "x", "", "Kind",
+    "kind", "cc", "city", "prov", "ttl", "sid", "rot", "strict", "x", "", "Kind",
 ];
 const VALUES: &[&str] = &[
     "static",
@@ -209,6 +219,9 @@ const VALUES: &[&str] = &[
     "a-b",
     "é",
     "99999999999999999999",
+    "true",
+    "false",
+    "True",
 ];
 
 #[test]

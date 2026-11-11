@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use common::types::{Kind, OrgId, Partition, Tier};
 use store::{ExitIpClaim, Grant, Phase, SessionJob};
+use time::OffsetDateTime;
 
-use super::support::{Harness, Setup, TestResult, evictions, harness, rotating_adapter, unix_now};
+use super::support::{
+    Harness, Setup, TestResult, evictions, harness, rotating_adapter, unit, unix_now,
+};
 
 async fn start(drops_per_hour: u32) -> TestResult<Option<Harness>> {
     start_with(drops_per_hour, 10).await
@@ -23,6 +26,85 @@ async fn start_with(drops_per_hour: u32, changes_per_hour: u32) -> TestResult<Op
         ),
     ))
     .await
+}
+
+/// A provider whose auth exposes both the requested seconds and strict mode.
+fn session_recipe_adapter(port: u16) -> String {
+    format!(
+        "{}\n\
+         [[adapter.option]]\nname = \"ttl\"\nto = \"user\"\n\
+         frag = \"-t-{{v}}\"\nunit = \"sec\"\nmax = 1800\n\
+         [[adapter.option]]\nname = \"strict\"\nto = \"user\"\nfrag = \"-strict\"\n",
+        rotating_adapter(port)
+    )
+}
+
+fn per_request_adapter(port: u16) -> String {
+    format!(
+        r#"
+[[adapter]]
+id = "rot"
+kind = "rotating"
+subtype = "residential"
+host = "127.0.0.1"
+port = {port}
+credentials_optional = true
+session_mode = "per_request"
+user = "u-rotate{{opts}}"
+echo_url = "http://echo.test/echo"
+
+[[adapter.option]]
+name = "country"
+to = "user"
+frag = "-c-{{v}}"
+"#
+    )
+}
+
+fn load_session_recipe_adapter() -> TestResult<provider::Adapter> {
+    let config: provider::AdapterFile = toml::from_str(&session_recipe_adapter(8080))?;
+    let adapters = provider::AdapterSet::from_configs(config.adapter, &|name: &str| {
+        anyhow::bail!("unexpected test secret {name}")
+    })?;
+    Ok(adapters.get(&"rot".parse()?).ok_or("adapter")?.clone())
+}
+
+#[test]
+fn a_persisted_session_renders_the_original_ttl_and_strict_auth() -> TestResult {
+    let adapter = load_session_recipe_adapter()?;
+    let region = "fr".parse()?;
+    let session_id = "AbCd12345678";
+    for seconds in [37, 317] {
+        for strict in [false, true] {
+            let ttl = Duration::from_secs(seconds);
+            let initial = adapter.recipe(&provider::UnitSpec::Rotating {
+                session_id,
+                ttl,
+                region: &region,
+                strict,
+            })?;
+            let identity = adapter.encode_session(session_id, ttl, strict)?;
+            let kept = crate::checks::rotating_endpoint(&adapter, &identity, &region)?;
+            let suffix = if strict { "-strict" } else { "" };
+            assert_eq!(
+                kept.username.expose(),
+                format!("u-s-{session_id}-c-fr-t-{seconds}{suffix}")
+            );
+            assert_eq!(kept.username.expose(), initial.username.expose());
+            assert_eq!(kept.password.expose(), initial.password.expose());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_legacy_session_keeps_the_provider_maximum_and_non_strict_auth() -> TestResult {
+    let adapter = load_session_recipe_adapter()?;
+    let region = "fr".parse()?;
+    let endpoint = crate::checks::rotating_endpoint(&adapter, "AbCd12345678", &region)?;
+    assert_eq!(endpoint.username.expose(), "u-s-AbCd12345678-c-fr-t-1800");
+    assert!(crate::checks::rotating_endpoint(&adapter, "AbCd12345678~invalid~1", &region).is_err());
+    Ok(())
 }
 
 /// Create one ready session and return its job.
@@ -159,6 +241,80 @@ async fn keepalive_only_touches_the_echo_endpoint() -> TestResult {
     assert!(h.fake.hits("/echo") > echo, "the neutral request went out");
     assert_eq!(h.fake.hits("/probe/ok"), probe, "never a target");
     assert_eq!(h.fake.hits("/ipify"), ipify, "not the public quorum either");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_gateway_identity_keeps_its_auth_through_keepalive_and_ip_recheck() -> TestResult {
+    let mut h = harness!(Harness::start(Setup::new(
+        session_recipe_adapter,
+        "min_ready = 1\nmax_ready = 1\nlow_watermark = 1\n",
+        "[policy.rotating.stability]\ndrops_per_hour = 10\nchanges_per_hour = 10\n",
+    )));
+    let p = h.partition("rot")?;
+    let loaded = h.w.loaded();
+    let adapter = loaded.adapters.get(&p.provider).ok_or("adapter")?;
+    let ttl = Duration::from_secs(317);
+    let session_id = "AbCd12345678";
+    let initial = adapter.recipe(&provider::UnitSpec::Rotating {
+        session_id,
+        ttl,
+        region: &p.region,
+        strict: true,
+    })?;
+    let user = initial.username.expose();
+    assert_eq!(user, "u-s-AbCd12345678-c-fr-t-317-strict");
+    h.fake.set_user_ip(user, addr(91));
+    let exit =
+        h.w.exit_ip
+            .check(
+                &initial,
+                &verify::ExitQuery::in_region(&p.region, adapter.echo_url()),
+            )
+            .await?;
+    assert_eq!(exit.ip, addr(91));
+    assert_eq!(h.fake.auth_user("/ipify").as_deref(), Some(user));
+
+    // Persist exactly the identity and job the gateway hands to the warmer.
+    let now = OffsetDateTime::now_utc();
+    let session = adapter.encode_session(session_id, ttl, true)?;
+    let job = SessionJob {
+        partition: p.clone(),
+        session: session.clone(),
+        ip: exit.ip,
+        born: now.unix_timestamp(),
+        expires: (now + ttl).unix_timestamp(),
+        phase: Phase::fresh(now.unix_timestamp()),
+    };
+    assert_eq!(
+        h.hot
+            .claim_exit_ip(IpAddr::V4(exit.ip), &session, ttl)
+            .await?,
+        ExitIpClaim::Claimed
+    );
+    h.hot
+        .ready_put(&p, &unit(&session, IpAddr::V4(exit.ip)))
+        .await?;
+    h.hot.due_schedule(&job.encode(), now).await?;
+
+    let kept = next(&mut h).await?;
+    assert_eq!(kept.session, session);
+    assert_eq!(kept.ip, exit.ip);
+    assert_eq!(fails(&kept), 0);
+    assert_eq!(h.fake.auth_user("/echo").as_deref(), Some(user));
+    assert!(ready(&h, &p, &kept).await?);
+
+    // An IP change runs the full quorum through the same persisted recipe.
+    let checks = h.fake.hits("/ipify");
+    h.fake.set_user_ip(user, addr(92));
+    let moved = next(&mut h).await?;
+    assert_eq!(moved.session, session);
+    assert_eq!(moved.ip, addr(92));
+    assert_eq!((fails(&moved), changes(&moved)), (0, 1));
+    assert!(h.fake.hits("/ipify") > checks);
+    assert_eq!(h.fake.auth_user("/echo").as_deref(), Some(user));
+    assert_eq!(h.fake.auth_user("/ipify").as_deref(), Some(user));
+    assert!(ready(&h, &p, &moved).await?);
     Ok(())
 }
 
@@ -467,5 +623,52 @@ async fn a_session_drained_elsewhere_is_waited_out_not_kept_alive() -> TestResul
         echo,
         "no keepalive for a drained session"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn per_request_adapters_never_warm_and_old_jobs_drain_without_checks() -> TestResult {
+    let mut h = harness!(Harness::start(Setup::new(
+        per_request_adapter,
+        "min_ready = 1\nmax_ready = 1\nlow_watermark = 1\n",
+        "",
+    )));
+    let p = h.partition("rot")?;
+    assert!(crate::state::rotating_partitions(&h.w.loaded()).is_empty());
+    h.reconcile().await;
+    assert!(h.due_jobs().await?.is_empty());
+    assert_eq!(h.fake.hits("/ipify"), 0);
+
+    let now = unix_now();
+    let job = SessionJob {
+        partition: p.clone(),
+        session: "AbCd12345678".to_owned(),
+        ip: addr(93),
+        born: now,
+        expires: now + 300,
+        phase: Phase::fresh(now),
+    };
+    let ttl = Duration::from_secs(300);
+    h.hot
+        .ready_put(&p, &unit(&job.session, IpAddr::V4(job.ip)))
+        .await?;
+    assert_eq!(
+        h.hot
+            .claim_exit_ip(IpAddr::V4(job.ip), &job.session, ttl)
+            .await?,
+        ExitIpClaim::Claimed
+    );
+    h.hot
+        .due_schedule(&job.encode(), OffsetDateTime::now_utc())
+        .await?;
+
+    assert!(draining(&next(&mut h).await?));
+    assert!(!ready(&h, &p, &job).await?);
+    assert_eq!(evictions(&h, "session_mode"), 1);
+    assert_eq!(h.fake.hits("/echo"), 0);
+    assert_eq!(h.fake.hits("/ipify"), 0);
+    assert_eq!(h.fake.hits("/probe/ok"), 0);
+    assert!(step(&mut h).await?.is_none());
+    assert_eq!(claim(&h, job.ip).await?, ExitIpClaim::Claimed);
     Ok(())
 }

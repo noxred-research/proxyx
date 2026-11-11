@@ -6,9 +6,9 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 
 ### `proxyx_edge_connections_total`
 - **Type:** counter
-- **Labels:** `listener`, `outcome` (accepted, over_limit, proxy_protocol_error)
+- **Labels:** `listener`, `outcome` (accepted, over_limit, proxy_protocol_error, tls_error)
 - **Source:** event, `crates/edge/src/server.rs`, once per accepted TCP connection
-- **Meaning:** Client connections by listener and outcome. `over_limit` is a connection closed at accept because `server.max_connections`, the listener's `max_connections` or `server.max_connections_per_src` is reached; `proxy_protocol_error` is a connection from a trusted proxy whose PROXY header was missing or broken, or from an untrusted peer on a listener that requires the header.
+- **Meaning:** Client connections by listener and outcome. `over_limit` is a connection closed at accept because `server.max_connections`, the listener's `max_connections` or `server.max_connections_per_src` is reached; `proxy_protocol_error` is a missing, invalid or untrusted required PROXY header. `tls_error` is a failed or timed-out listener TLS handshake; no proxy credentials are accepted on that transport.
 - **Query:** `sum by (listener, outcome) (rate(proxyx_edge_connections_total{outcome!="accepted"}[5m]))`
 
 ### `proxyx_edge_connections_open`
@@ -44,8 +44,8 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 ### `proxyx_edge_acl_decisions_total`
 - **Type:** counter
 - **Labels:** `action` (allow, deny)
-- **Source:** event, `crates/edge/src/conn.rs` (`check`)
-- **Meaning:** Access rule decisions, one per request (and per new UDP destination). `deny` includes the default deny when no rule matches.
+- **Source:** event, `crates/edge/src/conn.rs` (`check`, lifecycle and command-stage checks)
+- **Meaning:** Access-rule decisions across normal requests and every configured pre-negotiation, post-authentication, BIND and UDP stage. One request may contribute several decisions. An absent optional stage contributes none; `deny` includes a configured stage's default deny when no rule matches.
 - **Query:** `rate(proxyx_edge_acl_decisions_total{action="deny"}[5m])`
 
 ### `proxyx_edge_destination_denied_total`
@@ -89,7 +89,7 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 - **Type:** counter
 - **Labels:** `parent`, `outcome` (ok, failed)
 - **Source:** event, `crates/edge/src/connect.rs`
-- **Meaning:** Connections made through each parent proxy and whether the connect and handshake worked. A failed attempt moves the request to the next parent (up to three) and counts towards the parent's circuit breaker (`[breaker.parent]`); a request that fails because our own egress is out of service is not counted against the parent.
+- **Meaning:** Connections made through each parent proxy and whether the connect and handshake worked. Failed attempts move to the next path within `selector.connect_retries` and `selector.forward_timeout` and count towards the parent's existing circuit breaker. Node `max_fails`/`fail_timeout` override that breaker's settings; local egress failures do not count against a parent. A successful first hop alone does not prove a complete chain is healthy.
 - **Query:** `sum by (parent, outcome) (rate(proxyx_edge_parent_requests_total[5m]))`
 
 ### `proxyx_edge_parent_up`
@@ -131,9 +131,9 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 
 ### `proxyx_edge_health_checks_total`
 - **Type:** counter
-- **Labels:** `kind` (parent, egress), `result` (ok, failed)
+- **Labels:** `kind` (parent, egress, chain), `result` (ok, failed)
 - **Source:** event, `crates/edge/src/health.rs`, every `health.interval`
-- **Meaning:** Active probes. A `parent` probe connects to the parent from its egress pool and, with `health.parent_target`, opens a tunnel to that target through it. An `egress` check counts each explicitly listed address (is it still assigned to a local interface and bindable) and each prefix (is it still routed here) once per round; `failed` means the address left the host or became unbindable.
+- **Meaning:** Active probes. Parent probes use configured TCP, HTTP status/body or operator command checks, or the legacy TCP/CONNECT probe. Chain probes traverse every selected hop to a representative target. Egress checks verify listed addresses and routed prefixes remain assigned and bindable. Probe duration feeds latency selection; unmeasured nodes do not acquire fictitious zero latency.
 - **Query:** `sum by (kind) (rate(proxyx_edge_health_checks_total{result="failed"}[5m]))`
 
 ### `proxyx_edge_parent_conn_reuse_total`
@@ -165,3 +165,21 @@ All families are defined in `crates/edge/src/metrics.rs` (`Metrics::new()`, one 
 - **Source:** state, `crates/edge/src/udp.rs`
 - **Meaning:** SOCKS5 UDP associations open now.
 - **Query:** `sum by (listener) (proxyx_edge_udp_associations_open)`
+
+## Runtime statistics
+
+`GET /stats` shares the ops listener but does not create Prometheus families or client-identity
+labels. JSON contains `listeners`, `pools` and `nodes` arrays, including configured zero-traffic
+entries. Each row has `kind`, `name`, `pool`, `state`, `active`, `total_connections`, `failures`
+and `latency_seconds`. Request `?format=csv` or `Accept: text/csv` for CSV; explicit format wins,
+and an unknown format returns `400`. CSV uses the same columns, CRLF records and quoted-field escaping.
+
+Node states are `up`, `half_open`, `open` or `unhealthy`; listener states include `unbound` and
+`stopping`, and pools report `up`/`down`. Listener failure counts combine rejected connections
+and failed requests. Pool aggregates reuse existing metrics; node activity comes from runtime
+counters. Unknown latency is JSON `null` or an empty CSV cell, not zero. Listener latency is
+not measured. Snapshots are observational, not an atomic transaction across counters.
+Addresses drawn from a routed prefix are not individually listed.
+
+The endpoint exposes configured node identities and local addresses. Bind the ops listener
+to loopback or a protected management network; it is not a public dashboard or authenticated API.

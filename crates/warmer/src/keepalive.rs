@@ -15,7 +15,7 @@ use common::config::DRAIN_CAP;
 use common::session::UNIT_MARGIN;
 use common::types::Partition;
 use policy::EffectivePolicy;
-use provider::Adapter;
+use provider::{Adapter, SessionMode};
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -158,6 +158,9 @@ impl Warmer {
         let Some(adapter) = loaded.adapters.get(&p.provider) else {
             return self.start_drain(job, "retired").await;
         };
+        if adapter.session_mode() == SessionMode::PerRequest {
+            return self.start_drain(job, "session_mode").await;
+        }
         let policy = policy_for(&loaded, &p.provider);
         let stability = policy.rotating.stability;
         let unix = OffsetDateTime::now_utc().unix_timestamp();

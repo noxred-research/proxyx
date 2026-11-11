@@ -109,6 +109,8 @@ fn defaults_are_the_proposal_values() {
     assert_eq!(p.create_deadline, Duration::from_secs(6));
     assert_eq!(p.orgs_hard, None);
     assert_eq!(p.max_tunnels_per_org, None);
+    assert_eq!(p.max_sticky_entries_per_org, None);
+    assert_eq!(p.dial.race, 1);
     assert_eq!(p.criteria.max_risk, 75);
     assert_eq!(p.criteria.min_success, 0.66);
     assert_eq!(p.criteria.browser_sample, 0.05);
@@ -250,6 +252,7 @@ fn cases() -> Vec<Case> {
         case!(rest_after_release, "'1s'", "'2s'", "'3s'"),
         case!(max_tunnels_per_org, "10", "20", "30"),
         case!(sticky_scope, "'org'", "'target'", "'connection'"),
+        case!(dial.race, "2", "4", "16"),
         case!(block.target_cooldown, "'1m'", "'2m'", "'3m'"),
         case!(block.escalate_targets, "4", "5", "6"),
         case!(block.escalate_signals, "7", "8", "9"),
@@ -490,6 +493,75 @@ fn the_org_budget_is_off_unset_and_only_ever_tightens() {
 }
 
 #[test]
+fn sticky_entry_ceiling_only_tightens_across_all_scopes() {
+    for global in [None, Some(100)] {
+        for route_class in [None, Some(50), Some(200)] {
+            for org_limit in [None, Some(25), Some(300)] {
+                let body = |limit: Option<u32>| {
+                    limit
+                        .map(|n| format!("max_sticky_entries_per_org = {n}"))
+                        .unwrap_or_default()
+                };
+                let s = ok(&format!(
+                    "{}{}{}",
+                    global_with(&body(global)),
+                    rc_doc("rc", "p", &body(route_class)),
+                    org_doc("o", "acme", &body(org_limit)),
+                ));
+                for (org_id, provider_id, want) in [
+                    ("acme", Some("p"), [global, route_class, org_limit]),
+                    ("acme", None, [global, None, org_limit]),
+                    ("other", Some("p"), [global, route_class, None]),
+                    ("other", None, [global, None, None]),
+                ] {
+                    assert_eq!(
+                        s.effective(&org(org_id), provider_id.map(provider).as_ref())
+                            .max_sticky_entries_per_org,
+                        want.into_iter().flatten().min(),
+                        "global={global:?}, route_class={route_class:?}, org={org_limit:?}, \
+                         lookup={org_id}/{provider_id:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dial_race_and_sticky_entry_ceiling_accept_positive_bounds() {
+    for race in [1, 16] {
+        let p = eff(&global_with(&format!(
+            "max_sticky_entries_per_org = 1\ndial.race = {race}"
+        )));
+        assert_eq!(p.dial.race, race);
+        assert_eq!(p.max_sticky_entries_per_org, Some(1));
+    }
+    let p = eff(&global_with(&format!(
+        "max_sticky_entries_per_org = {}",
+        u32::MAX
+    )));
+    assert_eq!(p.max_sticky_entries_per_org, Some(u32::MAX));
+}
+
+#[test]
+fn dial_race_and_sticky_entry_ceiling_reject_wrong_types() {
+    for body in [
+        "dial.race = -1",
+        "dial.race = 1.5",
+        "dial.race = '2'",
+        "dial.race = true",
+        "dial.races = 2",
+        "max_sticky_entries_per_org = -1",
+        "max_sticky_entries_per_org = 1.5",
+        "max_sticky_entries_per_org = '2'",
+        "max_sticky_entries_per_org = true",
+        "max_sticky_entries_per_org = 4294967296",
+    ] {
+        assert!(rejected_at_parse(&global_with(body)), "{body}");
+    }
+}
+
+#[test]
 fn a_route_class_ceiling_binds_the_org_that_uses_that_provider() {
     let global = global_with("[policy.limits]\nmax_gb_per_day = 10");
     let org8 = org_doc("o", "acme", "cost.max_gb_per_day = 8");
@@ -632,6 +704,9 @@ fn out_of_range_values_are_refused() {
         "create_deadline = \"0s\"",
         "orgs_hard = 0",
         "max_tunnels_per_org = 0",
+        "max_sticky_entries_per_org = 0",
+        "dial.race = 0",
+        "dial.race = 17",
         "block.max_cooldown_share = 0",
         "static.replace_blocked_share = 1.01",
         "static.quarantine_after = 0",
@@ -724,6 +799,7 @@ fn min_remaining_must_leave_a_session_leasable_for_the_provider_life() {
 fn a_document_survives_the_json_round_trip_the_store_uses() {
     let text = "[[policy]]\nname = \"g\"\nregions = [\"fr/paris\", \"de\"]\nlease_ttl = \"5m\"\nmin_ready = 3\non_empty.static = \"fail\"\n\
                 criteria.min_success = 0.5\nrotating.keepalive = \"45s\"\nrotating.stability.drops_per_hour = 9\n\
+                max_sticky_entries_per_org = 100\ndial.race = 4\n\
                 limits.max_gb_per_day = 9\n[policy.min_ready_by_region]\n\"fr/paris\" = 2\n";
     let original = docs(text).remove(0);
     let json = serde_json::to_string(&original).expect("serialize");

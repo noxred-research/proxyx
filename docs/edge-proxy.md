@@ -2,13 +2,13 @@
 
 `proxyx edge` turns one machine into a proxy gateway over its own IP addresses. Install it on a host that has several IPv4 or IPv6 addresses (or a whole routed IPv6 block), and clients reach the internet through the proxy with the source address you choose: fixed per listener, per user, per rule, round robin, random, least busy, or sticky per session.
 
-It needs no database and no Redis: one TOML file ([`examples/edge.toml`](../examples/edge.toml)), one process. For the pool gateway, which leases rented and rotating IPs from many providers with Postgres and Redis behind it, see [gateway.md](gateway.md); the two can be combined, see [Using the machine's addresses from the pool gateway](#using-the-machines-addresses-from-the-pool-gateway).
+It needs no database: one TOML file ([`examples/edge.toml`](../examples/edge.toml)), one process. Redis is optional for shared affinity between replicas. For the pool gateway, which leases rented and rotating IPs from many providers with Postgres and Redis behind it, see [gateway.md](gateway.md); the two can be combined, see [Using the machine's addresses from the pool gateway](#using-the-machines-addresses-from-the-pool-gateway).
 
 | | `proxyx edge` | `proxyx gateway` |
 |---|---|---|
 | State | one TOML file, SIGHUP reload | Postgres (truth), Redis (hot state) |
 | Exit IPs | the machine's own addresses | upstream providers, rented IPs, SIM boxes |
-| Clients | HTTP proxy, `CONNECT`, SOCKS4/4a/5 (TCP and UDP) | `CONNECT` and SOCKS5 |
+| Clients | HTTP proxy, `CONNECT`, SOCKS4/4a/5 (TCP, BIND and UDP), optional TLS | `CONNECT` and SOCKS5 |
 | Accounts | static users, htpasswd file, login options | org keys, policies, budgets |
 | Scale | one host | a fleet |
 
@@ -62,6 +62,29 @@ pool = "primary"                # everything on this port leaves from the pool "
 
 Behind a TCP load balancer set `proxy_protocol = "optional"` or `"required"` and `trusted_proxies = ["10.0.0.0/8"]`: the PROXY protocol v1 or v2 header sets the client address for the rules, limits and access log, and only the listed peers are believed (a header from anyone else is ignored, or the connection is closed when the header is `required`). The edge can also send the header to a [parent](#parent-proxies) (`send_proxy_protocol = "v1"` or `"v2"` on the parent), so the parent sees the client's address.
 
+Add `tls = { cert = "/etc/proxyx/tls/edge.pem", key = "/etc/proxyx/tls/edge-key.pem" }`
+to wrap the listener in TLS. PEM certificates and private keys are read and validated before
+the listener starts; reload replaces credentials for new connections. A mixed TLS listener
+accepts HTTPS proxy requests and SOCKS5-over-TLS after decryption. Clients must verify the
+proxy certificate. TLS protects proxy credentials in transit; Basic and RFC 1929 alone do not.
+PROXY protocol, when configured, precedes the TLS handshake and remains restricted to trusted peers.
+TLS encrypts the SOCKS5 UDP association's control connection only. UDP relay datagrams
+remain unencrypted; use a separately secured network when UDP payload confidentiality matters.
+
+SOCKS5 `BIND` sends the listening address in its first success reply, then the accepted peer
+address in its second. Only a resolved requested peer IP and its nonzero requested port may
+connect; port zero allows any source port for that checked IP. Wildcard destination addresses
+are refused. Acceptance is bounded by `timeouts.connect` and 64 unexpected peers. BIND uses
+direct local egress, not a reverse tunnel through parents. Authorize it with `method = ["BIND"]`;
+normal private-destination protection still applies.
+The expected peer must be able to reach the returned ephemeral port on the chosen egress
+address. Configure the host firewall accordingly; a NAT address is not automatically published
+or mapped by the proxy. Keep BIND disabled through ACLs unless reverse connections are needed.
+
+HTTP-capable TLS listeners advertise ALPN `h2` and `http/1.1`. HTTP/2 supports ordinary
+authority-form CONNECT streams, not RFC 8441 extended CONNECT or HTTP/3. Each stream passes
+the same authentication, destination ACLs, egress selection and shaping as HTTP/1.1 tunnels.
+
 ## Egress addresses: pools
 
 A `[[pool]]` is a set of local addresses with a strategy. Give it addresses (`addresses = [...]`), an interface to discover them from (`interface = "eth0"`, minus loopback, link-local and multicast addresses, minus `exclude = [...]`), or a routed block (`prefixes = [...]`, at most one per IP family, not mixed with explicit addresses of the same family).
@@ -73,6 +96,19 @@ A `[[pool]]` is a set of local addresses with a strategy. Give it addresses (`ad
 | `random` | a random address (a random address of the block for `prefixes`) |
 | `least_connections` | the address with the fewest open connections |
 | `sticky` | by a hash of the session id (`-sid-`), else the user name, else the client address: the same key keeps the same address while the address set stays, and removing an address moves only the keys that were on it |
+
+`fifo` is an explicit spelling for first-healthy-in-order selection. `hash` chooses a stable
+address using `hash_key = "client_ip" | "target_host" | "user" | "session_id"`; absent user
+or session values fall back to client IP. `userhash` and `sourcehash` select those attributes
+directly. `carp` uses rendezvous hashing, so adding or removing one address only remaps keys
+owned by that address. `race` dials available candidates concurrently and keeps the first success.
+`latency` prefers measured fast paths and retains the current address within `latency_tolerance`
+(default `50ms`). Prefix pools retain their documented per-prefix strategy restrictions.
+
+`backup_addresses = [...]` participate only without a healthy primary of the destination family.
+Pool `max_fails` and `fail_timeout` override `[breaker.egress]` for the same breaker.
+`race_width` (default 2) limits simultaneous source-address dials. Prefix races have one
+candidate; prefix latency selection is rejected because generated IPs have no persistent history.
 
 The family always matches the destination: an IPv4 destination leaves from an IPv4 address of the pool, an IPv6 one from an IPv6 address, and a pool with no address of the family answers `502` with `X-ProxyX-Error: no_egress_address` (the proxy does not fall back to another source). An address whose connects fail for lack of the address itself (`EADDRNOTAVAIL`, network unreachable from that source) counts against its [circuit breaker](#circuit-breakers-and-health-checks) and the connection is retried from another address; a refusal or timeout from the destination is the destination's answer and counts against nobody. The kernel binds the address before `connect` with `IP_BIND_ADDRESS_NO_PORT`, so many connections from one address to different targets do not run out of ephemeral ports.
 
@@ -120,12 +156,19 @@ when = { group = ["staff"], time = [{ days = ["mon", "tue", "wed", "thu", "fri"]
 | `dst` | destination addresses (the name is resolved first) |
 | `domain` | `example.com` exact, `.example.com` the name and its subdomains, `*.example.com` subdomains only, `re:<regex>` |
 | `port` | `443`, `8000-8100` |
-| `method` | `GET`, `POST`, ..., `CONNECT`; SOCKS commands count as `CONNECT` and `UDP` |
+| `method` | `GET`, `POST`, ..., `CONNECT`; SOCKS commands count as `CONNECT`, `BIND` and `UDP` |
 | `protocol` | `http`, `connect`, `socks4`, `socks5`, `udp` |
 | `user`, `group`, `listener` | login name, group of the user, listener name (every name is checked to exist) |
 | `time` | windows of `days` (`mon`..`sun`) and `from`/`to` (`HH:MM`, wrapping over midnight), in `server.utc_offset` |
 | `authenticated` | a login was presented and accepted |
 | `not` | a nested `when` that must not match |
+
+`stage` on an access rule selects `request` (default), `pre_negotiation`, `post_auth`, `bind`
+or `udp`. Early stages run before protocol negotiation or after authentication and accept only
+conditions available at that point. A configured stage denies unmatched traffic; an absent
+stage adds no restriction. BIND and each UDP destination must pass the normal request rules
+and their configured command-stage rules. Place source-only admission rules in `pre_negotiation`
+and identity rules in `post_auth`; these checks never replace destination authorization.
 
 **Private and internal destinations are always denied**, whatever the rules say: loopback, RFC 1918, link-local and the cloud metadata addresses, IPv4-mapped and translated IPv6 forms, odd spellings (`2130706433`, `0x7f.1`), internal names (`localhost`, dotless names, `.internal`, `.local`, `.svc`), and any name that *resolves* to one of them. The answer is `403` with `X-ProxyX-Error: destination_denied`. A rule that must reach an internal network says so with `allow_internal = true` (allow rules only); the opt-out belongs to that rule, never to the proxy as a whole. The proxy connects to the addresses it checked, never to a second resolution.
 
@@ -137,9 +180,87 @@ when = { group = ["staff"], time = [{ days = ["mon", "tue", "wed", "thu", "fri"]
 
 ## Parent proxies
 
-`[[parent]]` tables chain to upstream HTTP or SOCKS5 proxies (squid `cache_peer`, 3proxy `parent`), with `weight`, `priority` tiers (the lowest tier with a parent that is up serves; inside it the choice is random by weight) and [health](#circuit-breakers-and-health-checks): a circuit breaker fed by real requests and active probes. A failed connect moves the request to the next parent, up to three. Plain HTTP requests go to an HTTP parent as a proxy request (with `Proxy-Authorization`), `CONNECT` and SOCKS to it as `CONNECT`; a SOCKS5 parent gets the destination as a name so the parent resolves it. The connection to the parent leaves from the parent's own `pool`, else from the request's pool (useful when a provider whitelists your source address). With `http.parent_keepalive` (on) the connection to an HTTP parent is kept for the next bodyless request of the same client key (see [Keepalive and connection reuse](#keepalive-and-connection-reuse)). A parent that answers `407` is a `502 parent_error` for the client; its login is never forwarded.
+`[[parent]]` tables define upstream HTTP, HTTPS, SOCKS4 or SOCKS5 proxies (Squid `cache_peer`, 3proxy `parent`). Lowest available priority tiers serve first; weighted random remains the default selector. HTTPS verifies the proxy certificate and hostname before forwarding or CONNECT. Plain HTTP requests use absolute-form forwarding and separate `Proxy-Authorization` toward a flat HTTP(S) parent; tunnels and chain hops use CONNECT handshakes. The first parent connection uses its own `pool`, else the request pool. Bounded parent keep-alive reuse remains available for bodyless HTTP requests. A parent `407` becomes `502 parent_error`; upstream credentials never reach the target.
 
 `[[route]]` tables choose per request, first match wins (otherwise `server.default_route`): `route = "direct"` (squid `always_direct`), `"parent"` (squid `never_direct`: only through a parent; `503` when none is up) or `"parent_or_direct"`; `parents = [...]` restricts the choice to named parents.
+
+### Parent selectors and multi-hop chains
+
+`[selector]` controls parent selection: `first`/`fifo`, `round_robin`, weighted `random`,
+`least_connections`, `sticky`, `hash`, `userhash`, `sourcehash`, weighted `carp`, `race` and
+`latency`. Hash keys use `client_ip`, `target_host`, `user` or `session_id`. CARP-style weighted
+rendezvous hashing uses stable configured names: membership changes do not rehash every key.
+This does not implement Squid's cache protocol or exact cache-key algorithm.
+
+`backup = true` nodes participate only without available primaries; `default = true` supplies
+a last-resort parent. Existing priority tiers remain authoritative. Node `max_fails` and
+`fail_timeout` override the existing passive breaker's threshold and open interval.
+`selector.connect_retries` bounds next-path retries and `selector.forward_timeout` bounds total
+connection establishment; they do not replay an already forwarded non-idempotent request body.
+`selector.race_width` bounds concurrent candidate dials; losers are dropped after first success.
+
+Chains list ordered hop groups. Each group names configured parents and may override the selector:
+
+```toml
+[selector]
+strategy = "fifo"
+connect_retries = 2
+forward_timeout = "30s"
+
+[[chain]]
+name = "two-hop"
+hops = [
+  { parents = ["entry-a", "entry-b"], selector = { strategy = "race", race_width = 2 } },
+  { parents = ["exit-a"], selector = { strategy = "fifo" } },
+]
+probe = { type = "http", url = "http://probe.example.org/health", status = 200, body_contains = "ok" }
+
+[[route]]
+when = { domain = [".example.net"] }
+route = "parent"
+chain = "two-hop"
+```
+
+Every hop may use HTTP(S) CONNECT, SOCKS4 or SOCKS5. The proxy connects to the first hop once
+and negotiates later hops inside the established stream. Only the first hop selects a local
+egress address. Race combinations are capped at 64 concurrent chain paths; larger configurations
+fail validation. A keep-alive HTTP client retains its chosen chain; new requests do not silently
+switch an existing client connection to another chain.
+
+### Explicit affinity and replicas
+
+Explicit claims are used by sticky parent selection and sticky local egress. Setting the global
+parent selector to `sticky` also pins direct egress, even when that source pool uses round robin.
+Stateless `hash`, `sourcehash`, `userhash` and CARP policies do not require a stored session.
+
+`[stick]` bounds key-to-path affinity by `capacity` (65536 default) and fixed `ttl` (10 minutes).
+Claims retain selected parent names and local egress, survive SIGHUP with unchanged stick
+configuration, and expire rather than renewing indefinitely on access. A failed/removed path
+may be remapped earlier; capacity eviction may also remap a key.
+Exact source-IP claims cover explicit/discovered address lists, not addresses generated from
+routed prefixes. Use a prefix pool's own `strategy = "sticky"` for deterministic prefix affinity
+on identically configured replicas. A sticky parent selector does not make a round-robin prefix
+pool sticky; generated prefix addresses have no replicated per-address entry.
+
+```toml
+[stick]
+capacity = 65536
+ttl = "10m"
+[stick.redis]
+url = "redis://127.0.0.1:6379/4"
+key_prefix = "edge-production:affinity"
+ttl = "10m"
+timeout = "5s"
+```
+
+Redis is optional. When enabled, shared claims are authoritative and atomic; replicas need
+identical names, capacity, namespace and key semantics. A replica replaces invalid claims atomically
+and fails closed if Redis cannot answer, rather than generating an independent competing route.
+This is affinity for a path, not a distributed lock on a target session or a provider exit-IP guarantee.
+Redis enforces the same claim capacity with an atomic expiry index. Cleanup is bounded to
+64 expired and 64 capacity victims per operation. A large configured capacity reduction can
+temporarily refuse claims until subsequent bounded cleanup calls converge; plan such changes
+as an availability event. Shared expiry and capacity eviction may remap a key on every replica.
 
 ## Circuit breakers and health checks
 
@@ -174,6 +295,18 @@ When every address of the destination's family is out of service the answer is `
 * **Parents**: a probe connects to each parent from its egress pool and, with `parent_target = "host:port"`, opens a tunnel to that target through it (HTTP `CONNECT` or SOCKS5 `CONNECT`, with the parent's login), so it proves the parent *and* its path out. `unhealthy_threshold` failed probes in a row (2) take the parent out of use, `healthy_threshold` good ones (1) bring it back. Pick a target you may probe every few seconds (your own service, or a public resolver port).
 * **Egress addresses**: every explicitly listed or discovered address is checked to be still assigned to a local interface and bindable, every prefix to be still routed to this host. A failed check takes the address out of the rotation at once; the next passing check puts it back. (A pool built from `interface = "eth0"` is read at start and on reload; reload after adding addresses.)
 
+Per-parent `probe` and chain `probe` accept `type = "tcp"` with `target = "host:port"`,
+`type = "http"` with an `http://` or verified `https://` URL, expected `status`, optional `body_contains` and bounded
+`max_body_bytes`, or `type = "command"` with an explicit `command = ["/path/program", "arg"]`.
+HTTP probes traverse the parent/chain before issuing GET. Checking only the first TCP listener
+cannot prove that a later hop reaches the target. Commands run without a shell under the
+proxy service account, respect `health.timeout`, and require trusted configuration ownership.
+
+With `strategy = "latency"`, probe duration drives choice. `tolerance_ms` retains the existing
+healthy node unless another improves latency enough. `health.interval` sets probe frequency;
+`idle_timeout` pauses latency probes when no traffic uses the group. `interrupt_on_switch = true`
+closes existing tunnels when the best node changes; leave it false to preserve active sessions.
+
 A configuration reload builds new breakers and trackers, which start closed and healthy; the next round of checks re-establishes the verdicts.
 
 ## Ops endpoints
@@ -195,8 +328,19 @@ FAIL egress path: no healthy local address or parent
   * *listeners bound*: every configured listener is bound (after a reload that moved a listener, until it is);
   * *egress path*: at least one way to reach the internet works for the default route: with `default_route = "direct"` a pool with a usable address (healthy and not shut out by its breaker) or no pool at all (the operating system picks the source), with `"parent"` a parent that is up, with `"parent_or_direct"` either.
 * `GET /metrics`: [metrics/edge.md](metrics/edge.md).
+* `GET /stats`: JSON with `listeners`, `pools` and `nodes`; `?format=csv` or `Accept: text/csv`
+  selects CSV. Rows contain `kind`, `name`, `pool`, `state`, `active`, `total_connections`,
+  `failures` and `latency_seconds`; unknown latency is null/blank. The snapshot is observational,
+  not a transaction. It includes configured zero-traffic nodes, not every address drawn from a
+  routed prefix. Bind ops to a trusted interface: node addresses are operational data.
 
 ## Keepalive and connection reuse
+
+Idle parent connections are separated by client IP, target host, authenticated user and session
+ID as well as the parent/path, pool and explicit address choice. They never cross configuration
+generations: reload retires old idle entries from reuse by new requests. Existing active tunnels
+continue normally, and a keep-alive client's selected hop names remain pinned. This preserves
+hash-selected source addresses when clients share a SID or pool settings change.
 
 ```toml
 [tcp.client]                 # sockets accepted from clients
@@ -243,6 +387,22 @@ Every timeout except `total` must be above zero (checked at start). `total` is t
 
 For forwarded plain HTTP, `[http]` decides what the target sees. Hop-by-hop headers (`Connection`, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`, `Upgrade` outside a handshake) are always removed, and the client's `Proxy-Authorization` never goes on. `forwarded_for` is `delete` (default: remove `X-Forwarded-For`, `Forwarded` and `X-Real-IP`), `off` (`X-Forwarded-For: unknown`), `truncate` (only the client address), `on` (append it) or `transparent` (leave it). `via = true` adds `Via: 1.1 <proxy_name>`; by default the proxy hides itself. `request_headers_remove` and `request_headers_set` (and the `response_` pair) edit what is left.
 
+Safe declarative hooks can scope both request and response edits to the deciding named allow rule:
+
+```toml
+[[http.header_rule]]
+rule = "staff"
+request_headers_remove = ["X-Debug"]
+request_headers_set = { X-Client-Class = "staff" }
+response_headers_remove = ["Server"]
+response_headers_set = { X-Proxy-Policy = "staff" }
+```
+
+Scoped edits run after the global policy. The rule must identify exactly one named request-stage allow rule;
+duplicate references, invalid header syntax, CR/LF/NUL values and attempts to rewrite `Host`,
+message framing or hop-by-hop headers fail configuration validation. No dynamically loaded
+code runs in the proxy. Parent credentials remain separate and are injected only toward that parent.
+
 ## DNS
 
 The proxy resolves names itself (once per request, for the rules and the destination check, and connects to those addresses): a cache with `min_ttl`/`max_ttl`, `nameservers` (empty: `/etc/resolv.conf`), `ip_version` (`prefer_ipv4`, `prefer_ipv6`, `ipv4_only`, `ipv6_only`) and fixed answers in `dns.hosts` (3proxy `nsrecord`).
@@ -251,7 +411,7 @@ The proxy resolves names itself (once per request, for the rules and the destina
 
 * **Access log**: `[access_log] output = "file" | "stdout" | "stderr" | "off"`, `format = "squid"` (the native `access.log` format, readable by squid tools), `"combined"` (Apache) or `"json"`. One line per request, written by a separate thread: a slow disk drops lines (counted in `proxyx_edge_access_log_dropped_total`) and never slows a request. SIGHUP reopens the file. The JSON line carries the client, listener, protocol, user, method, URL, status, bytes, `egress_ip`, `pool`, `target_ip`, `parent`, matched `rule` and `result`.
 * **Process log**: structured JSON to stderr (journald), `log.json = false` for text, `RUST_LOG` or `log.level` for the filter. Passwords are never logged.
-* **Ops listener** (`server.ops_listen`): `/metrics` ([catalogue](metrics/edge.md)), `/healthz`, `/readyz` (503 while stopping). Bind it to loopback or a management network.
+* **Ops listener** (`server.ops_listen`): `/metrics` ([catalogue](metrics/edge.md)), JSON/CSV `/stats`, `/healthz`, `/readyz` (503 while stopping). Bind it to loopback or a management network.
 
 ## Operating it
 
@@ -265,8 +425,8 @@ The proxy resolves names itself (once per request, for the rules and the destina
 * The HTTP proxy speaks HTTP/1.1 and is strict about message framing: a request with both `Content-Length` and `Transfer-Encoding`, with conflicting lengths, or with a coding stack other than a lone `chunked` is refused with `400`. Request and response bodies (fixed length, chunked with trailers, until close) are passed through unchanged. A client connection stays open between requests (HTTP/1.1 only; HTTP/1.0 clients get `Connection: close`).
 * Each forwarded request opens its own connection to the target and sends `Connection: close` to it, so the egress address is chosen per request and a target never sees a connection shared between two clients. There is no origin keep-alive pool.
 * `Expect: 100-continue` is answered by the proxy once the request has passed the rules and the target is connected; an `Upgrade` (WebSocket) handshake is forwarded and the connection becomes a tunnel after the `101`.
-* `https://` URLs must use `CONNECT`: the proxy never terminates TLS. A request in origin form (`GET /path`) is a request to the proxy itself and answered `400`.
-* SOCKS5 `CONNECT` and `UDP ASSOCIATE` are served; `BIND` is not. The reply to `CONNECT` carries the local address of the outgoing connection, so a SOCKS5 client can read its exit address from it. UDP datagrams are accepted only from the client's own address, each new destination goes through the rules and the destination check, replies are accepted only from addresses the client sent to, and fragmentation is not supported.
+* `https://` targets use `CONNECT`; listener TLS protects the client-to-proxy leg without decrypting target TLS.
+* SOCKS5 `CONNECT`, `BIND` and `UDP ASSOCIATE` are served. The reply to `CONNECT` carries the local address of the outgoing connection. UDP datagrams are accepted only from the client's own address, each new destination goes through the rules and destination check, replies are accepted only from addresses the client sent to, and fragmentation is not supported.
 
 ## Using the machine's addresses from the pool gateway
 
@@ -277,13 +437,14 @@ The pool gateway can lease the machine's own addresses as static inventory with 
 | Not included | Why |
 |---|---|
 | HTTP caching (squid) | ProxyX forwards, it does not store: a cache changes what a target sees, shares responses between clients and needs eviction and revalidation logic that none of the proxy roles has. Put squid or varnish in front when you need one |
-| TLS interception, `ssl_bump` | the session proxy (`proxyx-intercept`) is the role for authorized interception; the edge role never opens a tunnel |
+| TLS interception, `ssl_bump` | the session proxy (`proxyx-intercept`) handles authorized interception; edge listener TLS does not decrypt target tunnels |
 | Origin keep-alive pools | see above: per-request egress selection |
-| ICP/HTCP, CARP peers, ICAP/eCAP, external ACL helpers, Kerberos/NTLM/Digest | out of scope for a static-config proxy; HTTP Basic, RFC 1929 and hashed files cover the use case |
+| ICP/HTCP, ICAP/eCAP, external ACL helpers, Kerberos/NTLM/Digest | out of scope for a static-config proxy; HTTP Basic, RFC 1929 and hashed files cover the use case |
 | FTP/POP3/SMTP proxies, port mappers, the 3proxy admin page | not needed by HTTP/SOCKS clients |
 | Transparent (redirect/TPROXY) mode | needs firewall integration per host; clients are expected to name the proxy |
 | Volume quotas per period (3proxy `countin`) | not available: bandwidth, connection and request-rate limits exist, byte quotas that persist across restarts need a store |
-| Per-rule header policy | one `[http]` policy per process |
+| Dynamic plugins and a web dashboard | declarative request/response header hooks and authenticated network boundaries avoid arbitrary in-process code; `/stats` supplies machine-readable operations data |
+| HTTP/3, QUIC, VPN, SSH and WebSocket proxy transports | require distinct transport, security and lifecycle implementations; not needed for the HTTP CONNECT/SOCKS gateway contract |
 
 ## Troubleshooting
 
@@ -296,6 +457,7 @@ The pool gateway can lease the machine's own addresses as static inventory with 
 | `429 auth_blocked` | 20 wrong logins from the source in a minute; wait or raise `auth.fail_limit` |
 | `503 egress_unavailable` | every address of that IP family is shut out by its breaker or failed its active check (`proxyx_edge_egress_addresses`, the process log says which address left the host) |
 | `503 no_parent` | the route needs a parent and all are out: `proxyx_edge_parent_breaker_state`, `proxyx_edge_parent_healthy`, `health.parent_target` |
+| `502 connect_failed` with shared stickiness | inspect Redis reachability, credentials, timeout and namespace capacity; `stick affinity unavailable` fails closed and never falls back to an independently chosen direct path |
 | `502 no_egress_address` | the pool has no address of the destination's IP family: add one or use `ip_version = "ipv4_only"` |
 | Exits do not rotate | the pool is `sticky` and no `-sid-` is sent (the user name decides), or a `[[egress]]` rule or the user's pool overrides the strategy you changed |
 | Slow tunnels | a `[[limit]]` matches (every matching one applies); `proxyx_edge_limit_rejections_total` and the rule's `bandwidth_*` |

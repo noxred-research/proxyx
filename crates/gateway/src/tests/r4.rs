@@ -12,7 +12,8 @@ async fn an_ip_level_dial_failure_is_retried_on_another_ip_without_withdrawing_t
 -> TestResult {
     let Some(env) = env() else { return Ok(()) };
     let good = stub_provider(PROVIDER_PASS, stub_target().await, uniq_ip()).await;
-    let status = stub_provider(PROVIDER_PASS, closed_addr().await, uniq_ip()).await;
+    let dead = closed_endpoint();
+    let status = stub_provider(PROVIDER_PASS, dead.addr(), uniq_ip()).await;
     let garbage = serve(|mut s| async move {
         if read_head(&mut s).await.is_some() {
             let _ = s.write_all(b"not http at all\r\n\r\n").await;
@@ -238,10 +239,11 @@ async fn a_walk_past_its_budget_takes_no_more_leases() -> TestResult {
     let rotating = Setup::new();
     // the rotating partition is tried first and is empty: it asks for a create
     setup.kinds = r#"["rotating", "static"]"#;
+    let dead = closed_endpoint();
     setup.adapter_toml = Some(format!(
         "{}\n{}",
         setup.static_adapter("[]"),
-        rotating.rotating_adapter(closed_addr().await.port())
+        rotating.rotating_adapter(dead.port())
     ));
     let slow = serve(|mut s| async move {
         if read_head(&mut s).await.is_some() {

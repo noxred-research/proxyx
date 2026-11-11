@@ -7,27 +7,40 @@
 //! from the pool, bound before `connect`.
 
 use std::collections::HashMap;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use common::types::Target;
-use dial::DialError;
+use dial::{DialError, ProxyStream};
 use parking_lot::Mutex;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 
-use crate::config::{ParentKind, Route, SendProxyProtocol, SocketOptions};
+use crate::config::{
+    HashKey, ParentKind, ProbeConfig, Route, SendProxyProtocol, SocketOptions, Strategy,
+};
 use crate::dns::DnsError;
 use crate::egress::{Family, Lease, PickError, PickKey, Pool};
 use crate::metrics::Metrics;
-use crate::parent::Parent;
+use crate::parent::{Attempt, Parent, ParentUse, Selector, split_host_port};
 use crate::proxy_protocol;
 use crate::sockopt;
-use crate::state::State;
+use crate::state::{Chain, State};
+use crate::stick::Mapping;
+
+#[path = "parent_connect.rs"]
+mod parent_connect;
+pub use parent_connect::{check_probe, probe_chain};
+use parent_connect::{
+    connect_chain, connect_group, execute_probe, first_success, handshake, probe_key,
+};
 
 /// What the connection is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +69,11 @@ pub enum ConnectError {
     Parent { name: String, reason: String },
     #[error("no parent proxy is available")]
     NoParent,
+    #[error("stick affinity unavailable: {0}")]
+    Stick(String),
 }
 
+#[derive(Clone, Copy)]
 pub struct Plan<'a> {
     pub host: &'a str,
     pub port: u16,
@@ -69,6 +85,8 @@ pub struct Plan<'a> {
     pub route: Route,
     /// Parents the route allows; empty is all.
     pub parents: &'a [usize],
+    pub chain: Option<&'a Chain>,
+    pub pinned: Option<&'a [String]>,
     pub mode: Mode,
     pub client: SocketAddr,
     /// The request is bodyless and may use (and leave) an idle connection to an HTTP parent.
@@ -76,7 +94,9 @@ pub struct Plan<'a> {
 }
 
 pub struct Upstream {
-    pub stream: TcpStream,
+    pub stream: ProxyStream,
+    pub bound_addr: Option<SocketAddr>,
+    pub chain: Vec<String>,
     /// Keeps the local address counted as in use.
     pub lease: Option<Lease>,
     pub parent: Option<Arc<Parent>>,
@@ -93,12 +113,55 @@ pub struct Upstream {
 
 impl Upstream {
     pub fn local_ip(&self) -> Option<IpAddr> {
-        self.stream.local_addr().ok().map(|a| a.ip())
+        self.bound_addr.map(|a| a.ip())
     }
 }
 
 fn pool_label(pool: Option<&Arc<Pool>>) -> &str {
     pool.map_or("none", |p| p.name())
+}
+
+/// All affinity attributes participate: a SID must not mask client-IP or host hashing.
+fn parent_reuse_key(
+    state: &State,
+    plan: &Plan<'_>,
+    parents: &[Arc<Parent>],
+    pool: Option<&Arc<Pool>>,
+) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(state.generation.to_be_bytes());
+    hash.update(
+        u64::try_from(parents.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for parent in parents {
+        hash.update(
+            u64::try_from(parent.name.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        hash.update(parent.name.as_bytes());
+    }
+    let pool = pool_label(pool);
+    hash.update(u64::try_from(pool.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hash.update(pool.as_bytes());
+    hash.update(
+        u64::try_from(plan.index.unwrap_or(0))
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for attribute in [
+        HashKey::ClientIp,
+        HashKey::TargetHost,
+        HashKey::User,
+        HashKey::SessionId,
+    ] {
+        hash.update(plan.key.hash_bytes(attribute));
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.finalize())
 }
 
 /// Connect to `ips`, one source address per destination address.
@@ -137,6 +200,63 @@ async fn connect_ips(
             continue;
         };
         for _ in 0..3 {
+            if pool.strategy() == Strategy::Race {
+                let leases = match pool.candidates(Family::of(ip), key, index, &avoid) {
+                    Ok(leases) => leases,
+                    Err(PickError::NoAddressOfFamily) => {
+                        last = Some(ConnectError::NoAddressOfFamily);
+                        break;
+                    }
+                    Err(PickError::Unavailable) => {
+                        last = Some(ConnectError::EgressUnavailable);
+                        break;
+                    }
+                    Err(PickError::BadIndex) => {
+                        last = Some(ConnectError::BadIndex);
+                        break;
+                    }
+                };
+                let attempted: Vec<_> = leases.iter().map(Lease::ip).collect();
+                let futures = leases
+                    .into_iter()
+                    .map(|mut lease| async move {
+                        let started = Instant::now();
+                        match timeout(
+                            per_try.min(deadline.saturating_duration_since(started)),
+                            dial::connect_from(vec![sa], Some(lease.ip())),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => {
+                                lease.report_latency(started.elapsed());
+                                lease.report(true);
+                                let _ = sockopt::apply(&stream, sock);
+                                Ok((stream, Some(lease), ip))
+                            }
+                            Ok(Err(e)) => {
+                                let e = dial_io(e);
+                                if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::AddrNotAvailable
+                                        | io::ErrorKind::NetworkUnreachable
+                                ) {
+                                    lease.report(false);
+                                }
+                                Err(ConnectError::Connect(e))
+                            }
+                            Err(_) => Err(ConnectError::Timeout),
+                        }
+                    })
+                    .collect();
+                match first_success(futures).await {
+                    Ok(result) => return Ok(result),
+                    Err(error) => {
+                        last = Some(error);
+                        avoid.extend(attempted);
+                        continue;
+                    }
+                }
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(ConnectError::Timeout);
@@ -151,12 +271,17 @@ async fn connect_ips(
                     last = Some(ConnectError::EgressUnavailable);
                     break;
                 }
-                Err(PickError::BadIndex) => return Err(ConnectError::BadIndex),
+                Err(PickError::BadIndex) => {
+                    last = Some(ConnectError::BadIndex);
+                    break;
+                }
             };
             let src = lease.ip();
+            let dial_started = Instant::now();
             match timeout(left.min(per_try), dial::connect_from(vec![sa], Some(src))).await {
                 Ok(Ok(s)) => {
                     lease.report(true);
+                    lease.report_latency(dial_started.elapsed());
                     let _ = sockopt::apply(&s, sock);
                     return Ok((s, Some(lease), ip));
                 }
@@ -203,62 +328,27 @@ pub async fn connect(
     plan: &Plan<'_>,
 ) -> Result<Upstream, ConnectError> {
     let started = Instant::now();
+    let selector = plan
+        .chain
+        .and_then(|c| c.hops.first().map(|h| &h.selector))
+        .unwrap_or(&state.selector);
     let work = async {
         if plan.route != Route::Direct {
-            let mut tried: Vec<usize> = Vec::new();
-            let mut last: Option<ConnectError> = None;
-            let mut attempts = 0;
-            while attempts < 3 {
-                let Some(i) = state.parents.select(plan.parents, &tried) else {
-                    break;
-                };
-                tried.push(i);
-                let Some(parent) = state.parents.get(i) else {
-                    break;
-                };
-                // A half-open breaker lets only a few requests through.
-                if !parent.breaker.try_acquire() {
-                    continue;
-                }
-                attempts += 1;
-                match via_parent(state, metrics, idle, connect_timeout, plan, parent).await {
-                    Ok(up) => {
-                        parent.report(true);
-                        metrics
-                            .parent_requests_total
-                            .with_label_values(&[&parent.name, "ok"])
-                            .inc();
-                        return Ok(up);
-                    }
-                    // Our own egress is out of service: not the parent's fault.
-                    Err(
-                        e @ (ConnectError::NoAddressOfFamily
-                        | ConnectError::EgressUnavailable
-                        | ConnectError::BadIndex),
-                    ) => {
-                        parent.breaker.cancel();
-                        last = Some(e);
-                        if matches!(last, Some(ConnectError::BadIndex)) {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        parent.report(false);
-                        metrics
-                            .parent_requests_total
-                            .with_label_values(&[&parent.name, "failed"])
-                            .inc();
-                        last = Some(e);
-                    }
-                }
-            }
-            if plan.route == Route::Parent {
-                return Err(last.unwrap_or(ConnectError::NoParent));
+            let result = if let Some(chain) = plan.chain {
+                connect_chain(state, metrics, idle, connect_timeout, plan, chain).await
+            } else {
+                connect_group(state, metrics, idle, connect_timeout, plan, selector).await
+            };
+            match result {
+                Ok(up) => return Ok(up),
+                Err(error @ ConnectError::Stick(_)) => return Err(error),
+                Err(error) if plan.route == Route::Parent => return Err(error),
+                Err(_) => {}
             }
         }
-        direct(plan, connect_timeout, &state.cfg.tcp.upstream).await
+        direct(state, plan, connect_timeout, &state.cfg.tcp.upstream).await
     };
-    let out = timeout(connect_timeout, work)
+    let out = timeout(selector.cfg.forward_timeout, work)
         .await
         .unwrap_or(Err(ConnectError::Timeout));
     let label = pool_label(plan.pool);
@@ -284,16 +374,20 @@ pub async fn connect(
 }
 
 async fn direct(
+    state: &State,
     plan: &Plan<'_>,
     budget: Duration,
     sock: &SocketOptions,
 ) -> Result<Upstream, ConnectError> {
+    let index = parent_connect::direct_index(state, plan).await?;
     let (stream, lease, peer) = connect_ips(
-        plan.ips, plan.port, plan.pool, &plan.key, plan.index, budget, sock,
+        plan.ips, plan.port, plan.pool, &plan.key, index, budget, sock,
     )
     .await?;
     Ok(Upstream {
-        stream,
+        bound_addr: stream.local_addr().ok(),
+        stream: stream.into(),
+        chain: Vec::new(),
         lease,
         parent: None,
         peer,
@@ -311,112 +405,121 @@ async fn via_parent(
     plan: &Plan<'_>,
     parent: &Arc<Parent>,
 ) -> Result<Upstream, ConnectError> {
+    let Some(attempt) = Attempt::start(parent) else {
+        return Err(ConnectError::NoParent);
+    };
     let fail = |reason: String| ConnectError::Parent {
         name: parent.name.clone(),
         reason,
     };
-    let addrs = match state.resolver.resolve(&parent.host).await {
-        Ok(a) => {
-            metrics.dns_lookups_total.with_label_values(&["ok"]).inc();
-            a
-        }
-        Err(e) => {
-            metrics
-                .dns_lookups_total
-                .with_label_values(&["error"])
-                .inc();
-            return Err(fail(e.to_string()));
-        }
-    };
-    // The connection to the parent leaves from the parent's own pool, else the request's.
-    let own = parent.pool.as_ref().and_then(|n| state.pools.get(n));
-    let pool = own.or(plan.pool);
-    let http_parent = parent.kind == ParentKind::Http && plan.mode == Mode::Http;
-    let reuse_key = (http_parent
-        && plan.reuse
-        && state.cfg.http.parent_keepalive
-        && parent.send_proxy_protocol == SendProxyProtocol::Off)
-        .then(|| {
-            format!(
-                "{}|{}|{:?}|{}",
-                parent.name,
-                pool_label(pool),
-                plan.index,
-                String::from_utf8_lossy(&plan.key.bytes_for_reuse())
-            )
-        });
-    if let Some(key) = &reuse_key {
-        if let Some((stream, lease, peer)) = idle.take(key) {
+    let work = async {
+        let addrs = match state.resolver.resolve(&parent.host).await {
+            Ok(addrs) => {
+                metrics.dns_lookups_total.with_label_values(&["ok"]).inc();
+                addrs
+            }
+            Err(error) => {
+                metrics
+                    .dns_lookups_total
+                    .with_label_values(&["error"])
+                    .inc();
+                return Err(fail(error.to_string()));
+            }
+        };
+        let own = parent.pool.as_ref().and_then(|n| state.pools.get(n));
+        let pool = own.or(plan.pool);
+        let http_parent =
+            matches!(parent.kind, ParentKind::Http | ParentKind::Https) && plan.mode == Mode::Http;
+        let reuse_key = (http_parent
+            && plan.reuse
+            && state.cfg.http.parent_keepalive
+            && parent.send_proxy_protocol == SendProxyProtocol::Off)
+            .then(|| parent_reuse_key(state, plan, std::slice::from_ref(parent), pool));
+        if let Some(key) = &reuse_key {
+            if let Some((stream, lease, peer, bound_addr)) = idle.take(key) {
+                metrics
+                    .parent_conn_reuse_total
+                    .with_label_values(&["reused"])
+                    .inc();
+                return Ok(Upstream {
+                    stream,
+                    bound_addr,
+                    chain: vec![parent.name.clone()],
+                    lease,
+                    parent: Some(Arc::clone(parent)),
+                    peer,
+                    http_proxy: true,
+                    reuse_key,
+                    reused: true,
+                });
+            }
             metrics
                 .parent_conn_reuse_total
-                .with_label_values(&["reused"])
+                .with_label_values(&["new"])
                 .inc();
-            return Ok(Upstream {
-                stream,
-                lease,
-                parent: Some(Arc::clone(parent)),
-                peer,
-                http_proxy: true,
-                reuse_key,
-                reused: true,
-            });
         }
-        metrics
-            .parent_conn_reuse_total
-            .with_label_values(&["new"])
-            .inc();
-    }
-    let (mut stream, lease, peer) = match connect_ips(
-        &addrs,
-        parent.port,
-        pool,
-        &plan.key,
-        plan.index,
-        budget,
-        &state.cfg.tcp.upstream,
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(
-            e @ (ConnectError::NoAddressOfFamily
-            | ConnectError::EgressUnavailable
-            | ConnectError::BadIndex),
-        ) => return Err(e),
-        Err(e) => return Err(fail(e.to_string())),
-    };
-
-    if parent.send_proxy_protocol != SendProxyProtocol::Off
-        && let Ok(dst) = stream.peer_addr()
-    {
-        let header = match parent.send_proxy_protocol {
-            SendProxyProtocol::V1 => proxy_protocol::encode_v1(plan.client, dst),
-            _ => proxy_protocol::encode_v2(plan.client, dst),
+        let (mut tcp, lease, peer) = connect_ips(
+            &addrs,
+            parent.port,
+            pool,
+            &plan.key,
+            plan.index,
+            budget,
+            &state.cfg.tcp.upstream,
+        )
+        .await?;
+        let bound_addr = tcp.local_addr().ok();
+        if parent.send_proxy_protocol != SendProxyProtocol::Off
+            && let Ok(dst) = tcp.peer_addr()
+        {
+            let header = match parent.send_proxy_protocol {
+                SendProxyProtocol::V1 => proxy_protocol::encode_v1(plan.client, dst),
+                _ => proxy_protocol::encode_v2(plan.client, dst),
+            };
+            tcp.write_all(&header)
+                .await
+                .map_err(|e| fail(format!("send PROXY header: {e}")))?;
+        }
+        let target = Target {
+            host: plan.host.to_owned(),
+            port: plan.port,
         };
-        stream
-            .write_all(&header)
-            .await
-            .map_err(|e| fail(format!("send PROXY header: {e}")))?;
-    }
-
-    let target = Target {
-        host: plan.host.to_owned(),
-        port: plan.port,
+        let stream = if http_parent {
+            dial::proxy_transport(tcp, parent.endpoint())
+                .await
+                .map_err(|e| fail(e.to_string()))?
+        } else {
+            handshake(tcp.into(), parent, &target).await?
+        };
+        Ok(Upstream {
+            stream,
+            bound_addr,
+            chain: vec![parent.name.clone()],
+            lease,
+            parent: Some(Arc::clone(parent)),
+            peer,
+            http_proxy: http_parent,
+            reuse_key,
+            reused: false,
+        })
     };
-    if !http_parent {
-        dial::handshake(&mut stream, parent.endpoint(), &target)
-            .await
-            .map_err(|e| fail(e.to_string()))?;
+    let result = timeout(budget, work)
+        .await
+        .unwrap_or(Err(ConnectError::Timeout));
+    match &result {
+        Err(
+            ConnectError::NoAddressOfFamily
+            | ConnectError::EgressUnavailable
+            | ConnectError::BadIndex,
+        ) => drop(attempt),
+        Ok(upstream) if upstream.http_proxy => attempt.defer_http(upstream.reused),
+        _ => attempt.finish(result.is_ok()),
     }
-    Ok(Upstream {
-        stream,
-        lease,
-        parent: Some(Arc::clone(parent)),
-        peer,
-        http_proxy: http_parent,
-        reuse_key,
-        reused: false,
-    })
+    metrics
+        .parent_requests_total
+        .with_label_values(&[&parent.name, if result.is_ok() { "ok" } else { "failed" }])
+        .inc();
+    result
 }
 
 /// Probe a parent: connect to it from its egress pool and, with `target`, open
@@ -427,36 +530,31 @@ pub async fn probe_parent(
     target: Option<&Target>,
     budget: Duration,
 ) -> Result<(), ConnectError> {
-    let fail = |reason: String| ConnectError::Parent {
-        name: parent.name.clone(),
-        reason,
-    };
-    let addrs = state
-        .resolver
-        .resolve(&parent.host)
-        .await
-        .map_err(|e| fail(e.to_string()))?;
-    let own = parent.pool.as_ref().and_then(|n| state.pools.get(n));
-    let key = PickKey {
-        session: None,
-        user: None,
-        client: IpAddr::from([0, 0, 0, 0]),
-    };
     let work = async {
-        let (mut stream, _lease, _) = connect_ips(
+        if let Some(probe) = &parent.probe {
+            return execute_probe(state, std::slice::from_ref(parent), probe, budget).await;
+        }
+        let tunnel = target.is_some();
+        let target = target.cloned().unwrap_or_else(|| Target {
+            host: parent.host.clone(),
+            port: parent.port,
+        });
+        let addrs = state.resolver.resolve(&parent.host).await?;
+        let own = parent.pool.as_ref().and_then(|n| state.pools.get(n));
+        let key = probe_key(&target.host);
+        let default = state.default_pool();
+        let (tcp, _lease, _) = connect_ips(
             &addrs,
             parent.port,
-            own.or(state.default_pool().as_ref()),
+            own.or(default.as_ref()),
             &key,
             None,
             budget,
             &state.cfg.tcp.upstream,
         )
         .await?;
-        if let Some(t) = target {
-            dial::handshake(&mut stream, parent.endpoint(), t)
-                .await
-                .map_err(|e| fail(e.to_string()))?;
+        if tunnel {
+            handshake(tcp.into(), parent, &target).await?;
         }
         Ok(())
     };
@@ -466,7 +564,8 @@ pub async fn probe_parent(
 }
 
 struct IdleConn {
-    stream: TcpStream,
+    stream: ProxyStream,
+    local_ip: Option<IpAddr>,
     lease: Option<Lease>,
     peer: IpAddr,
     since: Instant,
@@ -509,7 +608,7 @@ impl ParentConns {
     }
 
     /// An idle connection that is still open and has sent nothing.
-    fn take(&self, key: &str) -> Option<(TcpStream, Option<Lease>, IpAddr)> {
+    fn take(&self, key: &str) -> Option<(ProxyStream, Option<Lease>, IpAddr, Option<SocketAddr>)> {
         let max_age = self.max_age();
         let mut map = self.map.lock();
         let list = map.get_mut(key)?;
@@ -519,9 +618,18 @@ impl ParentConns {
             }
             // A closed peer reads 0 bytes; a live idle one has nothing to read.
             let mut probe = [0u8; 1];
-            if matches!(c.stream.try_read(&mut probe), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+            let mut probe = ReadBuf::new(&mut probe);
+            let mut stream = c.stream;
+            let mut cx = Context::from_waker(Waker::noop());
+            if Pin::new(&mut stream)
+                .poll_read(&mut cx, &mut probe)
+                .is_pending()
             {
-                return Some((c.stream, c.lease, c.peer));
+                let bound_addr = stream
+                    .local_addr()
+                    .ok()
+                    .or_else(|| c.local_ip.map(|ip| SocketAddr::new(ip, 0)));
+                return Some((stream, c.lease, c.peer, bound_addr));
             }
         }
         if list.is_empty() {
@@ -531,7 +639,14 @@ impl ParentConns {
     }
 
     /// File a connection for the next request. Dropped when the pool is full.
-    pub fn put(&self, key: String, stream: TcpStream, lease: Option<Lease>, peer: IpAddr) {
+    pub fn put(
+        &self,
+        key: String,
+        stream: ProxyStream,
+        lease: Option<Lease>,
+        peer: IpAddr,
+        local_ip: Option<IpAddr>,
+    ) {
         let mut map = self.map.lock();
         let total: usize = map.values().map(Vec::len).sum();
         if total >= self.max_total.load(Ordering::Relaxed) {
@@ -543,6 +658,7 @@ impl ParentConns {
         }
         list.push(IdleConn {
             stream,
+            local_ip,
             lease,
             peer,
             since: Instant::now(),

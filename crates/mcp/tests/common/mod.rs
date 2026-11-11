@@ -192,6 +192,9 @@ pub async fn fake_pool() -> (Fake, Pool) {
             get(|| async { Json(json!({"items": []})) }),
         )
         .route("/v1/inventory/{provider}", put(pool_inventory_put))
+        .route("/v1/orgs/{org}/sessions", get(pool_sessions_list))
+        .route("/v1/orgs/{org}/sessions/{sid}", delete(pool_session_drop))
+        .route("/v1/orgs/{org}/endpoints", post(pool_endpoints))
         .route("/v1/org-blocks", get(pool_blocks).post(pool_block_create))
         .route("/v1/org-blocks/{id}", delete(pool_block_delete))
         .route(
@@ -302,6 +305,61 @@ async fn pool_inventory_put(
     Json(
         json!({"provider": provider, "added": added, "updated": [], "revived": [], "retired": [], "unchanged": 0}),
     )
+}
+
+async fn pool_sessions_list(AxPath(org): AxPath<String>) -> Json<Value> {
+    Json(json!({
+        "org": org,
+        "sessions": [
+            {"sid": "scan42", "provider": "p1", "region": "fr/paris", "exit_ip": "203.0.113.50", "age_seconds": 120, "bytes": 4096},
+            {"sid": "job_7", "provider": "p2", "region": "de", "exit_ip": "203.0.113.51", "age_seconds": 30, "bytes": 10},
+            {"sid": "job_8", "provider": "p2", "region": "de", "exit_ip": "203.0.113.52", "age_seconds": 20, "bytes": 0}
+        ],
+        "affinity": {"entries": 3, "hits": 40, "misses": 3, "evictions": 0, "rotations": 1}
+    }))
+}
+
+async fn pool_session_drop(AxPath((org, sid)): AxPath<(String, String)>) -> Response {
+    if sid == "gone" {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no live session with this sid"})),
+        )
+            .into_response();
+    }
+    Json(json!({"org": org, "sid": sid, "rotated": true})).into_response()
+}
+
+/// Echoes `count` username-only endpoints. A request that carries an org key is refused, like
+/// the real route would not need it.
+async fn pool_endpoints(AxPath(org): AxPath<String>, Json(body): Json<Value>) -> Response {
+    if body.get("org_key").is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unexpected org_key"})),
+        )
+            .into_response();
+    }
+    let count = body["count"].as_u64().unwrap_or(1);
+    let scheme = if body["style"] == "socks5" {
+        "socks5"
+    } else {
+        "http"
+    };
+    let endpoints: Vec<Value> = (0..count)
+        .map(|n| {
+            json!({
+                "sid": format!("gen{n}"),
+                "url": format!("{scheme}://px-cc-fr-sid-gen{n}@{}:8080", body["gateway_host"].as_str().unwrap_or("")),
+                "username": format!("px-cc-fr-sid-gen{n}"),
+            })
+        })
+        .collect();
+    (
+        StatusCode::CREATED,
+        Json(json!({"org": org, "count": count, "endpoints": endpoints})),
+    )
+        .into_response()
 }
 
 async fn pool_blocks(

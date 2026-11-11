@@ -6,7 +6,7 @@ target ports are allowed and how to reset a SIM box. The same adapter is used by
 warmer to create and check units, and by the control API to validate a customer's upstream.
 
 ProxyX bundles no provider accounts. The shipped adapters in `data/adapters/` are **worked examples**: the
-vendor ones (`iproyal_res`, `oxylabs_isp`, `oxylabs_res`) show how a real grammar is expressed, and you bring
+vendor ones (Oxylabs, IPRoyal, Webshare and Bright Data) show how a real grammar is expressed, and you bring
 your own accounts and verify the current grammar with your provider before use. Everything is configured in
 data files and secret files; see [configuration.md](configuration.md) for process settings,
 [policies.md](policies.md) for what a lease may use, and [gateway.md](gateway.md) for how a request reaches an
@@ -41,7 +41,7 @@ adapter.
 | Kind | Subtypes | What a unit is | Who makes units |
 | --- | --- | --- | --- |
 | `static` | `datacenter`, `isp`, `mobile_box` | A rented IP or modem from the inventory. Nothing is created. | You list them in the [inventory](#static-inventory-file); the warmer verifies them. |
-| `rotating` | `residential`, `mobile`, `isp_rotating` | A quota-based session with an id the adapter writes into the credential. | The warmer and the gateway create sessions through the provider. |
+| `rotating` | `residential`, `mobile`, `isp_rotating` | A quota-based provider session. `session_mode = "per_request"` instead describes an independently rotating endpoint, not a reusable pooled exit. | The warmer and gateway create sticky sessions; direct recipes also support per-request endpoints. |
 
 `mobile_box` is a static subtype: a fixed endpoint whose exit IP changes when it is reset (see
 [Mobile boxes](#mobile-boxes)).
@@ -62,7 +62,7 @@ disappears would be worse. After the first load, a reload that fails keeps the l
 | `id` | provider id | required | Unique across all files. |
 | `kind` | `static` or `rotating` | required | Must agree with `subtype`; written out so a file reads on its own. |
 | `subtype` | see the table above | required | |
-| `scheme` | `http`, `socks5` or `local` | `http` | Protocol to the upstream: HTTP CONNECT or SOCKS5. `local` has no upstream: the machine's own IP is the exit (see [Local units](#local-units)). |
+| `scheme` | `http`, `https`, `socks5` or `local` | `http` | Protocol to the upstream: HTTP CONNECT, TLS-protected HTTP CONNECT, or SOCKS5. `https` encrypts the proxy hop and verifies its certificate; it does not intercept destination TLS. `local` uses the machine's own exit IP. |
 | `host` | string | none | Upstream host. The only template placeholder allowed is `{opts}` (where an option with `to = "host"` goes). Required for rotating adapters. A static adapter that leaves it out dials the `host` of each inventory entry. |
 | `port` | 1 to 65535 | none | Upstream port. Required for a rotating adapter unless an option sets it. A static adapter that leaves it out dials the `port` of each inventory entry (a port-per-IP gateway). |
 | `user_file` | string | none | Secret file with the base username. |
@@ -72,7 +72,8 @@ disappears would be worse. After the first load, a reload that fails keeps the l
 | `pass` | template | `"{base_pass}{opts}"` | Password template. |
 | `allowed_ports` | list of ports | empty: any | Target ports the provider allows. A target port outside the list is `403 port_not_allowed` (when every candidate provider refuses it). |
 | `max_conns_per_ip` | count above 0 | none | Provider cap on tunnels per IP, for the lease counters. It is the hard ceiling of the policy's `max_conns_per_ip`; when the policy leaves it unset, 80% of this is used. |
-| `max_session_minutes` | count above 0 | none | Longest session. Rotating: the duration written into the credential and the base of `rotating.max_age`. When unset, 30 minutes. |
+| `max_session_minutes` | count above 0 | none | Explicit upper bound on a requested session duration and the base of `rotating.max_age`. When unset, default sessions use 30 minutes; an option's `max` still limits rendered values. A provider without a duration option receives no duration parameter. |
+| `session_mode` | `sticky` or `per_request` | `sticky` | `sticky` requires a `sid` option. `per_request` forbids `sid`, `ttl` and `strict` options and rotates exits per request. These endpoints cannot satisfy stable exit-IP pool/session validation. |
 | `echo_url` | http(s) URL | none | The provider's echo endpoint, which returns the exit IP as plain text. It is one more vote in the exit-IP check and the target of rotating keepalives. |
 | `public_only` | bool | `false` | The upstream address of every unit must be public routable. Set by the `customer` adapters. |
 | `rotate` | table | none | How to reset a SIM box. Required for subtype `mobile_box`, refused for any other. |
@@ -100,11 +101,11 @@ the order they appear in the file, and the fragments of one field are concatenat
 | `to` | all | Where the fragment is written: `user`, `pass`, `host` or `port`. The field's template must contain `{opts}` (a `port` option needs no template). At most one option may set the port. |
 | `frag` | all | Text written for the option; `{v}` marks the value, exactly once (never, for `strict`). A fragment written to `user` may not contain `:`. No other braces. |
 | `strict_frag` | `sid` only | Written instead of `frag` when the lease is strict. |
-| `charset` | text options | `digits`, `alpha`, `alnum`, `word` (letters, digits, `_`) or `ip` (hex digits, `.` and `:`). Defaults: country `alpha`, city `word`, sid `alnum`, ip `ip`. A `sid` charset must be `alnum` or `word`. |
+| `charset` | text options | `digits`, `alpha`, `alnum`, `word` (letters, digits, `_`), `alpha_underscore` (letters, `_`) or `ip` (hex digits, `.`, `:`). Defaults: country `alpha`, city `word`, sid `alnum`, ip `ip`. A `sid` charset must be `alnum`, `word` or `digits`. |
 | `len` | text options | Exact length in characters. Country defaults to 2. |
 | `max_len` | text options | Longest value in characters. Default 64. `len` may not exceed an explicit `max_len`. |
 | `max` | `ttl` only | Largest value, in the option's `unit`. |
-| `unit` | `ttl` only | `min` (default) or `sec`. The lease asks in minutes; `sec` multiplies by 60. |
+| `unit` | `ttl` only | `min` (default) or `sec`. The recipe accepts a positive whole-second `Duration` and rounds up to a whole provider unit; it never rounds down or exceeds an explicit cap. |
 | `case` | `country`, `city` | `keep` (default), `upper` or `lower`. |
 
 `len`, `max_len` and `max` must be above 0. `charset`, `len` and `max_len` do not apply to `ttl` and `strict`.
@@ -116,20 +117,20 @@ the order they appear in the file, and the fragments of one field are concatenat
 | --- | --- | --- | --- |
 | `country` | Country of the region | both | always |
 | `city` | City of the region | both | the region has a city |
-| `sid` | Session id (generated by the warmer or gateway, `[A-Za-z0-9]`, the adapter's `len`, else its longest allowed length) | rotating | always |
-| `ttl` | Session duration in minutes: `max_session_minutes`, or 30 | rotating | always |
+| `sid` | Session id (generated from `Adapter::session_id_alphabet()`, with the adapter's `len`, else its longest allowed length) | rotating, sticky | always |
+| `ttl` | Requested session duration, normalized to the provider unit; default sessions use `max_session_minutes`, or 30 minutes | rotating, sticky | always |
 | `strict` | Strict-mode flag | rotating | the lease is strict; no value, only `frag` |
 | `ip` | The inventory entry's IP | static | always |
 
 A static adapter may use only `country`, `city` and `ip`. A rotating adapter may not use `ip`, and must have a
-`country` option and a `sid` option, a `host`, and a `port` (or a port option). When a rotating adapter's
-template uses `{base_user}` or `{base_pass}`, the matching `user_file` or `pass_file` is required unless
-`credentials_optional` is set.
+`country` option, a `host`, and a `port` (or a port option). Sticky mode also requires `sid`; per-request mode
+forbids session options. When a rotating adapter's template uses `{base_user}` or `{base_pass}`, the matching
+`user_file` or `pass_file` is required unless `credentials_optional` is set.
 
 A rotating adapter without a `city` option serves country-level regions only: a lease for `fr/paris` is refused
 with the option error "the adapter has no city option", so keep the policy's `regions` to countries for such a
-provider. A strict lease needs a `strict` option or a `strict_frag`; the gateway and the warmer currently
-render non-strict sessions.
+provider. A strict lease needs a `strict` option or a `strict_frag`. Unsupported strict mode is refused, not
+silently downgraded. The chosen lifetime and strictness must survive warming, reuse and upstream dialing.
 
 ## The deterministic recipe
 
@@ -137,6 +138,14 @@ render non-strict sessions.
 whether the upstream is `public_only`). It is pure: the same spec renders the same endpoint, byte for byte. The
 gateway and the warmer render the same spec for a session, so a session created by one is dialed correctly by
 the other.
+
+`UnitSpec::Rotating` carries `session_id`, `ttl: Duration`, `region` and `strict`. Use
+`Adapter::normalize_session_ttl` before comparing recipe options: a 61-second request becomes 120 seconds for a
+minute-based provider, while IPRoyal retains 61 seconds. Zero and fractional-second durations are refused.
+`Adapter::encode_session` persists the normalized duration and strict flag with the upstream session id as
+`sid~seconds~0` or `sid~seconds~1`. `decode_session` reconstructs those exact inputs; legacy bare ids mean the
+adapter's default lifetime and non-strict mode. Malformed identities are errors, never legacy fallbacks.
+Sessions with different normalized lifetimes or strictness must not reuse each other's pooled unit.
 
 Values outside an option's rules are **refused, never escaped**. The recipe fails when:
 
@@ -162,7 +171,8 @@ An entry's subtype must equal the adapter's subtype.
 
 An adapter that cannot work is refused when the file loads: `kind` and `subtype` disagree; a template or
 fragment is malformed; an option appears twice or writes to a field whose template has no `{opts}`; a static
-adapter has `sid`, `ttl` or `strict`; a rotating adapter has `ip`, or lacks `country`, `sid`, a host or a port;
+adapter has `sid`, `ttl` or `strict`; a rotating adapter has `ip`, or lacks `country`, a host or a port; a sticky
+adapter lacks `sid`; a per-request adapter sets session options; a static adapter sets per-request mode;
 `port`, an `allowed_ports` entry, `max_conns_per_ip` or `max_session_minutes` is 0; `echo_url` is not an http(s)
 URL with a host; `rotate` is missing for `mobile_box` or present otherwise; a secret file is unreadable or
 empty; a `public_only` adapter has a literal host that is not public; or a base credential already contains a
@@ -182,9 +192,11 @@ Files in `data/adapters/`:
 | `oxylabs_isp.toml` | `oxylabs_isp` | static, `isp` | Rented ISP IPs, one port per IP. Example of a static adapter. |
 | `oxylabs_res.toml` | `oxylabs_res` | rotating, `residential` | Options in the username. Example of a rotating adapter with a city option and a strict fragment. |
 | `iproyal_res.toml` | `iproyal_res` | rotating, `residential` | Options in the password. Example of a rotating adapter without a city option. |
-| `customer.toml` | `customer`, `customer_socks5` | static, `datacenter` | An org's own upstream over HTTP or SOCKS5. See [Customer upstreams](#customer-upstreams). |
+| `customer.toml` | `customer`, `customer_https`, `customer_socks5` | static, `datacenter` | An org's own upstream over HTTP, TLS-protected HTTP or SOCKS5. See [Customer upstreams](#customer-upstreams). |
 | `vpn-pool.toml` | `vpn-pool` | static, `datacenter` | A local SOCKS5 egress proxy per VPN exit, for upstreams you operate. |
 | `local.toml` | `local` | static, `datacenter` | The machine's own IP addresses, dialed straight from a bound source address. See [Local units](#local-units). |
+| `webshare_res.toml` | `webshare_sticky_http`, `webshare_sticky_socks5`, `webshare_rotating_http`, `webshare_rotating_socks5` | rotating, `residential` | Numeric sticky sessions and genuine per-request rotation over HTTP or SOCKS5. Per-request endpoints are not reusable pooled exits. |
+| `brightdata_zone.toml` | `brightdata_zone` | rotating, `residential` | Full dashboard-generated zone username, geographic parameters, session id and optional strict peer binding. |
 
 The vendor grammars were read from the vendors' documentation on the dates in each file's header comment and are
 shown as examples; confirm them against your own account. Rendered examples below use made-up secrets and
@@ -205,7 +217,7 @@ pass_file = "oxylabs_res_pass"
 user = "customer-{base_user}{opts}"
 pass = "{base_pass}"
 allowed_ports = [80, 443]
-max_session_minutes = 1440
+max_session_minutes = 30
 echo_url = "https://ip.oxylabs.io"
 
 [[adapter.option]]
@@ -214,13 +226,14 @@ to = "user"
 frag = "-cc-{v}"
 case = "upper"
 # city (word, max_len 48), sid (alnum, len 16, strict_frag "-sessid_oneip-{v}") and
-# ttl (min, max 1440) follow the same pattern; see the file.
+# ttl (min, max 30) follow the same pattern; see the file.
 ```
 
 For region `fr/paris`, secret user `acct`, session id `Ab3dEf6hIj9kLm2n`, the username is
-`customer-acct-cc-FR-city-paris-sessid-Ab3dEf6hIj9kLm2n-sesstime-1440`, and the password is the base password.
-The destination port must be 80 or 443; any other port answers `403 port_not_allowed`. The `ttl` written is
-`max_session_minutes` (1440), the longest the session lives.
+`customer-acct-cc-FR-city-paris-sessid-Ab3dEf6hIj9kLm2n-sesstime-30`, and the password is the base password.
+The destination port must be 80 or 443; any other port answers `403 port_not_allowed`. The default `ttl` is
+30 minutes. This example intentionally caps both `sessid` and `sessid_oneip` at 30 minutes; do not interpret
+that conservative configured cap as a claim about every current Oxylabs product's maximum.
 
 ### Rotating, options in the password: `iproyal_res`
 
@@ -251,9 +264,48 @@ charset = "alnum"
 len = 8
 ```
 
-The file also has `ttl` (`_lifetime-{v}m`, max 10080) and `strict` (`_killswitch-1`) options. For region `fr` the
-password is `<base password>_country-fr_session-Ab3dEf6h_lifetime-10080m`. There is no `city` option, so this
-provider serves country-level regions only.
+The file also has `ttl` (`_lifetime-{v}s`, `unit = "sec"`, max 604800) and `strict` (`_killswitch-1`)
+options. For region `fr`, session `Ab3dEf6h` and a 61-second lifetime, the password is
+`<base password>_country-fr_session-Ab3dEf6h_lifetime-61s`. Bounds are exactly 1 second through 7 days,
+inclusive. There is no `city` option, so this provider serves country-level regions only.
+
+### Webshare sticky and per-request HTTP/SOCKS5 endpoints
+
+The [primary connection reference](https://apidocs.webshare.io/proxy-connection) documents
+`{username}-{country_code}-{geo_params}-{session_id}`, numeric sticky ids, and the mutually exclusive
+`-rotate` suffix. The shipped examples use `p.webshare.io:80` for HTTP and `p.webshare.io:1080` for SOCKS5.
+With base username `acct`, country `us`, city `los_angeles` and sticky id `1234567890123456`, both transports
+render `acct-us-city_los_angeles-1234567890123456`; rotating mode renders `acct-us-city_los_angeles-rotate`.
+Cities allow ASCII letters and underscores, not digits or hyphens.
+
+The [Endpoint Generator documentation](https://help.webshare.io/en/articles/16310718-endpoint-generator-rotating-residential)
+sets sticky duration in the dashboard, from 1 minute to 24 hours. There is no documented username lifetime
+parameter. Set each sticky adapter's `max_session_minutes` to the actual dashboard timer before use; the
+1440-minute example is valid only with a 24-hour dashboard timer. A shorter client TTL bounds the local lease;
+it does not change that dashboard timer or guarantee the peer remains available. No strict replacement-blocking
+flag is documented, so strict recipes fail.
+
+`webshare_rotating_http` and `webshare_rotating_socks5` explicitly set `session_mode = "per_request"`.
+Their tracking id and local TTL are not sent upstream. These direct recipe examples do not preserve a stable
+exit between requests, so the stable-IP warmer and pooled session allocator exclude them. Use the sticky
+adapters for pooled sessions; do not relabel a `-rotate` endpoint as sticky.
+
+### Bright Data generic zone username
+
+The [current zone configuration reference](https://docs.brightdata.com/proxy-networks/config-options)
+documents `brd-customer-[customerID]-zone-[zone name]-[optional parameters]`. Put the complete username from
+your zone's dashboard in `brightdata_zone_user`, not just a customer id or a guessed product prefix.
+Confirm host, port, zone product and targeting against the zone's
+[generated examples](https://brightdata.com/cp/zones/proxy_examples) before enabling the adapter.
+The generic example uses `brd.superproxy.io:33335` with `-country-us`, optional `-city-sanfrancisco`,
+`-session-scan42`, and strict `-const`. `-const` returns 502 when the bound peer is unavailable instead of
+silently choosing another peer. Dedicated-IP `-ip-` targeting belongs to a matching dedicated zone, not this
+residential example. This reference supplies no session duration parameter; local TTL is not a remote uptime
+guarantee.
+
+Session syntax and capabilities above were checked on 2026-11-11 against those primary references,
+[Oxylabs session control](https://developers.oxylabs.io/products/proxies/residential-proxies/session-control),
+and [IPRoyal rotation](https://docs.iproyal.com/proxies/residential/proxy/rotation).
 
 ### Static, per-IP port: `oxylabs_isp`
 
@@ -276,7 +328,7 @@ There is no `port` and no options: each inventory entry carries the port of its 
 the key). The username and password are the base secrets, unless an entry names its own `credentials`.
 `max_conns_per_ip = 100` makes the policy default 80 tunnels per IP.
 
-### Customer upstreams: `customer` and `customer_socks5`
+### Customer upstreams: `customer`, `customer_https` and `customer_socks5`
 
 ```toml
 [[adapter]]
@@ -290,8 +342,8 @@ user = "{base_user}"
 pass = "{base_pass}"
 ```
 
-`customer_socks5` is the same with `scheme = "socks5"`. There are no secret files: the login comes from the
-org's stored customer login. See [Customer upstreams](#customer-upstreams).
+`customer_https` uses `scheme = "https"`; `customer_socks5` uses `scheme = "socks5"`. There are no secret
+files: the login comes from the org's stored customer login. See [Customer upstreams](#customer-upstreams).
 
 ### Local egress sidecars: `vpn-pool`
 
@@ -471,8 +523,8 @@ An org can bring its own upstream proxy instead of using the shared pool. The co
 inventory unit **owned by the org**, so only that org can lease it.
 
 - Set it with [`PUT /v1/orgs/{org}/upstream`](gateway.md#put-v1orgsorgupstream) (admin token): `scheme`
-  (`http` or `socks5`), `host`, `port`, `region` and an optional login. `http` uses the provider `customer`,
-  `socks5` uses `customer_socks5`.
+  (`http`, `https` or `socks5`), `host`, `port`, `region` and an optional login. `http` uses `customer`,
+  `https` uses `customer_https`, and `socks5` uses `customer_socks5`.
 - It starts as `candidate` and nothing leases it until
   [`POST .../validate`](gateway.md#post-v1orgsorgupstreamvalidate) passes: a dial through it with the stored
   login and the exit-IP quorum, whose country must be the declared region's. The warmer re-checks it with the

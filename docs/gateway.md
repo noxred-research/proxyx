@@ -188,7 +188,7 @@ username as its egress login.
 
 ```text
 username = "px" *( "-" key "-" value )
-key      = "kind" / "cc" / "city" / "prov" / "ttl" / "sid" / "rot"
+key      = "kind" / "cc" / "city" / "prov" / "ttl" / "sid" / "rot" / "strict"
 value    = 1*( %x61-7A / %x30-39 / "_" )        ; a-z 0-9 _  (never "-")
 ```
 
@@ -201,9 +201,10 @@ anything that does not parse is refused with `403 option_denied` (SOCKS5 reply `
 | `cc` | two lowercase letters | Country (ISO 3166-1 alpha-2). |
 | `city` | `[a-z0-9_]{1,48}` | City slug; requires `cc`. `cc-fr-city-paris` is the region `fr/paris`. |
 | `prov` | provider id | Restrict to one provider adapter. |
-| `ttl` | `30`, `30s`, `10m`, `2h`, `1d` | Lease idle time. Above 0 and at most the policy's `lease_ttl`. |
+| `ttl` | `30`, `30s`, `10m`, `2h`, `1d` | Lease idle time and requested rotating provider-session lifetime. Above 0 and at most the policy's `lease_ttl` and provider's session maximum. Provider-specific units round up; see [providers.md](providers.md). |
 | `sid` | `[a-z0-9_]+` | Sticky key chosen by the caller. |
 | `rot` | `sticky` (default) or `each` | `each` gives every tunnel its own unit. |
+| `strict` | `true` or `false` (default) | Request the adapter's strict-session mode. Unsupported strict mode is refused rather than silently ignored. |
 
 ### Rules
 
@@ -264,11 +265,18 @@ more is `option_denied`. Without options the whole policy is the request.
 | `ttl` | at most `lease_ttl` | `lease_ttl` |
 | `sid` | always | the policy's `sticky_scope` |
 | `rot` | always (not with `sid` for `each`) | `sticky` |
+| `strict` | the selected rotating adapter supports strict sessions when `true` | `false` |
 
 Kinds and providers are narrowed against the base policy of the request. Region and `ttl` are checked
 again against each provider's own policy, because a route-class policy may narrow `regions` and
 `lease_ttl` for its provider. A provider whose policy refuses the request's region or `ttl` is skipped;
 when every provider does, the answer is `option_denied`.
+
+When `ttl` is omitted, the lease uses policy `lease_ttl` while the provider recipe keeps the adapter's
+default session lifetime, so prewarmed sessions remain reusable. An explicit `ttl` also requests that
+provider lifetime, normalized upward to its supported unit. The durable rotating unit identity keeps
+the normalized lifetime and strict flag, and later dials and warmer checks reconstruct the same
+credential. Units warmed with different options are not silently reused for an incompatible request.
 
 ## The open pipeline
 
@@ -329,6 +337,15 @@ key does not jump back to a higher-priority provider right after it moved. An ol
 degraded unit moves to a normal unit when one is free, and an org that took more static IPs than its
 share (see below) gives IPs up at its next tunnel. An open tunnel is never cut by a move.
 
+**Shared affinity table.** Successful sticky tunnels update an org-scoped Redis table across gateway
+replicas. `max_sticky_entries_per_org` sets an optional positive cap; unset means no cap. On insertion
+past the cap, Redis evicts the least recently used key and releases its lease atomically. Recency tracks
+successful tunnel opens, not individual packets. An eviction does not interrupt an already open tunnel.
+Expired leases disappear from the session list. Connection-scoped leases do not enter this table.
+The API exposes hits, misses, evictions, rotations and current entries without org-valued metric labels.
+See the endpoint and session routes below. Affinity updates, like session correlation writes, are
+best effort during a Redis outage; successful updates apply the cap atomically.
+
 ## Lease walk and soft limits
 
 The candidate partitions of a request are walked in this order: each `kind` of the narrowed request in
@@ -388,8 +405,22 @@ the gateway dials it, then sends `CONNECT host:port` (HTTP upstream, with `Proxy
 when the credential has a username; only `200` is accepted, `407` is a credential failure) or a SOCKS5
 `CONNECT` (SOCKS5 upstream).
 
+For scheme `https`, the gateway first establishes TLS to the provider proxy endpoint, validates its
+certificate chain and hostname, then sends HTTP CONNECT inside TLS. This encrypts provider credentials
+and the client-to-provider hop; it is not TLS interception.
+
 **Stage timeouts** of one attempt: DNS 1 s (skipped for an IP literal), TCP connect 2 s over all
 addresses, handshake 3 s. Each stage is recorded in `dial_duration_seconds{provider,stage}`.
+
+**Rotating dial races.** Set `dial.race = 2` in a policy to race up to two distinct rotating units
+within each candidate partition; the supported range is 1 to 16, with default 1. This applies only to
+connection-scoped rotation (`rot-each` or `sticky_scope = "connection"`). Sticky sessions and static
+units remain serial. Provider priority and rank ordering still apply, and a due breaker probe stays
+serial. When ready units are exhausted and creation is allowed, the same width bounds concurrent
+create/verify/dial attempts within partition capacity. The first success wins; pending attempts are
+cancelled and their leases, counters, reservations and incomplete creates are released. Successfully
+verified ready sessions may remain cached for later requests. Cancelled attempts do not charge health
+or breakers, and a refused tunnel charges each failed route class only once.
 
 **Retries.** A dial is tried up to 3 times, with waits of 100 ms and 200 ms, inside the 8 s budget. Only
 these failures retry: a DNS or TCP stage timeout, `429` from the upstream, and a reset, abort, broken
@@ -417,6 +448,12 @@ old: a static IP after 5 minutes, a rotating session after 30 s, once per unit h
 arrive together. The check is bounded at 3 s. A unit whose exit changed (a rotating session that
 changed IP) is withdrawn and the tunnel leases again, up to 3 times per partition. A check that cannot
 reach a verdict (services down, slow) serves the tunnel unverified.
+
+**End-to-end and passive health.** Warmer admission and verification send requests through the complete
+upstream route to representative targets, not just to the proxy listener. Exit-IP quorum separately
+checks the observed exit. Live CONNECT/SOCKS target failures and timeouts already feed shared Redis
+unit strikes: failed units rank last with exponential penalties, and a successful tunnel clears the
+penalty. Local resource exhaustion and cancelled race losers do not count as unhealthy units.
 
 **When a static IP fails the dial.** One IP of its class failing is withdrawn (cooldown 60 s, then the
 warmer retests it) and the tunnel tries another IP. When two distinct IPs of the route class fail within
@@ -580,7 +617,7 @@ See [control-api.md](control-api.md) for the integration guide; this section is 
 
 | Credential | Header | Routes |
 | --- | --- | --- |
-| Admin bearer token | `Authorization: Bearer <token>` | inventory, policies, org keys, org blocks, customer upstreams, `POST /v1/ips/{ip}/block` |
+| Admin bearer token | `Authorization: Bearer <token>` | inventory, policies, org keys, org blocks, customer upstreams, endpoint generation, pool session listing/rotation, `POST /v1/ips/{ip}/block` |
 | Prober bearer token (a separate secret) | `Authorization: Bearer <token>` | `/v1/probe/*` |
 | Org key | HTTP Basic; the password is the org key. The username may carry inbound options and is ignored. | `POST /v1/block-signals` |
 
@@ -896,6 +933,69 @@ curl -sS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: appli
 Disable every key of the org. Response `200`: `{"org": "acme", "disabled": 2}` (the number of keys that
 were enabled). A gateway pod stops trusting a disabled key within 30 s (its cache's fresh time), and answers
 `org_disabled` from then.
+
+### `POST /v1/orgs/{org}/endpoints`
+
+Generate proxy URLs without creating keys or opening provider sessions. Admin bearer required.
+The strict JSON body accepts:
+
+| Field | Meaning |
+| --- | --- |
+| `gateway_host` | Gateway hostname or IP literal. No scheme, path or credentials. |
+| `http_port`, `socks5_port` | Explicit gateway listener ports. The selected style requires its port. |
+| `style` | `http` (default) or `socks5`. HTTP URLs use CONNECT for HTTPS targets; SOCKS5 URLs use proxy-side DNS. |
+| `format` | `json` (default), `csv` or `txt`. |
+| `count` | Number of endpoints, 1 to 10,000; default 1. |
+| `kind`, `country`, `city`, `provider` | Optional username selectors; city requires country. |
+| `rotation` | `sticky` (default), with one unique `sid` per URL, or `each`, without a sticky id. |
+| `ttl` | Optional duration such as `5m`; selectors are checked against org policy, and the gateway applies provider bounds on use. |
+| `strict` | Boolean, default `false`; requests strict provider-session handling. |
+| `org_key` | Optional key to echo as the URL password, validated as belonging to this org. Never loaded from storage, stored or included in audit rows. |
+
+Without `org_key`, URLs contain only the options username; clients must supply their own org key.
+Generation does not grant access or bypass gateway policy. Success is `201` for every format. JSON returns
+`{"org":"acme","count":1,"endpoints":[{"sid":"...","username":"px-sid-...","url":"http://px-sid-...@gateway.example:8080"}]}`.
+Rotation `each` returns `sid: null`. CSV starts with `sid,username,url` and uses CRLF rows; text exports
+contain one URL per line. Responses carry `Cache-Control: no-store`. Treat responses with supplied keys as credentials.
+
+```sh
+curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  "$API/v1/orgs/acme/endpoints" \
+  -d '{"gateway_host":"gateway.example","http_port":8080,"count":3,"kind":"rotating","country":"fr","rotation":"sticky","ttl":"5m","format":"json"}'
+```
+
+### `GET /v1/orgs/{org}/sessions`
+
+List live sticky affinity records from shared Redis, not a gateway pod's local tunnel registry.
+Admin bearer required. Response:
+
+```json
+{
+  "org": "acme",
+  "sessions": [
+    {"sid":"scan42","provider":"residential","region":"fr","exit_ip":"198.51.100.7","age_seconds":12,"bytes":4096}
+  ],
+  "affinity": {"entries":1,"hits":2,"misses":1,"evictions":0,"rotations":0}
+}
+```
+
+Age starts when the affinity entry is created. Bytes include both tunnel directions and appear after
+the keeper tick or tunnel close. Connection-scoped rotation is not listed. Entry caps and eviction
+semantics are described under [Sticky keys](#sticky-keys).
+
+### `DELETE /v1/orgs/{org}/sessions/{sid}`
+
+Force rotation of one sticky `sid`. Admin bearer required. The route releases its lease; the next
+tunnel with that `sid` selects a fresh unit. Existing tunnels continue under normal drain rules.
+The previous unit is excluded until a different unit serves or the old affinity expires; a lone static
+unit cannot immediately be reselected. Success is `200` with `{"org":"acme","sid":"scan42","rotated":true}`;
+an unknown or expired sid is `404`. The org boundary is part of every lookup.
+
+All three endpoint/session routes share a Redis-backed limit of 60 requests per minute per org.
+Excess requests return `429` with `Retry-After`. Audit rows record the operator, org, action and
+outcome, never generated URLs or the supplied key. Invalid options are `400`; org policy denials or
+a supplied key belonging to another org are `403`. Authentication fails with `401`, and unavailable
+storage returns `503`.
 
 ### `GET /v1/orgs/{org}/upstream`
 

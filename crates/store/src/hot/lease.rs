@@ -420,6 +420,23 @@ impl Hot {
         .map(|_| ())
     }
 
+    /// Remove a race loser's unit counter without marking the tunnel closed.
+    /// The winner can use the same tunnel id on another unit of the partition.
+    /// Only use before traffic renewal has started for this attempt; unlike
+    /// [`Hot::unit_tunnel_close`], this does not fence a late tunnel touch.
+    ///
+    /// # Errors
+    /// Returns a Redis error when removing the unit counter fails.
+    pub async fn unit_tunnel_cancel(&self, t: &TunnelRef) -> Result<()> {
+        self.run_ready::<i64>(
+            &self.scripts.tunnel_close,
+            &t.partition,
+            json!({ "unit": t.unit, "member": t.member(), "mark": false }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Push the deadline of an open tunnel in both counters. A counter that
     /// lost the tunnel (Redis data loss, or an outage longer than the tunnel
     /// TTL) counts it again. Returns false when the tunnel was closed with

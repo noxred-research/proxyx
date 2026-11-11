@@ -30,7 +30,7 @@ All families are defined in `crates/pool-common/src/metrics.rs` (`Metrics::new(s
 - **Type:** histogram (buckets 5 ms to 8 s)
 - **Labels:** `provider` (configured adapter id), `stage` (dns, tcp, handshake, first_byte)
 - **Source:** event, `crates/dial/src/lib.rs` (`dns`, `tcp`, `handshake`, also when the stage fails or times out); `dial::record_first_byte` from `crates/gateway` (`first_byte`)
-- **Meaning:** Upstream dial time per stage. A slow provider shows in `handshake`, a slow target in `first_byte`.
+- **Meaning:** Upstream dial time per stage. `handshake` includes TLS to an HTTPS proxy plus CONNECT under one shared budget. A slow provider shows in `handshake`, a slow target in `first_byte`. Rotating dial races record each attempted upstream, including completed failures, not a new metric family.
 - **Query:** `histogram_quantile(0.95, sum by (le, provider, stage) (rate(proxyx_pool_dial_duration_seconds_bucket[5m])))`
 
 ### `proxyx_pool_org_capacity_refusals_total`
@@ -53,7 +53,7 @@ All families are defined in `crates/pool-common/src/metrics.rs` (`Metrics::new(s
 - **Type:** counter
 - **Labels:** `route` (the matched route template, or unmatched; never the raw path), `status_class` (1xx, 2xx, 3xx, 4xx, 5xx, other)
 - **Source:** event, `crates/pool-api` request middleware, once per answered `/v1` request; the ops routes (`/healthz`, `/readyz`, `/metrics`) are not counted
-- **Meaning:** Control API requests by route and status class. `other` is a status outside 100 to 599. The route is a template such as `/v1/orgs/{org}/keys`, so no org or id reaches a label.
+- **Meaning:** Control API requests by route and status class. `other` is a status outside 100 to 599. Routes include `/v1/orgs/{org}/endpoints`, `/v1/orgs/{org}/sessions` and `/v1/orgs/{org}/sessions/{sid}`. Templates never expose orgs, session ids, generated URLs or keys as labels. Per-org affinity entries, hits, misses, evictions and rotations are Redis/API statistics, not Prometheus labels.
 - **Query:** `sum by (route, status_class) (rate(proxyx_pool_api_requests_total{status_class=~"4xx|5xx"}[5m]))`
 
 ### `proxyx_pool_api_request_duration_seconds`

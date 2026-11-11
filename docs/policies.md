@@ -60,10 +60,10 @@ policy, then the org's own policy, applied field by field:
 - Lists (`kinds`, `providers`, `regions`) are replaced as a whole.
 - `min_ready_by_region` merges per region: the more specific policy's entries win for the same region and
   the others stay.
-- Each sub-table (`criteria`, `on_empty`, `block`, `static`, `mobile_box`, `rotating`, `rotating.stability`,
-  `cost`) merges per field.
-- `limits` are ceilings: the **lowest** value in the chain wins, so a lower scope can lower a ceiling and
-  never raise it.
+- Each sub-table (`criteria`, `on_empty`, `dial`, `block`, `static`, `mobile_box`, `rotating`,
+  `rotating.stability`, `cost`) merges per field.
+- `limits` and `max_sticky_entries_per_org` are ceilings: the **lowest** value in the chain wins,
+  so a lower scope can lower a ceiling and never raise it. Leaving a ceiling unset keeps the inherited cap.
 
 A route-class policy applies to every org on that provider. An org's policy applies to that org on every
 provider. Where both exist the org value wins. An org that has no policy of its own gets the global and
@@ -131,11 +131,25 @@ unverified, so it is not admitted. See [providers.md](providers.md#reputation-sc
 | `max_conns_per_ip` | count, at least 1 | unset: 80% of the adapter's `max_conns_per_ip` (at least 1) | Tunnels per IP. A soft limit with a ceiling of twice the value (never above the adapter's limit). With neither set, there is no cap. |
 | `rest_after_release` | duration | `30s` | How long a unit rests between two orgs. A soft limit. Zero is allowed. |
 | `max_tunnels_per_org` | count, at least 1 | unset: no cap | Cap on open tunnels of an org. In a route-class policy it caps the org's tunnels on that provider only; the global or org value caps the org in total. |
+| `max_sticky_entries_per_org` | count, at least 1 | unset: no cap | Ceiling on sticky entries for one org. The lowest configured value across global, route-class and org scopes wins. |
 
 `rest_after_release`, `orgs_hard` and `max_conns_per_ip` are soft limits. A unit they keep back is skipped
 while another unit is free of them; with none left, the lease breaks them lowest first (rest, then
 `orgs_hard`, then `max_conns`, then the monthly fair-use stop), and `lease_limit_broken_total{limit,provider}`
 counts it. See [gateway.md](gateway.md#lease-walk-and-soft-limits).
+
+Clients may send `px-strict-true` to request strict lease selection, or `px-strict-false` to keep the
+default behaviour. The `strict` username option accepts only lowercase `true` or `false`; repeated keys
+and other values are refused. An omitted option produces a lease request with `strict = false`.
+
+### `dial`
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `race` | integer, 1 through 16 | 1 | Maximum concurrent candidate upstream dials. `1` preserves serial dialing; larger values race candidates. |
+
+Set it with `dial.race = 4` or `[policy.dial]` followed by `race = 4`. Like other ordinary policy fields,
+the most specific configured value wins; an omitted value inherits.
 
 ### `on_empty`
 
@@ -257,7 +271,8 @@ the warmer and the control API read. Three further results are derived from it:
 - **Connections per IP**: `max_conns_per_ip`, or 80% of the adapter's `max_conns_per_ip`, at least 1.
 
 A request narrows the effective policy with its username options and gets a lease request: the kinds, providers,
-regions and idle time it may use. See [How options narrow the policy](gateway.md#how-options-narrow-the-policy).
+regions and idle time it may use, plus the client's `strict` flag (default `false`). See
+[How options narrow the policy](gateway.md#how-options-narrow-the-policy).
 
 ## Validation
 
@@ -292,6 +307,8 @@ Field checks (reported as `<policies merged>: <field>: <reason>`):
 | `criteria.min_success`, `criteria.browser_sample` | 0 to 1 |
 | `criteria.verdict_max_age`, `lease_ttl`, `create_deadline`, `block.target_cooldown`, `block.signal_window`, `static.cooldown`, `static.retest_every`, `static.recheck_every`, `static.replace_quarantine_for`, `mobile_box.rotate_timeout`, `mobile_box.offline_after`, `rotating.ready_ttl`, `rotating.max_age`, `rotating.min_remaining`, `rotating.keepalive`, `rotating.recheck_every` | above 0 |
 | `orgs_hard`, `max_conns_per_ip`, `max_tunnels_per_org`, `block.escalate_*`, `static.quarantine_after`, `static.replace_after_checks`, `static.replace_min_sources`, `mobile_box.rotate_attempts`, `mobile_box.rotate_per_hour`, `rotating.refill_concurrency`, `rotating.refill_rate`, `rotating.stability.*` | at least 1 |
+| `max_sticky_entries_per_org` | at least 1 when set; only tightens across scopes |
+| `dial.race` | integer from 1 through 16 |
 | `block.max_cooldown_share`, `static.replace_blocked_share` | above 0 up to 1 |
 | `on_empty.static` | `wait` or `fail`; `create` is refused |
 | `rotating.min_remaining` | below `rotating.max_age` when that is set |

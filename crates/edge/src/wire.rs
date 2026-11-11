@@ -10,7 +10,7 @@
 use std::io;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -23,13 +23,13 @@ const READ_CHUNK: usize = 16 * 1024;
 const MAX_CHUNK_LINE: usize = 1024;
 
 /// A socket with the bytes read ahead of the parser.
-pub struct Pipe {
-    pub stream: TcpStream,
+pub struct Pipe<S = TcpStream> {
+    pub stream: S,
     pub buf: Vec<u8>,
 }
 
-impl Pipe {
-    pub fn new(stream: TcpStream) -> Self {
+impl<S: AsyncRead + Unpin> Pipe<S> {
+    pub fn new(stream: S) -> Self {
         Self {
             stream,
             buf: Vec::new(),
@@ -38,8 +38,13 @@ impl Pipe {
 
     /// Read more bytes into the buffer; `Ok(0)` is end of stream.
     pub async fn fill(&mut self, limit: Duration) -> io::Result<usize> {
+        self.fill_at_most(limit, READ_CHUNK).await
+    }
+
+    /// Head readers may consume only their remaining size budget.
+    async fn fill_at_most(&mut self, limit: Duration, max: usize) -> io::Result<usize> {
         let start = self.buf.len();
-        self.buf.resize(start + READ_CHUNK, 0);
+        self.buf.resize(start + READ_CHUNK.min(max), 0);
         let r = timeout(limit, self.stream.read(&mut self.buf[start..])).await;
         match r {
             Ok(Ok(n)) => {
@@ -57,7 +62,7 @@ impl Pipe {
         }
     }
 
-    pub fn into_parts(self) -> (TcpStream, Vec<u8>) {
+    pub fn into_parts(self) -> (S, Vec<u8>) {
         (self.stream, self.buf)
     }
 }
@@ -106,8 +111,8 @@ fn collect(h: &[httparse::Header<'_>]) -> Vec<Header> {
 }
 
 /// Read one request head. `limit` bounds each wait for bytes; `max` the head size.
-pub async fn read_request_head(
-    pipe: &mut Pipe,
+pub async fn read_request_head<S: AsyncRead + Unpin>(
+    pipe: &mut Pipe<S>,
     max: usize,
     limit: Duration,
 ) -> Result<RequestHead, HeadError> {
@@ -115,7 +120,7 @@ pub async fn read_request_head(
         if !pipe.buf.is_empty() {
             let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let mut req = httparse::Request::new(&mut headers);
-            match req.parse(&pipe.buf) {
+            match req.parse(&pipe.buf[..pipe.buf.len().min(max)]) {
                 Ok(httparse::Status::Complete(n)) => {
                     let head = RequestHead {
                         method: req.method.unwrap_or_default().to_owned(),
@@ -130,11 +135,11 @@ pub async fn read_request_head(
                 Err(httparse::Error::TooManyHeaders) => return Err(HeadError::TooLarge),
                 Err(_) => return Err(HeadError::Malformed("not a valid HTTP request")),
             }
-            if pipe.buf.len() >= max {
-                return Err(HeadError::TooLarge);
-            }
         }
-        match pipe.fill(limit).await? {
+        if pipe.buf.len() >= max {
+            return Err(HeadError::TooLarge);
+        }
+        match pipe.fill_at_most(limit, max - pipe.buf.len()).await? {
             0 if pipe.buf.is_empty() => return Err(HeadError::Closed),
             0 => {
                 return Err(HeadError::Malformed(
@@ -146,8 +151,8 @@ pub async fn read_request_head(
     }
 }
 
-pub async fn read_response_head(
-    pipe: &mut Pipe,
+pub async fn read_response_head<S: AsyncRead + Unpin>(
+    pipe: &mut Pipe<S>,
     max: usize,
     limit: Duration,
 ) -> Result<ResponseHead, HeadError> {
@@ -155,7 +160,7 @@ pub async fn read_response_head(
         if !pipe.buf.is_empty() {
             let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
             let mut resp = httparse::Response::new(&mut headers);
-            match resp.parse(&pipe.buf) {
+            match resp.parse(&pipe.buf[..pipe.buf.len().min(max)]) {
                 Ok(httparse::Status::Complete(n)) => {
                     let head = ResponseHead {
                         status: resp.code.unwrap_or(0),
@@ -170,11 +175,11 @@ pub async fn read_response_head(
                 Err(httparse::Error::TooManyHeaders) => return Err(HeadError::TooLarge),
                 Err(_) => return Err(HeadError::Malformed("not a valid HTTP response")),
             }
-            if pipe.buf.len() >= max {
-                return Err(HeadError::TooLarge);
-            }
         }
-        match pipe.fill(limit).await? {
+        if pipe.buf.len() >= max {
+            return Err(HeadError::TooLarge);
+        }
+        match pipe.fill_at_most(limit, max - pipe.buf.len()).await? {
             0 if pipe.buf.is_empty() => return Err(HeadError::Closed),
             0 => {
                 return Err(HeadError::Malformed(
@@ -309,7 +314,11 @@ pub fn render_head(line: &str, headers: &[Header]) -> Vec<u8> {
     out
 }
 
-async fn write_paced(dst: &mut TcpStream, data: &[u8], shaper: &Shaper) -> io::Result<()> {
+async fn write_paced<W: AsyncWrite + Unpin>(
+    dst: &mut W,
+    data: &[u8],
+    shaper: &Shaper,
+) -> io::Result<()> {
     if shaper.is_limited() {
         let step = shaper.chunk(READ_CHUNK);
         for piece in data.chunks(step) {
@@ -326,9 +335,9 @@ fn eof() -> io::Error {
     io::Error::from(io::ErrorKind::UnexpectedEof)
 }
 
-async fn copy_exact(
-    src: &mut Pipe,
-    dst: &mut TcpStream,
+async fn copy_exact<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    src: &mut Pipe<R>,
+    dst: &mut W,
     mut n: u64,
     shaper: &Shaper,
     idle: Duration,
@@ -348,7 +357,11 @@ async fn copy_exact(
 }
 
 /// Read one line up to and including CRLF out of the buffer (filling it as needed).
-async fn take_line(src: &mut Pipe, max: usize, idle: Duration) -> io::Result<Vec<u8>> {
+async fn take_line<R: AsyncRead + Unpin>(
+    src: &mut Pipe<R>,
+    max: usize,
+    idle: Duration,
+) -> io::Result<Vec<u8>> {
     loop {
         if let Some(i) = src.buf.windows(2).position(|w| w == b"\r\n") {
             let line: Vec<u8> = src.buf.drain(..i + 2).collect();
@@ -374,9 +387,9 @@ fn chunk_size(line: &[u8]) -> io::Result<u64> {
     u64::from_str_radix(digits, 16).map_err(|_| bad())
 }
 
-async fn copy_chunked(
-    src: &mut Pipe,
-    dst: &mut TcpStream,
+async fn copy_chunked<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    src: &mut Pipe<R>,
+    dst: &mut W,
     shaper: &Shaper,
     idle: Duration,
     max_trailer: usize,
@@ -421,9 +434,9 @@ async fn copy_chunked(
     }
 }
 
-async fn copy_until_close(
-    src: &mut Pipe,
-    dst: &mut TcpStream,
+async fn copy_until_close<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    src: &mut Pipe<R>,
+    dst: &mut W,
     shaper: &Shaper,
     idle: Duration,
     moved: &mut u64,
@@ -440,9 +453,9 @@ async fn copy_until_close(
 }
 
 /// Pass one message body from `src` to `dst`. Returns the bytes moved.
-pub async fn copy_body(
-    src: &mut Pipe,
-    dst: &mut TcpStream,
+pub async fn copy_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    src: &mut Pipe<R>,
+    dst: &mut W,
     framing: Framing,
     shaper: &Shaper,
     idle: Duration,
@@ -564,6 +577,58 @@ mod tests {
     }
 
     const IDLE: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn complete_heads_cannot_bypass_the_limit_and_bodies_do_not_count() {
+        let request = b"GET / HTTP/1.1\r\nX: value\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nX: value\r\n\r\n";
+        for (head, request_side) in [(request.as_slice(), true), (response.as_slice(), false)] {
+            for maximum in [0, head.len() - 1, head.len()] {
+                let mut pipe = Pipe::new(tokio::io::empty());
+                pipe.buf.extend_from_slice(head);
+                // Read-ahead body/pipeline bytes are not part of the head budget.
+                pipe.buf.extend_from_slice(&[b'x'; 8192]);
+                let result = if request_side {
+                    read_request_head(&mut pipe, maximum, IDLE)
+                        .await
+                        .map(|_| ())
+                } else {
+                    read_response_head(&mut pipe, maximum, IDLE)
+                        .await
+                        .map(|_| ())
+                };
+                if maximum == head.len() {
+                    assert!(result.is_ok());
+                    assert_eq!(pipe.buf, vec![b'x'; 8192]);
+                } else {
+                    assert!(matches!(result, Err(HeadError::TooLarge)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn head_reads_never_consume_past_the_remaining_budget() {
+        let oversized = b"GET / HTTP/1.1\r\nX: long value\r\n\r\npayload";
+        let mut pipe = Pipe::new(&oversized[..]);
+        let max = oversized.len() - b"\r\n\r\npayload".len();
+        assert!(matches!(
+            read_request_head(&mut pipe, max, IDLE).await,
+            Err(HeadError::TooLarge)
+        ));
+        assert_eq!(pipe.buf.len(), max);
+        assert_eq!(pipe.stream, &oversized[max..]);
+
+        let oversized = b"HTTP/1.1 200 OK\r\nX: long value\r\n\r\npayload";
+        let mut pipe = Pipe::new(&oversized[..]);
+        let max = oversized.len() - b"\r\n\r\npayload".len();
+        assert!(matches!(
+            read_response_head(&mut pipe, max, IDLE).await,
+            Err(HeadError::TooLarge)
+        ));
+        assert_eq!(pipe.buf.len(), max);
+        assert_eq!(pipe.stream, &oversized[max..]);
+    }
 
     #[tokio::test]
     async fn request_heads_parse_across_reads_and_keep_pipelined_bytes() {

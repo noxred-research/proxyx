@@ -1,4 +1,4 @@
-//! Upstream dial through HTTP CONNECT or SOCKS5 with per-stage timing.
+//! Upstream dial through HTTP(S) CONNECT or SOCKS5 with per-stage timing.
 //!
 //! One attempt per call: the caller owns retries and uses
 //! [`DialError::is_retryable`] to pick the retryable failures.
@@ -10,9 +10,12 @@
 mod destination;
 mod http;
 mod socks5;
+mod tls;
+mod transport;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::Cause;
@@ -23,6 +26,8 @@ use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::time::{Instant, timeout};
 
 pub use destination::is_denied_destination;
+pub use tls::proxy_tls_config;
+pub use transport::ProxyStream;
 
 /// A step of the dial, and the `stage` label of `dial_duration_seconds`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +57,7 @@ pub struct DialTimeouts {
     pub dns: Duration,
     /// TCP connect, over all resolved addresses together.
     pub tcp: Duration,
-    /// HTTP CONNECT or SOCKS5 exchange, from first byte sent to tunnel open.
+    /// Proxy TLS (HTTPS only) and CONNECT or SOCKS5, through tunnel open.
     pub handshake: Duration,
     /// TCP keepalive of the dialed socket; `None` turns it off.
     pub keepalive: Option<TcpKeepalive>,
@@ -263,6 +268,9 @@ fn observe(m: &Metrics, provider: &ProviderId, stage: Stage, elapsed: Duration) 
 /// stream is positioned right after the upstream's reply: no tunnel byte was
 /// consumed. A failure is a [`DialError`]; [`DialError::cause`] gives the
 /// gateway answer.
+/// HTTPS proxies first establish validated TLS using the system trust store,
+/// then send CONNECT and credentials inside TLS. TLS and CONNECT share the
+/// handshake stage budget; target TLS remains the caller's responsibility.
 ///
 /// With `up.public_only` (an upstream the customer chose) the upstream host is
 /// resolved here, every address it resolves to must pass
@@ -279,12 +287,38 @@ pub async fn dial(
     target: &Target,
     t: &DialTimeouts,
     m: &Metrics,
-) -> Result<TcpStream, DialError> {
+) -> Result<ProxyStream, DialError> {
     let source = local_source(up)?;
     let keepalive = t.keepalive;
     dial_with(up, target, t, m, resolve, move |a| {
         connect_from_with(a, source, keepalive)
     })
+    .await
+}
+
+/// [`dial`] with an explicit validating proxy TLS configuration, for private
+/// certificate authorities. Build it with [`proxy_tls_config`].
+///
+/// # Errors
+/// Returns the same stage, protocol and certificate errors as [`dial`].
+pub async fn dial_with_tls_config(
+    up: &UpstreamEndpoint,
+    target: &Target,
+    t: &DialTimeouts,
+    m: &Metrics,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<ProxyStream, DialError> {
+    let source = local_source(up)?;
+    let keepalive = t.keepalive;
+    dial_with_transport(
+        up,
+        target,
+        t,
+        m,
+        resolve,
+        move |a| connect_from_with(a, source, keepalive),
+        Some(tls),
+    )
     .await
 }
 
@@ -309,7 +343,25 @@ async fn dial_with<R, Fut, C, CFut>(
     m: &Metrics,
     resolver: R,
     connector: C,
-) -> Result<TcpStream, DialError>
+) -> Result<ProxyStream, DialError>
+where
+    R: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = Result<Vec<SocketAddr>, DialError>>,
+    C: FnOnce(Vec<SocketAddr>) -> CFut,
+    CFut: Future<Output = Result<TcpStream, DialError>>,
+{
+    dial_with_transport(up, target, t, m, resolver, connector, None).await
+}
+
+async fn dial_with_transport<R, Fut, C, CFut>(
+    up: &UpstreamEndpoint,
+    target: &Target,
+    t: &DialTimeouts,
+    m: &Metrics,
+    resolver: R,
+    connector: C,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<ProxyStream, DialError>
 where
     R: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = Result<Vec<SocketAddr>, DialError>>,
@@ -340,7 +392,9 @@ where
         }) {
             return Err(DialError::DeniedAddress);
         }
-        return timed(m, &up.provider, Stage::Tcp, t.tcp, connector(addrs)).await;
+        return timed(m, &up.provider, Stage::Tcp, t.tcp, connector(addrs))
+            .await
+            .map(ProxyStream::from);
     }
     check_sendable(up, host)?;
 
@@ -368,30 +422,75 @@ where
         return Err(DialError::DeniedAddress);
     }
 
-    let mut stream = timed(m, &up.provider, Stage::Tcp, t.tcp, connector(addrs)).await?;
+    let stream = timed(m, &up.provider, Stage::Tcp, t.tcp, connector(addrs)).await?;
+    let handshake = handshake_config(stream.into(), up, target, tls);
+    timed(m, &up.provider, Stage::Handshake, t.handshake, handshake).await
+}
 
-    let handshake = handshake(&mut stream, up, target);
-    timed(m, &up.provider, Stage::Handshake, t.handshake, handshake).await?;
+/// Open a tunnel on an established transport, including a previous proxy
+/// tunnel. HTTPS adds a validated TLS layer before CONNECT. The returned
+/// stream preserves all tunnel bytes following the proxy's reply.
+///
+/// # Errors
+/// Returns TLS, protocol or authentication errors. `Local` has no proxy.
+/// This function has no timeout; callers must bound the whole handshake.
+pub async fn handshake<S: Into<ProxyStream>>(
+    stream: S,
+    up: &UpstreamEndpoint,
+    target: &Target,
+) -> Result<ProxyStream, DialError> {
+    handshake_config(stream.into(), up, target, None).await
+}
 
+/// [`handshake`] with explicit proxy trust roots, including nested HTTPS hops.
+///
+/// # Errors
+/// Returns the same errors as [`handshake`]. The caller owns the timeout.
+pub async fn handshake_with_tls_config<S: Into<ProxyStream>>(
+    stream: S,
+    up: &UpstreamEndpoint,
+    target: &Target,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<ProxyStream, DialError> {
+    handshake_config(stream.into(), up, target, Some(tls)).await
+}
+
+async fn handshake_config(
+    stream: ProxyStream,
+    up: &UpstreamEndpoint,
+    target: &Target,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<ProxyStream, DialError> {
+    let host = target_host(target)?;
+    check_sendable(up, host)?;
+    if up.scheme == UpstreamScheme::Local {
+        return Err(DialError::LocalSource("no upstream proxy to talk to"));
+    }
+    let mut stream = tls::transport(stream, up, tls).await?;
+    match up.scheme {
+        UpstreamScheme::Http | UpstreamScheme::Https => {
+            http::connect(&mut stream, up, host, target.port).await?
+        }
+        UpstreamScheme::Socks5 => socks5::connect(&mut stream, up, host, target.port).await?,
+        UpstreamScheme::Local => {
+            return Err(DialError::LocalSource("no upstream proxy to talk to"));
+        }
+    }
     Ok(stream)
 }
 
-/// Open the tunnel to `target` on a stream already connected to the proxy
-/// `up` (HTTP CONNECT or SOCKS5, with `up`'s credential). The stream is left
-/// right after the proxy's reply. Calling it for a `Local` endpoint is a
-/// [`DialError::LocalSource`]: there is no proxy to talk to.
-pub async fn handshake(
-    stream: &mut TcpStream,
+/// Secure an established connection to an HTTPS proxy without sending CONNECT.
+/// HTTP and SOCKS transports pass through unchanged. Useful for forwarding an
+/// absolute-form HTTP request or preparing a multi-hop proxy chain.
+///
+/// # Errors
+/// Returns certificate, hostname or TLS handshake errors. The caller owns
+/// the timeout. System trust roots verify the proxy, not the target.
+pub async fn proxy_transport<S: Into<ProxyStream>>(
+    stream: S,
     up: &UpstreamEndpoint,
-    target: &Target,
-) -> Result<(), DialError> {
-    let host = target_host(target)?;
-    check_sendable(up, host)?;
-    match up.scheme {
-        UpstreamScheme::Http => http::connect(stream, up, host, target.port).await,
-        UpstreamScheme::Socks5 => socks5::connect(stream, up, host, target.port).await,
-        UpstreamScheme::Local => Err(DialError::LocalSource("no upstream proxy to talk to")),
-    }
+) -> Result<ProxyStream, DialError> {
+    tls::transport(stream.into(), up, None).await
 }
 
 /// Run one stage under its limit and record its time, also when it fails or

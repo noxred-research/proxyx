@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use anyhow::bail;
 
-use crate::config::{ForwardedFor, HttpConfig};
+use crate::config::{Action, ForwardedFor, HeaderRuleConfig, HttpConfig, RuleConfig, RuleStage};
 
 /// One header as read from the wire (value bytes are not necessarily UTF-8).
 pub type Header = (String, Vec<u8>);
@@ -41,6 +41,91 @@ pub struct HeaderPolicy {
     req_set: Vec<(String, String)>,
     resp_remove: HashSet<String>,
     resp_set: Vec<(String, String)>,
+    rules: Vec<RuleEdits>,
+}
+
+#[derive(Debug, Clone)]
+struct RuleEdits {
+    rule: String,
+    request_remove: Vec<String>,
+    request_set: Vec<Header>,
+    response_remove: Vec<String>,
+    response_set: Vec<Header>,
+}
+
+fn check_edit_name(name: &str) -> anyhow::Result<()> {
+    if !is_token(name)
+        || HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+        || ["host", "content-length", "transfer-encoding"]
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+    {
+        bail!("http.header_rule: cannot rewrite routing, framing or connection header {name:?}");
+    }
+    Ok(())
+}
+
+impl RuleEdits {
+    fn compile(c: &HeaderRuleConfig) -> anyhow::Result<Self> {
+        for name in c
+            .request_headers_remove
+            .iter()
+            .chain(&c.response_headers_remove)
+            .chain(c.request_headers_set.keys())
+            .chain(c.response_headers_set.keys())
+        {
+            check_edit_name(name)?;
+        }
+        let sets = |values: &std::collections::BTreeMap<String, String>| {
+            values
+                .iter()
+                .map(|(name, value)| {
+                    if !check_value(value) {
+                        bail!("http.header_rule: invalid header value for {name:?}");
+                    }
+                    Ok((name.clone(), value.as_bytes().to_vec()))
+                })
+                .collect::<anyhow::Result<Vec<Header>>>()
+        };
+        Ok(Self {
+            rule: c.rule.clone(),
+            request_remove: c.request_headers_remove.clone(),
+            request_set: sets(&c.request_headers_set)?,
+            response_remove: c.response_headers_remove.clone(),
+            response_set: sets(&c.response_headers_set)?,
+        })
+    }
+}
+
+/// Every scoped policy names exactly one allow rule; ambiguous references fail closed.
+pub fn validate_rules(c: &HttpConfig, rules: &[RuleConfig]) -> anyhow::Result<()> {
+    let mut seen = HashSet::new();
+    for policy in &c.header_rules {
+        let mut matching = rules
+            .iter()
+            .filter(|rule| rule.name.as_deref() == Some(&policy.rule));
+        let valid = matching
+            .next()
+            .is_some_and(|rule| rule.action == Action::Allow && rule.stage == RuleStage::Request)
+            && matching.next().is_none();
+        if policy.rule.is_empty() || !valid || !seen.insert(&policy.rule) {
+            bail!(
+                "http.header_rule: {:?} must name one unique request-stage allow rule",
+                policy.rule
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_edits(h: &mut Vec<Header>, remove: &[String], set: &[Header]) {
+    h.retain(|(name, _)| {
+        !remove.iter().any(|other| name.eq_ignore_ascii_case(other))
+            && !set
+                .iter()
+                .any(|(other, _)| name.eq_ignore_ascii_case(other))
+    });
+    h.extend_from_slice(set);
 }
 
 impl HeaderPolicy {
@@ -76,6 +161,11 @@ impl HeaderPolicy {
             req_set: sets("request_headers_set", &c.request_headers_set)?,
             resp_remove: names("response_headers_remove", &c.response_headers_remove)?,
             resp_set: sets("response_headers_set", &c.response_headers_set)?,
+            rules: c
+                .header_rules
+                .iter()
+                .map(RuleEdits::compile)
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 
@@ -140,6 +230,28 @@ impl HeaderPolicy {
         for (k, v) in &self.resp_set {
             h.retain(|(n, _)| !n.eq_ignore_ascii_case(k));
             h.push((k.clone(), v.clone().into_bytes()));
+        }
+    }
+
+    /// Apply request edits for the access rule that authorized this request.
+    pub fn apply_rule_request(&self, h: &mut Vec<Header>, rule: Option<&str>) {
+        if let Some(edits) = self
+            .rules
+            .iter()
+            .find(|edits| Some(edits.rule.as_str()) == rule)
+        {
+            apply_edits(h, &edits.request_remove, &edits.request_set);
+        }
+    }
+
+    /// Apply response edits for the access rule that authorized this request.
+    pub fn apply_rule_response(&self, h: &mut Vec<Header>, rule: Option<&str>) {
+        if let Some(edits) = self
+            .rules
+            .iter()
+            .find(|edits| Some(edits.rule.as_str()) == rule)
+        {
+            apply_edits(h, &edits.response_remove, &edits.response_set);
         }
     }
 }
@@ -331,6 +443,79 @@ mod tests {
                 HeaderPolicy::compile(&Config::parse(bad).expect("parse").http).is_err(),
                 "{bad}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn scoped_edits_only_touch_the_deciding_rule() {
+        let cfg = Config::parse(
+            r#"
+[[http.header_rule]]
+rule = "staff"
+request_headers_remove = ["X-Secret"]
+request_headers_set = { X-Mode = "staff" }
+response_headers_remove = ["Server"]
+response_headers_set = { X-Policy = "scoped" }
+[[rule]]
+name = "staff"
+action = "allow"
+"#,
+        )
+        .expect("config");
+        validate_rules(&cfg.http, &cfg.rules).expect("valid rule");
+        let policy = HeaderPolicy::compile(&cfg.http).expect("policy");
+        let original = vec![("X-Secret".to_owned(), b"secret".to_vec())];
+        let mut request = original.clone();
+        policy.apply_rule_request(&mut request, Some("other"));
+        assert_eq!(request, original);
+        policy.apply_rule_request(&mut request, Some("staff"));
+        assert_eq!(request, vec![("X-Mode".to_owned(), b"staff".to_vec())]);
+        let mut response = vec![("Server".to_owned(), b"origin".to_vec())];
+        policy.apply_rule_response(&mut response, Some("staff"));
+        assert_eq!(response, vec![("X-Policy".to_owned(), b"scoped".to_vec())]);
+    }
+
+    #[test]
+    fn scoped_edits_refuse_framing_routing_and_injection() {
+        for name in [
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Proxy-Authorization",
+        ] {
+            let cfg = Config::parse(&format!(
+                "[[http.header_rule]]\nrule='staff'\nrequest_headers_set={{'{name}'='bad'}}"
+            ))
+            .expect("config");
+            assert!(HeaderPolicy::compile(&cfg.http).is_err(), "{name}");
+        }
+        let cfg = Config::parse(
+            "[[http.header_rule]]\nrule='staff'\nresponse_headers_set={X-Test=\"a\\r\\nInjected: yes\"}",
+        )
+        .expect("config");
+        assert!(HeaderPolicy::compile(&cfg.http).is_err());
+    }
+
+    #[test]
+    fn scoped_edits_require_unique_named_allow_rule() {
+        for rules in [
+            "",
+            "[[rule]]\nname='staff'\naction='deny'",
+            "[[rule]]\nname='staff'\naction='allow'\nstage='post_auth'",
+            "[[rule]]\nname='staff'\naction='allow'\n[[rule]]\nname='staff'\naction='allow'",
+        ] {
+            let cfg = Config::parse(&format!(
+                "[[http.header_rule]]\nrule='staff'\nresponse_headers_set={{X-Test='yes'}}\n{rules}"
+            ))
+            .expect("config");
+            assert!(validate_rules(&cfg.http, &cfg.rules).is_err());
         }
     }
 }

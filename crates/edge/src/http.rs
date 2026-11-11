@@ -12,8 +12,8 @@ use std::time::{Instant, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use dial::ProxyStream;
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::TcpStream;
 
 use crate::accesslog::AccessRecord;
 use crate::acl::Proto;
@@ -23,6 +23,7 @@ use crate::headers::Header;
 use crate::limits::Dir;
 use crate::relay::relay;
 use crate::state::{ListenerRt, State};
+use crate::transport::Transport;
 use crate::wire::{
     Framing, HeadError, Pipe, RequestHead, ResponseHead, copy_body, has_token, header_str,
     read_request_head, read_response_head, render_head, request_framing, response_framing,
@@ -129,7 +130,11 @@ pub fn parse_absolute(target: &str) -> Option<Absolute> {
 
 /// `Basic base64(user:password)` of a `Proxy-Authorization` header.
 fn parse_basic(h: &[Header]) -> Option<(String, String)> {
-    let v = header_str(h, "proxy-authorization")?.trim();
+    parse_basic_value(header_str(h, "proxy-authorization")?)
+}
+
+pub(crate) fn parse_basic_value(value: &str) -> Option<(String, String)> {
+    let v = value.trim();
     let (scheme, enc) = v.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
@@ -176,7 +181,7 @@ fn error_reply(status: u16, code: &str, msg: &str, keep: bool, realm: Option<&st
 /// A tunnel to run once the request is answered: the connection is handed to
 /// the relay, which owns it from there.
 struct TunnelJob {
-    stream: TcpStream,
+    stream: ProxyStream,
     /// Bytes the upstream sent before the relay started.
     early: Vec<u8>,
     held: Held,
@@ -199,10 +204,10 @@ struct Session {
 
 /// Serve an HTTP proxy connection. `stream` has had nothing read except what
 /// the caller peeked; `early` holds bytes already taken from it.
-pub async fn serve(
+pub async fn serve<S: Transport>(
     shared: Arc<Shared>,
     rt: ListenerRt,
-    stream: TcpStream,
+    stream: S,
     peer: SocketAddr,
     early: Vec<u8>,
 ) {
@@ -211,6 +216,7 @@ pub async fn serve(
     let s = Session { shared, rt, peer };
     let mut first = true;
     let mut served: u32 = 0;
+    let mut parent_chain: Option<Vec<String>> = None;
     loop {
         let state = s.shared.state();
         let rt = state.listeners.get(&s.rt.cfg.name).unwrap_or(&s.rt);
@@ -260,7 +266,10 @@ pub async fn serve(
         served += 1;
         let max_requests = state.cfg.http.client_max_requests;
         let last = max_requests != 0 && served >= max_requests;
-        match s.handle(&state, rt, &mut client, head, last).await {
+        match s
+            .handle(&state, rt, &mut client, head, last, &mut parent_chain)
+            .await
+        {
             Next::KeepAlive => {}
             Next::Close => return,
             Next::Tunnel(job) => {
@@ -295,13 +304,14 @@ pub async fn serve(
 
 impl Session {
     #[allow(clippy::too_many_lines)]
-    async fn handle(
+    async fn handle<S: Transport>(
         &self,
         state: &Arc<State>,
         rt: &ListenerRt,
-        client: &mut Pipe,
+        client: &mut Pipe<S>,
         head: RequestHead,
         last: bool,
+        parent_chain: &mut Option<Vec<String>>,
     ) -> Next {
         let started = SystemTime::now();
         let t0 = Instant::now();
@@ -409,6 +419,23 @@ impl Session {
                 return Next::KeepAlive;
             }
         };
+        if let Err(r) = conn::check_stage(
+            shared,
+            state,
+            rt,
+            self.peer,
+            login.as_ref(),
+            crate::config::RuleStage::PostAuth,
+            if is_connect {
+                Proto::Connect
+            } else {
+                Proto::Http
+            },
+        ) {
+            return self
+                .reply_close(client, r.status(), r.code(), &r.message())
+                .await;
+        }
 
         let proto = if is_connect {
             Proto::Connect
@@ -435,7 +462,7 @@ impl Session {
         rec.referer = header_str(&head.headers, "referer").map(str::to_owned);
         rec.user_agent = header_str(&head.headers, "user-agent").map(str::to_owned);
 
-        let opened = match conn::open(&ctx).await {
+        let opened = match conn::open_pinned(&ctx, parent_chain.as_deref()).await {
             Ok(o) => o,
             Err(r) => {
                 let keep = keep_wanted && framing == Framing::None;
@@ -451,6 +478,9 @@ impl Session {
                 return Next::KeepAlive;
             }
         };
+        if parent_chain.is_none() && !opened.chain.is_empty() {
+            *parent_chain = Some(opened.chain.clone());
+        }
         rec.rule = opened.rule.clone();
         rec.pool = opened.pool.clone();
         rec.egress = opened.egress;
@@ -485,7 +515,7 @@ impl Session {
         if out.retry {
             // The idle parent connection had gone stale before it answered: once more on a new one.
             ctx.reuse = false;
-            match conn::open(&ctx).await {
+            match conn::open_pinned(&ctx, parent_chain.as_deref()).await {
                 Ok(o) => {
                     rec.egress = o.egress;
                     rec.target_ip = Some(o.peer);
@@ -523,7 +553,13 @@ impl Session {
         }
     }
 
-    async fn reply_close(&self, client: &mut Pipe, status: u16, code: &str, msg: &str) -> Next {
+    async fn reply_close<S: Transport>(
+        &self,
+        client: &mut Pipe<S>,
+        status: u16,
+        code: &str,
+        msg: &str,
+    ) -> Next {
         let _ = client
             .stream
             .write_all(&error_reply(status, code, msg, false, None))
@@ -533,10 +569,10 @@ impl Session {
 
     /// [`Self::forward`] under `timeouts.total`.
     #[allow(clippy::too_many_arguments)]
-    async fn forward_timed(
+    async fn forward_timed<S: Transport>(
         &self,
         state: &Arc<State>,
-        client: &mut Pipe,
+        client: &mut Pipe<S>,
         head: &RequestHead,
         framing: Framing,
         keep_wanted: bool,
@@ -555,10 +591,10 @@ impl Session {
 
     /// Forward one plain HTTP request and its response.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    async fn forward(
+    async fn forward<S: Transport>(
         &self,
         state: &Arc<State>,
-        client: &mut Pipe,
+        client: &mut Pipe<S>,
         head: &RequestHead,
         framing: Framing,
         keep_wanted: bool,
@@ -567,6 +603,8 @@ impl Session {
     ) -> Outcome {
         let t = &state.cfg.timeouts;
         let max = state.cfg.http.max_header_bytes;
+        let rule = opened.rule.clone();
+        let local_ip = opened.egress;
         let Opened {
             stream,
             mut held,
@@ -595,6 +633,9 @@ impl Session {
         state
             .headers
             .apply_request(&mut headers, self.peer.ip(), upgrade);
+        state
+            .headers
+            .apply_rule_request(&mut headers, rule.as_deref());
         headers.retain(|(n, _)| !n.eq_ignore_ascii_case("host"));
         // The request passed every check and the target is connected, so the body is
         // accepted: say 100 here and keep `Expect` away from a target that may never
@@ -626,6 +667,9 @@ impl Session {
             .is_err()
         {
             if reused {
+                if let Some(parent) = &parent {
+                    parent.breaker.cancel();
+                }
                 return Outcome { retry: true, ..out };
             }
             self.parent_report(&parent, false);
@@ -669,6 +713,9 @@ impl Session {
                 Ok(r) => r,
                 Err(e) => {
                     if reused && matches!(e, HeadError::Closed | HeadError::Io(_)) {
+                        if let Some(parent) = &parent {
+                            parent.breaker.cancel();
+                        }
                         return Outcome { retry: true, ..out };
                     }
                     self.parent_report(&parent, false);
@@ -732,6 +779,9 @@ impl Session {
         if resp.status == 101 && upgrade {
             let mut hdrs = resp.headers.clone();
             state.headers.apply_response(&mut hdrs, true);
+            state
+                .headers
+                .apply_rule_response(&mut hdrs, rule.as_deref());
             hdrs.push(("Connection".to_owned(), b"Upgrade".to_vec()));
             let line = format!("HTTP/1.1 101 {}", resp.reason);
             if client
@@ -762,6 +812,9 @@ impl Session {
         let parent_keeps = resp.minor == 1 && !has_token(&resp.headers, "connection", "close");
         let mut hdrs = resp.headers.clone();
         state.headers.apply_response(&mut hdrs, false);
+        state
+            .headers
+            .apply_rule_response(&mut hdrs, rule.as_deref());
         let keep = keep_wanted && body_consumed && resp_framing != Framing::UntilClose;
         if !keep {
             hdrs.push(("Connection".to_owned(), b"close".to_vec()));
@@ -794,9 +847,13 @@ impl Session {
                     && resp_framing != Framing::UntilClose
                     && up.buf.is_empty()
                 {
-                    self.shared
-                        .parent_conns
-                        .put(key, up.stream, held.take_lease(), upstream_peer);
+                    self.shared.parent_conns.put(
+                        key,
+                        up.stream,
+                        held.take_lease(),
+                        upstream_peer,
+                        local_ip,
+                    );
                 }
                 Outcome { keep, ..out }
             }
@@ -810,7 +867,14 @@ impl Session {
         }
     }
 
-    async fn send_error(&self, client: &mut Pipe, status: u16, code: &str, msg: &str, keep: bool) {
+    async fn send_error<S: Transport>(
+        &self,
+        client: &mut Pipe<S>,
+        status: u16,
+        code: &str,
+        msg: &str,
+        keep: bool,
+    ) {
         let _ = client
             .stream
             .write_all(&error_reply(status, code, msg, keep, None))
@@ -828,7 +892,7 @@ struct Outcome {
     /// The idle parent connection used was stale: run the request again on a new one.
     retry: bool,
     /// Set for an upgraded connection: relay it instead of reading more requests.
-    tunnel: Option<(TcpStream, Vec<u8>, Held)>,
+    tunnel: Option<(ProxyStream, Vec<u8>, Held)>,
 }
 
 impl Outcome {

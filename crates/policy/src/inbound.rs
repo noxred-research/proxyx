@@ -29,6 +29,8 @@ pub struct InboundOptions {
     /// Sticky key chosen by the caller.
     pub sid: Option<String>,
     pub rotation: Option<Rotation>,
+    /// Strict lease selection requested by the caller.
+    pub strict: Option<bool>,
 }
 
 fn set<T>(slot: &mut Option<T>, value: T) -> Result<(), Cause> {
@@ -98,6 +100,10 @@ impl InboundOptions {
                         _ => return Err(Cause::OptionDenied),
                     },
                 )?,
+                "strict" => set(
+                    &mut out.strict,
+                    value.parse().map_err(|_| Cause::OptionDenied)?,
+                )?,
                 _ => return Err(Cause::OptionDenied),
             }
         }
@@ -136,6 +142,8 @@ pub struct LeaseRequest {
     pub ttl: Duration,
     pub sticky: StickyKeySource,
     pub rotation: Rotation,
+    /// Strict lease selection. Defaults to `false`.
+    pub strict: bool,
 }
 
 impl EffectivePolicy {
@@ -178,6 +186,7 @@ impl EffectivePolicy {
                 None => StickyKeySource::Scope(self.sticky_scope),
             },
             rotation: opts.rotation.unwrap_or_default(),
+            strict: opts.strict.unwrap_or(false),
         })
     }
 }

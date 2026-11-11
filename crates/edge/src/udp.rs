@@ -14,7 +14,8 @@ use std::time::{Instant, SystemTime};
 
 use tokio::io::AsyncReadExt as _;
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::UdpSocket;
 
 use crate::acl::Proto;
 use crate::auth::Login;
@@ -83,22 +84,18 @@ async fn recv_opt(o: &Option<Out>, buf: &mut [u8]) -> std::io::Result<(usize, So
     }
 }
 
-pub async fn associate(
+pub async fn associate<S: AsyncRead + AsyncWrite + Unpin>(
     shared: Arc<Shared>,
     state: Arc<State>,
     rt: &ListenerRt,
-    mut control: TcpStream,
+    mut control: S,
+    local_ip: IpAddr,
     peer: SocketAddr,
     login: Option<Login>,
-    _requested: (String, u16),
 ) {
     let started = SystemTime::now();
     let t0 = Instant::now();
     let metrics = &shared.metrics;
-    let local_ip = match control.local_addr() {
-        Ok(a) => a.ip(),
-        Err(_) => return,
-    };
     let relay_sock = match UdpSocket::bind(SocketAddr::new(local_ip, 0)).await {
         Ok(s) => s,
         Err(_) => {
@@ -223,6 +220,7 @@ pub async fn associate(
                                     session: login.as_ref().and_then(|l| l.options.sid.as_deref()),
                                     user: login.as_ref().map(|l| l.user.name.as_str()),
                                     client: peer.ip(),
+                                    target_host: &host,
                                 };
                                 match p.pick(Family::of(ip), &k, index, &[]) {
                                     Ok(l) => (Some(l.ip()), Some(l)),

@@ -7,6 +7,7 @@
 //! not meet in one binary.
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use common::Secret;
 use common::types::{InventoryEntry, Region, Subtype, Target};
@@ -89,7 +90,7 @@ fn recipe_render(c: &mut Criterion) {
         b.iter(|| {
             black_box(rotating.recipe(&UnitSpec::Rotating {
                 session_id: "Ab3dEf6hIj9kLm2n",
-                ttl_minutes: 1440,
+                ttl: Duration::from_secs(1440 * 60),
                 region: &country,
                 strict: false,
             }))
@@ -99,7 +100,7 @@ fn recipe_render(c: &mut Criterion) {
         b.iter(|| {
             black_box(rotating.recipe(&UnitSpec::Rotating {
                 session_id: "Ab3dEf6hIj9kLm2n",
-                ttl_minutes: 1440,
+                ttl: Duration::from_secs(1440 * 60),
                 region: &city,
                 strict: true,
             }))

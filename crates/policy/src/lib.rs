@@ -28,6 +28,7 @@
 //! rest_after_release = "30s"       # these three are soft limits: with no unit left within
 //!                                  # them the lease breaks rest, orgs_hard, max_conns, in that order
 //! max_tunnels_per_org = 200        # unset: no cap; in a route_class: the org's tunnels on that provider
+//! max_sticky_entries_per_org = 10000 # unset: no cap; scopes can only lower it
 //! sticky_scope = "org"             # org | target | connection
 //! on_score_unavailable = "allow"   # allow | deny
 //!
@@ -45,6 +46,9 @@
 //! [policy.on_empty]                # static default wait, rotating default create
 //! static = "wait"                  # wait | fail
 //! rotating = "create"              # create | wait | fail
+//!
+//! [policy.dial]
+//! race = 1                        # concurrent candidate dials, from 1 through 16
 //!
 //! [policy.block]
 //! target_cooldown = "30m"
@@ -73,9 +77,10 @@
 //! `global` < `route_class` < `org`, field by field: a field that a more
 //! specific policy sets replaces the value of a less specific one, a field it
 //! leaves out keeps it. Lists (`kinds`, `providers`, `regions`) are replaced as
-//! a whole; `min_ready_by_region` merges per region. `limits` are ceilings: the
-//! lowest value in the chain wins, and a `cost` value above its ceiling makes
-//! the whole set invalid ([`PolicySet::from_docs`]).
+//! a whole; `min_ready_by_region` merges per region. `limits` and
+//! `max_sticky_entries_per_org` are ceilings: the lowest value in the chain
+//! wins, and a `cost` value above its ceiling makes the whole set invalid
+//! ([`PolicySet::from_docs`]).
 //!
 //! # Several providers
 //!
@@ -93,6 +98,8 @@
 //!
 //! [`InboundOptions::parse`] reads the proxy username, and
 //! [`EffectivePolicy::narrow`] turns it into a [`LeaseRequest`].
+//! `px-strict-true` requests strict lease selection; omitted or `false` keeps
+//! the default lease behaviour.
 
 mod doc;
 mod effective;
@@ -101,12 +108,13 @@ mod inbound;
 mod set;
 
 pub use doc::{
-    AfterRelease, BlockDoc, CostDoc, CriteriaDoc, LimitsDoc, MobileBoxDoc, OnEmpty, OnEmptyDoc,
-    OnScoreUnavailable, PolicyDoc, PolicyFile, Pool, RotatingDoc, Scope, StabilityDoc, StaticDoc,
+    AfterRelease, BlockDoc, CostDoc, CriteriaDoc, DialDoc, LimitsDoc, MobileBoxDoc, OnEmpty,
+    OnEmptyDoc, OnScoreUnavailable, PolicyDoc, PolicyFile, Pool, RotatingDoc, Scope, StabilityDoc,
+    StaticDoc,
 };
 pub use effective::{
-    BlockRules, Capacity, Cost, Criteria, EffectivePolicy, Limits, MobileBoxRules, OnEmptyByKind,
-    ReadyTarget, RotatingRules, Stability, StaticRules,
+    BlockRules, Capacity, Cost, Criteria, DialRules, EffectivePolicy, Limits, MobileBoxRules,
+    OnEmptyByKind, ReadyTarget, RotatingRules, Stability, StaticRules,
 };
 pub use error::PolicyError;
 pub use inbound::{InboundOptions, LeaseRequest, MAX_USERNAME_LEN, StickyKeySource};

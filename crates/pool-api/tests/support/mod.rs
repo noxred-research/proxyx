@@ -552,6 +552,15 @@ scheme = "socks5"
 credentials_optional = true
 user = "{base_user}"
 pass = "{base_pass}"
+
+[[adapter]]
+id = "customer_https"
+kind = "static"
+subtype = "datacenter"
+scheme = "https"
+credentials_optional = true
+user = "{base_user}"
+pass = "{base_pass}"
 "#;
 
 /// IP-check services that only answer through a stub proxy.

@@ -12,13 +12,13 @@ use store::CustomerLogin;
 /// Session id length when an adapter does not fix one.
 const DEFAULT_SESSION_ID_LEN: usize = 16;
 
-/// A new session id of `[A-Za-z0-9]`, the length the adapter accepts.
+/// A new session id in the character set and length the adapter accepts.
 pub(crate) fn new_session_id(adapter: &Adapter) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let alphabet = adapter.session_id_alphabet();
     let len = adapter.session_id_len().unwrap_or(DEFAULT_SESSION_ID_LEN);
     let mut rng = rand::thread_rng();
     (0..len)
-        .map(|_| char::from(ALPHABET[rng.gen_range(0..ALPHABET.len())]))
+        .map(|_| char::from(alphabet[rng.gen_range(0..alphabet.len())]))
         .collect()
 }
 
@@ -29,11 +29,12 @@ pub(crate) fn rotating_endpoint(
     session: &str,
     region: &Region,
 ) -> Result<UpstreamEndpoint, ProviderError> {
+    let recipe = adapter.decode_session(session)?;
     adapter.recipe(&UnitSpec::Rotating {
-        session_id: session,
-        ttl_minutes: adapter.session_minutes(),
+        session_id: recipe.session_id,
+        ttl: recipe.ttl,
         region,
-        strict: false,
+        strict: recipe.strict,
     })
 }
 

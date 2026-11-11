@@ -70,12 +70,35 @@ pub fn redact_text(text: &str) -> String {
 /// nothing else is exempt.
 pub const REVEALED: &str = "revealed_once";
 
+/// The member that carries generated username-only proxy endpoints. A field inside it may be
+/// called `proxy_url`, which the name rule would hide; the tool that produces it has already
+/// refused any entry with a password or key, so only the text patterns apply to it.
+pub const ENDPOINTS: &str = "endpoints";
+
+fn redact_text_only(value: &mut Value) {
+    match value {
+        Value::Object(map) => map.values_mut().for_each(redact_text_only),
+        Value::Array(items) => items.iter_mut().for_each(redact_text_only),
+        Value::String(text) => {
+            let redacted = redact_text(text);
+            if redacted != *text {
+                *text = redacted;
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Redact `value` in place.
 pub fn redact_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (name, member) in map.iter_mut() {
                 if name == REVEALED {
+                    continue;
+                }
+                if name == ENDPOINTS {
+                    redact_text_only(member);
                     continue;
                 }
                 if is_secret_name(name) && !member.is_null() && !member.is_boolean() {

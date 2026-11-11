@@ -1,16 +1,16 @@
 //! `proxyx edge`: a self-hosted multi-IP forward proxy.
 //!
 //! One TOML file, no database. It serves HTTP proxy, HTTPS `CONNECT`, SOCKS4/4a
-//! and SOCKS5 (TCP and UDP ASSOCIATE) on any number of listeners, connects to
+//! and SOCKS5 (CONNECT, BIND and UDP ASSOCIATE), optionally over listener TLS, connects to
 //! targets from a pool of local addresses chosen per listener, user, rule or
 //! login option, and applies ordered access rules, limits, header policy and
-//! parent proxies on the way.
+//! multi-hop parent chains, probes and bounded affinity on the way.
 //!
 //! Layout: [`config`] (the file), [`state`] (the compiled form, swapped on
 //! reload), [`conn`] (the per-request pipeline), [`http`] / [`socks`] /
 //! [`udp`] (wire protocols), [`connect`] and [`egress`] (outgoing
 //! connections), [`acl`], [`auth`], [`limits`], [`parent`], [`dns`],
-//! [`headers`], [`accesslog`], [`metrics`] and [`ops`].
+//! [`headers`], [`stick`], [`transport`], [`h2_connect`], [`accesslog`], [`metrics`] and [`ops`].
 
 pub mod accesslog;
 pub mod acl;
@@ -21,6 +21,7 @@ pub mod conn;
 pub mod connect;
 pub mod dns;
 pub mod egress;
+pub mod h2_connect;
 pub mod headers;
 pub mod health;
 pub mod http;
@@ -35,6 +36,8 @@ pub mod server;
 pub mod sockopt;
 pub mod socks;
 pub mod state;
+pub mod stick;
+pub mod transport;
 pub mod udp;
 pub mod wire;
 

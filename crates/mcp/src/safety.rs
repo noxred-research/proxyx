@@ -246,6 +246,7 @@ fn describe(capability: Capability) -> &'static str {
         Capability::Signals => "report block signals",
         Capability::Policy => "write or delete policies",
         Capability::Inventory => "replace static inventory",
+        Capability::PoolSessions => "rotate sticky pool sessions",
     }
 }
 

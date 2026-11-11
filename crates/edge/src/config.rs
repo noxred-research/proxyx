@@ -162,6 +162,10 @@ pub struct Config {
     pub breaker: BreakersConfig,
     pub health: HealthConfig,
     pub dns: DnsConfig,
+    pub selector: SelectorConfig,
+    pub stick: StickConfig,
+    #[serde(rename = "chain")]
+    pub chains: Vec<ChainConfig>,
     pub log: LogConfig,
     pub access_log: AccessLogConfig,
     pub http: HttpConfig,
@@ -186,6 +190,123 @@ pub struct Config {
     /// Bandwidth, connection and request-rate limits; every match applies.
     #[serde(rename = "limit")]
     pub limits: Vec<LimitConfig>,
+}
+
+/// Parent selection and its connection budget.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SelectorConfig {
+    pub strategy: Strategy,
+    pub hash_key: HashKey,
+    pub race_width: usize,
+    pub tolerance_ms: u64,
+    #[serde(with = "duration")]
+    pub idle_timeout: Duration,
+    pub interrupt_on_switch: bool,
+    pub connect_retries: usize,
+    #[serde(with = "duration")]
+    pub forward_timeout: Duration,
+}
+
+impl Default for SelectorConfig {
+    fn default() -> Self {
+        Self {
+            strategy: Strategy::Random,
+            hash_key: HashKey::ClientIp,
+            race_width: 2,
+            tolerance_ms: 50,
+            idle_timeout: Duration::from_secs(300),
+            interrupt_on_switch: false,
+            connect_retries: 2,
+            forward_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StickConfig {
+    pub capacity: usize,
+    #[serde(with = "duration")]
+    pub ttl: Duration,
+    pub redis: Option<StickRedisConfig>,
+}
+
+impl Default for StickConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 65536,
+            ttl: Duration::from_secs(600),
+            redis: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StickRedisConfig {
+    pub url: Secret,
+    #[serde(default = "stick_prefix")]
+    pub key_prefix: String,
+    #[serde(default = "probe_timeout", with = "duration")]
+    pub timeout: Duration,
+    #[serde(default, deserialize_with = "optional_duration")]
+    pub ttl: Option<Duration>,
+}
+
+fn stick_prefix() -> String {
+    "proxyx:edge:stick".to_owned()
+}
+fn probe_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+fn probe_status() -> u16 {
+    200
+}
+fn probe_body_limit() -> usize {
+    65536
+}
+fn optional_duration<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+    duration::deserialize(d).map(Some)
+}
+
+/// Each entry defines one named chain; hops run in listed order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainConfig {
+    pub name: String,
+    pub hops: Vec<HopConfig>,
+    #[serde(default)]
+    pub probe: Option<ProbeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopConfig {
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub selector: Option<SelectorConfig>,
+}
+
+/// HTTP and verified HTTPS checks tunnel through every configured parent hop.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProbeConfig {
+    Tcp {
+        target: String,
+    },
+    Http {
+        url: String,
+        #[serde(default = "probe_status")]
+        status: u16,
+        #[serde(default)]
+        body_contains: Option<String>,
+        #[serde(default = "probe_body_limit")]
+        max_body_bytes: usize,
+    },
+    Command {
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -467,6 +588,9 @@ pub struct HttpConfig {
     pub request_headers_set: BTreeMap<String, String>,
     pub response_headers_remove: Vec<String>,
     pub response_headers_set: BTreeMap<String, String>,
+    /// Header edits applied after the global policy for the deciding access rule.
+    #[serde(rename = "header_rule")]
+    pub header_rules: Vec<HeaderRuleConfig>,
     /// Largest request or response head accepted.
     pub max_header_bytes: usize,
     /// Requests served on one client connection before it is closed; `0` is no limit.
@@ -490,6 +614,7 @@ impl Default for HttpConfig {
             request_headers_set: BTreeMap::new(),
             response_headers_remove: Vec::new(),
             response_headers_set: BTreeMap::new(),
+            header_rules: Vec::new(),
             max_header_bytes: 32 * 1024,
             client_max_requests: 1000,
             parent_keepalive: true,
@@ -497,6 +622,17 @@ impl Default for HttpConfig {
             parent_max_idle: 64,
         }
     }
+}
+
+/// Safe request and response edits scoped to a named request-stage allow rule.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeaderRuleConfig {
+    pub rule: String,
+    pub request_headers_remove: Vec<String>,
+    pub request_headers_set: BTreeMap<String, String>,
+    pub response_headers_remove: Vec<String>,
+    pub response_headers_set: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -554,6 +690,14 @@ pub enum ProxyProtocolMode {
     Required,
 }
 
+/// PEM certificate chain and matching PEM private key for an encrypted listener.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
@@ -574,6 +718,9 @@ pub struct ListenerConfig {
     /// Serve SOCKS5 UDP ASSOCIATE.
     #[serde(default)]
     pub udp: bool,
+    /// Encrypt HTTP, SOCKS or mixed protocol traffic with TLS.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// Most connections on this listener; 0 is unlimited.
     #[serde(default)]
     pub max_connections: usize,
@@ -594,12 +741,35 @@ fn default_proxy_protocol() -> ProxyProtocolMode {
 pub enum Strategy {
     /// Always the first address (3proxy `-e`).
     First,
+    /// First healthy address in configuration order.
+    Fifo,
     #[default]
     RoundRobin,
     Random,
     LeastConnections,
     /// Hash of the session id, else the user, else the client address.
     Sticky,
+    /// Rendezvous affinity using the configured hash key.
+    Hash,
+    Userhash,
+    Sourcehash,
+    /// Equal-weight CARP-style rendezvous affinity.
+    Carp,
+    /// Dial all available addresses concurrently; retain the first success.
+    Race,
+    /// Prefer the measured fastest address, with switching tolerance.
+    Latency,
+}
+
+/// Request attribute used by hash and CARP selectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HashKey {
+    #[default]
+    ClientIp,
+    TargetHost,
+    User,
+    SessionId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -626,6 +796,39 @@ pub struct PoolConfig {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub strategy: Strategy,
+    #[serde(default)]
+    pub hash_key: HashKey,
+    /// Local addresses reserved for when every primary address is unavailable.
+    #[serde(default)]
+    pub backup_addresses: Vec<IpAddr>,
+    /// Override the egress breaker's consecutive-failure threshold.
+    #[serde(default)]
+    pub max_fails: Option<u32>,
+    /// Override the egress breaker's open interval.
+    #[serde(default, deserialize_with = "PoolConfig::deserialize_fail_timeout")]
+    pub fail_timeout: Option<Duration>,
+    /// Keep the current latency choice while it is within this of the fastest.
+    #[serde(default = "PoolConfig::default_latency_tolerance", with = "duration")]
+    pub latency_tolerance: Duration,
+    /// Maximum local source addresses dialed concurrently by the race selector.
+    #[serde(default = "PoolConfig::default_race_width")]
+    pub race_width: usize,
+}
+
+impl PoolConfig {
+    fn default_race_width() -> usize {
+        2
+    }
+
+    fn default_latency_tolerance() -> Duration {
+        Duration::from_millis(50)
+    }
+
+    fn deserialize_fail_timeout<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        duration::deserialize(d).map(Some)
+    }
 }
 
 fn yes() -> bool {
@@ -636,6 +839,8 @@ fn yes() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum ParentKind {
     Http,
+    Https,
+    Socks4,
     Socks5,
 }
 
@@ -672,6 +877,16 @@ pub struct ParentConfig {
     pub pool: Option<String>,
     #[serde(default)]
     pub send_proxy_protocol: SendProxyProtocol,
+    #[serde(default)]
+    pub backup: bool,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub max_fails: Option<u32>,
+    #[serde(default, deserialize_with = "optional_duration")]
+    pub fail_timeout: Option<Duration>,
+    #[serde(default)]
+    pub probe: Option<ProbeConfig>,
 }
 
 fn one() -> u32 {
@@ -771,12 +986,27 @@ pub struct MatchConfig {
     pub not: Option<Box<MatchConfig>>,
 }
 
+/// The point in the protocol lifecycle where an access rule applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleStage {
+    #[default]
+    Request,
+    PreNegotiation,
+    PostAuth,
+    Bind,
+    Udp,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     #[serde(default)]
     pub name: Option<String>,
     pub action: Action,
+    /// Unspecified stages retain the existing request-rule behavior.
+    #[serde(default)]
+    pub stage: RuleStage,
     #[serde(default)]
     pub when: MatchConfig,
     /// Let this rule reach private and internal destinations, which are
@@ -811,6 +1041,9 @@ pub struct RouteRuleConfig {
     /// Parents this rule may use; empty is every configured parent.
     #[serde(default)]
     pub parents: Vec<String>,
+    /// Named, ordered multi-hop chain. Mutually exclusive with parents.
+    #[serde(default)]
+    pub chain: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]

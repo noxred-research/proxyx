@@ -10,8 +10,9 @@ User=proxyx
 Group=proxyx
 ExecStartPre=/usr/local/bin/proxyx edge --check --config /etc/proxyx/edge.toml
 ExecStart=/usr/local/bin/proxyx edge --config /etc/proxyx/edge.toml
-# SIGHUP re-reads the configuration (users, rules, pools, limits, new listeners)
-# without dropping open tunnels, and reopens the access log after logrotate.
+# SIGHUP atomically reloads rules, pools, parent chains and listener TLS credentials.
+# Existing tunnels survive (unless latency interrupt_on_switch is configured).
+# Unchanged stick tables survive reload; access logs reopen after logrotate.
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 # `server.shutdown_grace` (30 s by default) is how long open tunnels may finish.
@@ -28,6 +29,8 @@ LogsDirectoryMode=0750
 # Hardening. The process needs the network, the interface list (netlink, for
 # `interface = "eth0"` pools) and the right to bind ports below 1024 when a
 # listener asks for one; nothing else.
+# TLS keys must be readable by proxyx (root:proxyx 0640 under /etc/proxyx).
+# Operator command probes inherit this sandbox; install executables outside /home and /tmp.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes

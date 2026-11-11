@@ -40,6 +40,14 @@ on_score_unavailable = "allow"
 # max_tunnels_per_org = 200
 # Unset by default (80% of the provider limit):
 # max_conns_per_ip = 40
+# Unset by default (no cap): most sticky keys an org may hold at once; the least recently
+# used key is evicted beyond it. A more specific scope can only tighten it.
+# max_sticky_entries_per_org = 10000
+
+# Dial up to `race` candidate units at once and keep the first that connects (1 to 16;
+# 1 = one at a time). The losers' leases are released.
+[policy.dial]
+race = 1
 
 # Overrides of min_ready per region (exact region, else country). Empty by default.
 [policy.min_ready_by_region]

@@ -188,6 +188,13 @@ pub struct Limits {
     pub org_max_gb_per_day: Option<f64>,
 }
 
+/// Upstream dial concurrency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialRules {
+    /// Concurrent candidate dials, from 1 through 16. Defaults to 1.
+    pub race: u32,
+}
+
 /// The policy that applies to one org on one provider.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectivePolicy {
@@ -216,7 +223,10 @@ pub struct EffectivePolicy {
     pub rest_after_release: Duration,
     /// Cap on open tunnels per org. `None`: no cap.
     pub max_tunnels_per_org: Option<u32>,
+    /// Cap on sticky entries per org. `None`: no cap; scopes can only tighten it.
+    pub max_sticky_entries_per_org: Option<u32>,
     pub sticky_scope: StickyScope,
+    pub dial: DialRules,
     pub block: BlockRules,
     pub static_ips: StaticRules,
     pub mobile_box: MobileBoxRules,
@@ -448,10 +458,18 @@ pub(crate) fn resolve(doc: &PolicyDoc, context: &str) -> Result<EffectivePolicy,
         ("orgs_hard", doc.orgs_hard),
         ("max_conns_per_ip", doc.max_conns_per_ip),
         ("max_tunnels_per_org", doc.max_tunnels_per_org),
+        ("max_sticky_entries_per_org", doc.max_sticky_entries_per_org),
     ] {
         if let Some(n) = v {
             c.at_least_one(field, n)?;
         }
+    }
+
+    let dial = DialRules {
+        race: doc.dial.race.unwrap_or(1),
+    };
+    if !(1..=16).contains(&dial.race) {
+        return Err(c.invalid("dial.race", "must be 1 to 16"));
     }
 
     let b = &doc.block;
@@ -588,7 +606,9 @@ pub(crate) fn resolve(doc: &PolicyDoc, context: &str) -> Result<EffectivePolicy,
         max_conns_per_ip: doc.max_conns_per_ip,
         rest_after_release: doc.rest_after_release.unwrap_or(secs(30)),
         max_tunnels_per_org: doc.max_tunnels_per_org,
+        max_sticky_entries_per_org: doc.max_sticky_entries_per_org,
         sticky_scope: doc.sticky_scope.unwrap_or_default(),
+        dial,
         block,
         static_ips,
         mobile_box,

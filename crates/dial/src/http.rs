@@ -3,16 +3,15 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use common::types::UpstreamEndpoint;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::DialError;
 
 /// Same cap as the session proxy: a reply head above this is not a proxy answering.
 const MAX_HEAD_BYTES: usize = 8192;
 
-pub(crate) async fn connect(
-    stream: &mut TcpStream,
+pub(crate) async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
     up: &UpstreamEndpoint,
     host: &str,
     port: u16,
@@ -31,6 +30,7 @@ pub(crate) async fn connect(
         .write_all(request.as_bytes())
         .await
         .map_err(DialError::Io)?;
+    stream.flush().await.map_err(DialError::Io)?;
 
     let head = read_head(stream).await?;
     match status(&head)? {
@@ -44,7 +44,7 @@ pub(crate) async fn connect(
 /// reader could swallow tunnel bytes the target sends right after the
 /// `200` (SMTP, SSH and FTP servers speak first), and the stream goes on to
 /// the relay. The head is a few hundred bytes, so the syscalls are cheap.
-async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, DialError> {
+async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, DialError> {
     let mut head = Vec::with_capacity(256);
     loop {
         head.push(stream.read_u8().await.map_err(DialError::Io)?);

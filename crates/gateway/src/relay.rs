@@ -17,11 +17,11 @@ use std::time::Duration;
 use common::metrics::Metrics;
 use common::session::BYTES_PER_GB;
 use common::types::{Kind, OrgId, Partition, ProviderId, Target};
+use dial::ProxyStream;
 use policy::{AfterRelease, Pool};
 use store::{Grant, LeaseLimits, LeaseRequest, ReleaseRule};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
@@ -56,6 +56,17 @@ pub(crate) struct LeaseData {
 }
 
 impl LeaseData {
+    /// Affinity cannot outlive either the lease or its provider session.
+    pub(crate) fn affinity_ttl(&self) -> Duration {
+        self.grant
+            .expires_at
+            .map_or(self.limits.lease_ttl, |expires| {
+                Duration::try_from(expires - OffsetDateTime::now_utc())
+                    .unwrap_or_default()
+                    .min(self.limits.lease_ttl)
+            })
+    }
+
     fn request(&self) -> LeaseRequest<'_> {
         LeaseRequest {
             partition: &self.partition,
@@ -214,7 +225,7 @@ pub(crate) async fn relay<S>(
     gw: &Arc<Gateway>,
     tunnel: Tunnel,
     client: S,
-    mut upstream: TcpStream,
+    mut upstream: ProxyStream,
     leftover: Vec<u8>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -246,7 +257,7 @@ pub(crate) async fn relay<S>(
             unmetered.fetch_add(leftover.len() as u64, Ordering::Relaxed);
         }
         let (client_r, client_w) = tokio::io::split(client);
-        let (upstream_r, upstream_w) = upstream.into_split();
+        let (upstream_r, upstream_w) = tokio::io::split(upstream);
         tokio::try_join!(
             pump(client_r, upstream_w, &unmetered, &activity, None),
             pump(
@@ -282,6 +293,14 @@ pub(crate) async fn relay<S>(
 async fn record_and_meter(gw: &Gateway, lease: &LeaseData, bytes: u64) {
     if bytes == 0 {
         return;
+    }
+    if !lease.per_connection {
+        let _ = redis(
+            "record sticky session traffic",
+            gw.hot
+                .affinity_add_bytes(&lease.org, &lease.sticky, bytes, lease.affinity_ttl()),
+        )
+        .await;
     }
     let _ = redis(
         "record traffic",
@@ -535,6 +554,16 @@ mod tests {
             after_release: None,
             fair_use_gb: None,
         }
+    }
+
+    #[test]
+    fn affinity_lifetime_never_extends_a_provider_session() {
+        let mut lease = lease();
+        assert_eq!(lease.affinity_ttl(), Duration::from_secs(60));
+        lease.grant.expires_at = Some(OffsetDateTime::now_utc() + time::Duration::seconds(10));
+        assert!(lease.affinity_ttl() <= Duration::from_secs(10));
+        lease.grant.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+        assert_eq!(lease.affinity_ttl(), Duration::ZERO);
     }
 
     #[test]

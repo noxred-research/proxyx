@@ -249,6 +249,14 @@ pub struct LimitsDoc {
     pub org_max_gb_per_day: Option<f64>,
 }
 
+/// Upstream dial concurrency.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DialDoc {
+    /// Concurrent candidate dials, from 1 through 16.
+    pub race: Option<u32>,
+}
+
 /// One `[[policy]]` table.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,8 +304,12 @@ pub struct PolicyDoc {
     #[serde(default, with = "opt_secs")]
     pub rest_after_release: Option<Duration>,
     pub max_tunnels_per_org: Option<u32>,
+    /// Sticky entries per org. Unset: no cap; scopes can only tighten it.
+    pub max_sticky_entries_per_org: Option<u32>,
     pub sticky_scope: Option<StickyScope>,
 
+    #[serde(default)]
+    pub dial: DialDoc,
     #[serde(default)]
     pub block: BlockDoc,
     #[serde(default, rename = "static")]
@@ -347,8 +359,8 @@ fn tighter<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
 impl PolicyDoc {
     /// Apply `top` over `self`, field by field: a field `top` sets wins, a
     /// field it leaves unset keeps `self`'s value. `min_ready_by_region`
-    /// merges per region. `limits` keep the tighter ceiling, so a lower scope
-    /// can lower a ceiling but never raise it.
+    /// merges per region. `limits` and `max_sticky_entries_per_org` keep the
+    /// tighter ceiling, so a lower scope can lower a ceiling but never raise it.
     pub fn overlay(&mut self, top: &PolicyDoc) {
         overlay_fields!(self, top;
             kinds, providers, regions, pool, min_ready, max_ready, low_watermark, low_for,
@@ -356,10 +368,15 @@ impl PolicyDoc {
             max_conns_per_ip, rest_after_release, max_tunnels_per_org, sticky_scope);
         self.min_ready_by_region
             .extend(top.min_ready_by_region.iter().map(|(r, n)| (r.clone(), *n)));
+        self.max_sticky_entries_per_org = tighter(
+            self.max_sticky_entries_per_org,
+            top.max_sticky_entries_per_org,
+        );
 
         overlay_fields!(self.criteria, top.criteria;
             max_risk, max_ttfb_ms, max_load_ms, min_success, browser_sample, verdict_max_age);
         overlay_fields!(self.on_empty, top.on_empty; static_ips, rotating);
+        overlay_fields!(self.dial, top.dial; race);
         overlay_fields!(self.block, top.block;
             target_cooldown, escalate_targets, escalate_signals, signal_window, max_cooldown_share);
         overlay_fields!(self.static_ips, top.static_ips;

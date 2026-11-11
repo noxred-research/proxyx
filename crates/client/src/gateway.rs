@@ -137,6 +137,7 @@ pub struct PoolSelector {
     ttl: Option<Duration>,
     sid: Option<String>,
     rotation: Option<Rotation>,
+    strict: Option<bool>,
 }
 
 fn is_value(v: &str) -> bool {
@@ -243,6 +244,15 @@ impl PoolSelector {
         self
     }
 
+    /// Ask the provider for a strict sticky session (`strict-true`): the exit IP must
+    /// not change during the session, and the lease fails rather than falling back to
+    /// another IP. `strict-false` explicitly allows a non-strict session.
+    #[must_use]
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
+
     /// Check the selector and render the proxy username.
     pub fn username(&self) -> Result<String, SelectorError> {
         if let Some(country) = &self.country
@@ -301,6 +311,9 @@ impl PoolSelector {
         if let Some(rotation) = self.rotation {
             push("rot", rotation.as_str());
         }
+        if let Some(strict) = self.strict {
+            push("strict", if strict { "true" } else { "false" });
+        }
         if name.len() > MAX_USERNAME_LEN {
             return Err(SelectorError::TooLong(name.len()));
         }
@@ -353,6 +366,14 @@ impl PoolSelector {
                     };
                     set(&mut out.rotation, "rot", rotation)?;
                 }
+                "strict" => {
+                    let strict = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(bad("strict", "must be true or false")),
+                    };
+                    set(&mut out.strict, "strict", strict)?;
+                }
                 other => return Err(SelectorError::UnknownKey(other.to_owned())),
             }
         }
@@ -395,6 +416,11 @@ impl PoolSelector {
     /// Rotation mode, if set.
     pub fn get_rotation(&self) -> Option<Rotation> {
         self.rotation
+    }
+
+    /// Strict sticky session request, if set.
+    pub fn get_strict(&self) -> Option<bool> {
+        self.strict
     }
 }
 

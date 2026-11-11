@@ -22,7 +22,7 @@ The interface is a [Model Context Protocol](https://modelcontextprotocol.io) ser
 | What did the traffic look like? | `search_traffic`, `count_traffic`, `get_capture`, `search_ws`, `get_ws_conversation`, `summarize_traffic` |
 | Is a target blocking us? | `classify_block_page`, `block_signal_rates`, `report_block_signal` |
 | Run a piece of work | `create_session`, `extend_session`, `end_session`, `session_status` |
-| Steer egress | `set_org_egress_proxy`, `set_customer_upstream`, `create_org_block`, `set_org_rate_limit` |
+| Steer egress | `set_org_egress_proxy`, `set_customer_upstream`, `create_org_block`, `set_org_rate_limit`, `list_pool_sessions`, `rotate_pool_session`, `generate_pool_endpoints` |
 | Change configuration | `validate_policy`, `suggest_policy`, `propose_config_change`, `apply_config_change` |
 | Understand the rules | resources `proxyx://docs/...`, prompts `triage_blocks`, `capacity_review`, `session_debug` |
 
@@ -46,7 +46,7 @@ Captured content is hostile by default: a response body can say "ignore your ins
 
 ## Management
 
-Mutations are the dangerous half, so they are opt-in and layered. The server is read-only until an operator enables capabilities (`sessions`, `org_keys`, `org_limits`, `egress`, `org_blocks`, `signals`, `policy`, `inventory`), can be confined to listed orgs and an engagement window, can hold every change for a human, and records every call in a hash-chained audit log. A tool that is not allowed is not listed. Secrets never travel through the model: a created org key or session proxy URL goes to a private file (or is shown once if the operator allows), and logins are passed by reference to the operator's credential files. The full list is in [mcp.md](mcp.md#safety-model).
+Mutations are the dangerous half, so they are opt-in and layered. The server is read-only until an operator enables capabilities (`sessions`, `org_keys`, `org_limits`, `egress`, `org_blocks`, `signals`, `policy`, `inventory`, `pool_sessions`), can be confined to listed orgs and an engagement window, can hold every change for a human, and records every call in a hash-chained audit log. A tool that is not allowed is not listed. Secrets never travel through the model: a created org key or session proxy URL goes to a private file (or is shown once if the operator allows), and logins are passed by reference to the operator's credential files. The full list is in [mcp.md](mcp.md#safety-model).
 
 Typical management calls: open a capture session for a crawl and extend it while the crawl runs; block an org from a provider after an abuse report, with the reason recorded; cap an org's rate; chain an org's session traffic through an egress proxy; set an org's own upstream and validate it; report a block signal so the pool cools the IP; disable an org's keys.
 

@@ -12,7 +12,9 @@ use common::types::{
 use common::{Secret, types::Target};
 
 use crate::MAX_FIELD_BYTES;
-use crate::config::{AdapterConfig, Case, Charset, Field, OptionConfig, OptionKey, Unit};
+use crate::config::{
+    AdapterConfig, Case, Charset, Field, OptionConfig, OptionKey, SessionMode, Unit,
+};
 use crate::error::ProviderError;
 use crate::rotate::RotateCall;
 
@@ -29,14 +31,22 @@ pub enum UnitSpec<'a> {
         entry: &'a InventoryEntry,
         credentials: Option<(Secret, Secret)>,
     },
-    /// A rotating session. The adapter always sets the session id and, when
-    /// it has a duration option, the duration.
+    /// A rotating session. Sticky adapters set the session id; per-request
+    /// adapters rotate exits independently of this local tracking id.
     Rotating {
         session_id: &'a str,
-        ttl_minutes: u32,
+        ttl: Duration,
         region: &'a Region,
         strict: bool,
     },
+}
+
+/// Persisted provider recipe parameters, borrowed from a unit identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRecipe<'a> {
+    pub session_id: &'a str,
+    pub ttl: Duration,
+    pub strict: bool,
 }
 
 /// A provider adapter, built from an [`AdapterConfig`].
@@ -56,6 +66,7 @@ pub struct Adapter {
     allowed_ports: Vec<u16>,
     max_conns_per_ip: Option<u32>,
     max_session_minutes: Option<u32>,
+    session_mode: SessionMode,
     echo_url: Option<String>,
     public_only: bool,
     pub(crate) rotate: Option<RotateCall>,
@@ -148,6 +159,7 @@ impl Adapter {
             allowed_ports: cfg.allowed_ports,
             max_conns_per_ip: cfg.max_conns_per_ip,
             max_session_minutes: cfg.max_session_minutes,
+            session_mode: cfg.session_mode,
             echo_url: cfg.echo_url,
             public_only: cfg.public_only,
             rotate,
@@ -200,14 +212,137 @@ impl Adapter {
         self.echo_url.as_deref()
     }
 
-    /// Length of the session id this adapter accepts: the exact length, or
-    /// the longest allowed. Generate ids of `[A-Za-z0-9]` with this length;
-    /// every session charset accepts them. `None` for a static adapter.
+    /// Length of the session id this adapter accepts. Per-request adapters
+    /// still need a local tracking id, although it is not sent upstream.
     pub fn session_id_len(&self) -> Option<usize> {
-        self.options
+        if !self.rotating() {
+            return None;
+        }
+        Some(
+            self.options
+                .iter()
+                .find(|o| o.key == OptionKey::Sid)
+                .map_or(16, |o| o.len.unwrap_or(o.max_len)),
+        )
+    }
+
+    /// Alphabet for generating session ids accepted by this adapter.
+    pub fn session_id_alphabet(&self) -> &'static [u8] {
+        if self
+            .options
             .iter()
-            .find(|o| o.key == OptionKey::Sid)
-            .map(|o| o.len.unwrap_or(o.max_len))
+            .any(|o| o.key == OptionKey::Sid && o.charset == Charset::Digits)
+        {
+            b"0123456789"
+        } else {
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        }
+    }
+
+    /// Whether separate requests can share a provider exit.
+    pub fn session_mode(&self) -> SessionMode {
+        self.session_mode
+    }
+
+    /// Round a positive whole-second request up to the provider's duration
+    /// unit. Refuse lifetimes beyond the configured cap, never truncate them.
+    pub fn normalize_session_ttl(&self, ttl: Duration) -> Result<Duration, ProviderError> {
+        if ttl.is_zero() || ttl.subsec_nanos() != 0 {
+            return Err(refuse(
+                "ttl",
+                "a positive whole-second duration is required",
+            ));
+        }
+        let rule = self.options.iter().find(|o| o.key == OptionKey::Ttl);
+        let quantum = match rule.map(|o| o.unit) {
+            Some(Unit::Min) => 60,
+            Some(Unit::Sec) | None => 1,
+        };
+        let seconds = ttl
+            .as_secs()
+            .div_ceil(quantum)
+            .checked_mul(quantum)
+            .ok_or_else(|| refuse("ttl", "out of range"))?;
+        let normalized = Duration::from_secs(seconds);
+        if self.max_session_minutes.is_some() && normalized > self.session_life() {
+            return Err(refuse("ttl", "above the adapter's max_session_minutes"));
+        }
+        if let Some(rule) = rule {
+            rule.ttl_number(normalized)?;
+        }
+        Ok(normalized)
+    }
+
+    /// Encode all recipe inputs into a stable unit identity. The separator
+    /// cannot occur in a session id, so malformed identities are unambiguous.
+    pub fn encode_session(
+        &self,
+        session_id: &str,
+        ttl: Duration,
+        strict: bool,
+    ) -> Result<String, ProviderError> {
+        self.check_session(session_id, strict)?;
+        let ttl = self.normalize_session_ttl(ttl)?;
+        Ok(format!(
+            "{session_id}~{}~{}",
+            ttl.as_secs(),
+            u8::from(strict)
+        ))
+    }
+
+    /// Decode a persisted identity. Legacy bare ids use the adapter's default
+    /// lifetime and non-strict mode. Invalid identities never fall back.
+    pub fn decode_session<'a>(
+        &self,
+        identity: &'a str,
+    ) -> Result<SessionRecipe<'a>, ProviderError> {
+        let (session_id, ttl, strict) = if let Some((sid, options)) = identity.split_once('~') {
+            let (seconds, strict) = options
+                .split_once('~')
+                .ok_or_else(|| refuse("sid", "malformed session identity"))?;
+            let seconds: u64 = seconds
+                .parse()
+                .map_err(|_| refuse("ttl", "malformed session identity"))?;
+            let strict = match strict {
+                "0" => false,
+                "1" => true,
+                _ => return Err(refuse("strict", "malformed session identity")),
+            };
+            (sid, Duration::from_secs(seconds), strict)
+        } else {
+            (identity, self.session_life(), false)
+        };
+        self.check_session(session_id, strict)?;
+        let normalized = self.normalize_session_ttl(ttl)?;
+        if normalized != ttl {
+            return Err(refuse(
+                "ttl",
+                "session identity has a non-normalized duration",
+            ));
+        }
+        Ok(SessionRecipe {
+            session_id,
+            ttl,
+            strict,
+        })
+    }
+
+    fn check_session(&self, session_id: &str, strict: bool) -> Result<(), ProviderError> {
+        if !self.rotating() {
+            return Err(self.mismatch("rotating spec for a static adapter"));
+        }
+        if strict && !self.supports_strict() {
+            return Err(self.mismatch("the provider has no strict session mode"));
+        }
+        if let Some(rule) = self.options.iter().find(|o| o.key == OptionKey::Sid) {
+            rule.check_text(session_id)?;
+        } else if session_id.is_empty()
+            || session_id.len() > DEFAULT_MAX_LEN
+            || !session_id.bytes().all(|c| c.is_ascii_alphanumeric())
+        {
+            return Err(refuse("sid", "invalid local tracking id"));
+        }
+        Ok(())
     }
 
     /// True when the provider allows tunnels to `port`. An adapter with no
@@ -308,7 +443,7 @@ impl Adapter {
                     country: entry.region.country(),
                     city: entry.region.city(),
                     sid: None,
-                    ttl_minutes: None,
+                    ttl: None,
                     strict: false,
                     ip: Some(entry.ip.to_string()),
                     credentials: credentials.as_ref(),
@@ -317,27 +452,20 @@ impl Adapter {
             }
             UnitSpec::Rotating {
                 session_id,
-                ttl_minutes,
+                ttl,
                 region,
                 strict,
             } => {
-                if !self.rotating() {
-                    return Err(self.mismatch("rotating spec for a static adapter"));
-                }
-                if self.max_session_minutes.is_some_and(|m| *ttl_minutes > m) {
-                    return Err(refuse("ttl", "above the adapter's max_session_minutes"));
-                }
+                self.check_session(session_id, *strict)?;
+                let ttl = self.normalize_session_ttl(*ttl)?;
                 if region.city().is_some() && !self.has_option(OptionKey::City) {
                     return Err(refuse("city", "the adapter has no city option"));
-                }
-                if *strict && !self.supports_strict() {
-                    return Err(self.mismatch("the provider has no strict session mode"));
                 }
                 Ok(Values {
                     country: region.country(),
                     city: region.city(),
                     sid: Some(session_id),
-                    ttl_minutes: Some(*ttl_minutes),
+                    ttl: Some(ttl),
                     strict: *strict,
                     ip: None,
                     credentials: None,
@@ -482,7 +610,7 @@ struct Values<'a> {
     country: &'a str,
     city: Option<&'a str>,
     sid: Option<&'a str>,
-    ttl_minutes: Option<u32>,
+    ttl: Option<Duration>,
     strict: bool,
     ip: Option<String>,
     credentials: Option<&'a (Secret, Secret)>,
@@ -633,8 +761,10 @@ impl OptionRule {
             _ => Charset::Alnum,
         };
         let charset = c.charset.unwrap_or(default_charset);
-        if key == OptionKey::Sid && !matches!(charset, Charset::Alnum | Charset::Word) {
-            return Err("option sid: charset must be alnum or word".to_owned());
+        if key == OptionKey::Sid
+            && !matches!(charset, Charset::Alnum | Charset::Word | Charset::Digits)
+        {
+            return Err("option sid: charset must be alnum, word or digits".to_owned());
         }
         let len = c.len.or((key == OptionKey::Country).then_some(2));
         let max_len = c.max_len.unwrap_or(DEFAULT_MAX_LEN);
@@ -677,8 +807,8 @@ impl OptionRule {
                 Some(ip) => ip.as_str().into(),
                 None => return Ok(None),
             },
-            OptionKey::Ttl => match v.ttl_minutes {
-                Some(m) => self.ttl_value(m)?.into(),
+            OptionKey::Ttl => match v.ttl {
+                Some(ttl) => self.ttl_value(ttl)?.into(),
                 None => return Ok(None),
             },
         };
@@ -719,18 +849,23 @@ impl OptionRule {
         }
     }
 
-    fn ttl_value(&self, minutes: u32) -> Result<String, ProviderError> {
+    fn ttl_value(&self, ttl: Duration) -> Result<String, ProviderError> {
+        Ok(self.ttl_number(ttl)?.to_string())
+    }
+
+    fn ttl_number(&self, ttl: Duration) -> Result<u32, ProviderError> {
         let n = match self.unit {
-            Unit::Min => Some(minutes),
-            Unit::Sec => minutes.checked_mul(60),
+            Unit::Min => ttl.as_secs() / 60,
+            Unit::Sec => ttl.as_secs(),
         };
-        let n = n
+        let n = u32::try_from(n)
+            .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| refuse("ttl", "out of range"))?;
         if self.max.is_some_and(|m| n > m) {
             return Err(refuse("ttl", "above the option maximum"));
         }
-        Ok(n.to_string())
+        Ok(n)
     }
 }
 
@@ -784,7 +919,19 @@ fn validate_options(
         return Err("at most one option may set the port".to_owned());
     }
     if cfg.kind == Kind::Rotating {
-        for key in [OptionKey::Country, OptionKey::Sid] {
+        let required: &[OptionKey] = if cfg.session_mode == SessionMode::PerRequest {
+            &[OptionKey::Country]
+        } else {
+            &[OptionKey::Country, OptionKey::Sid]
+        };
+        if cfg.session_mode == SessionMode::PerRequest
+            && rules
+                .iter()
+                .any(|r| matches!(r.key, OptionKey::Sid | OptionKey::Ttl | OptionKey::Strict))
+        {
+            return Err("per_request adapters cannot set session options".to_owned());
+        }
+        for &key in required {
             if !rules.iter().any(|r| r.key == key) {
                 return Err(format!("a rotating adapter needs a {} option", key.name()));
             }
@@ -811,6 +958,9 @@ fn validate_options(
 }
 
 fn validate_misc(cfg: &AdapterConfig) -> Result<(), String> {
+    if cfg.kind == Kind::Static && cfg.session_mode != SessionMode::Sticky {
+        return Err("session_mode belongs to rotating adapters".to_owned());
+    }
     if cfg.port == Some(0) || cfg.allowed_ports.contains(&0) {
         return Err("port 0 is not a port".to_owned());
     }

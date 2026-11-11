@@ -18,13 +18,13 @@ use common::metrics::Metrics;
 use common::retry::BreakerConfig;
 use common::session::BYTES_PER_GB;
 use common::types::{OrgId, Rotation, StickyScope, Target};
+use dial::ProxyStream;
 use moka::future::Cache;
 use parking_lot::Mutex;
 use policy::{InboundOptions, StickyKeySource};
 use store::loaded::Loaded;
-use store::{Db, Hot, SessionRecord};
+use store::{AffinityRecord, Db, Hot, SessionRecord};
 use time::OffsetDateTime;
-use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::{Instant, timeout};
 use tokio_util::task::TaskTracker;
@@ -128,7 +128,7 @@ impl Listener {
 
 /// An open tunnel, ready for the `200` reply and the relay.
 pub(crate) struct Opened {
-    pub stream: TcpStream,
+    pub stream: ProxyStream,
     pub session: String,
     pub tunnel: Tunnel,
 }
@@ -482,6 +482,37 @@ impl Gateway {
         };
 
         let lease = established.lease;
+        if !lease.per_connection {
+            let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+            let now = i64::try_from(now).unwrap_or(i64::MAX);
+            let affinity = AffinityRecord {
+                sticky: lease.sticky.clone(),
+                partition: lease.partition.clone(),
+                unit: lease.grant.unit.clone(),
+                ip: lease.grant.ip,
+                created_at_ms: now,
+                last_seen_ms: now,
+                bytes: 0,
+            };
+            let cap = req
+                .loaded
+                .policies
+                .effective(&lease.org, Some(&lease.provider))
+                .max_sticky_entries_per_org;
+            // Best effort, like the correlation record below. The Redis script
+            // atomically bounds the shared affinity table when Redis answers.
+            let _ = redis(
+                "record the sticky affinity",
+                self.hot.affinity_touch(
+                    &lease.org,
+                    &affinity,
+                    lease.affinity_ttl(),
+                    cap,
+                    !lease.grant.fresh,
+                ),
+            )
+            .await;
+        }
         let session = Uuid::new_v4().simple().to_string();
         let record = SessionRecord {
             org: lease.org.clone(),

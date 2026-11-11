@@ -470,6 +470,8 @@ async fn dispatch(ctx: &Arc<Ctx>, name: &'static str, args: Args, info: &CallInf
         "inventory_replacements" => read::inventory_replacements(ctx, &args).await,
         "list_policies" => read::list_policies(ctx, &args).await,
         "list_org_blocks" => read::list_org_blocks(ctx, &args).await,
+        "list_pool_sessions" => read::list_pool_sessions(ctx, &args).await,
+        "generate_pool_endpoints" => read::generate_pool_endpoints(ctx, &args).await,
         "get_customer_upstream" => read::get_customer_upstream(ctx, &args).await,
         "get_org" => read::get_org(ctx, &args).await,
         "list_sessions" => read::list_sessions(ctx, &args).await,

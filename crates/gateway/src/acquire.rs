@@ -65,18 +65,18 @@ use common::types::{
     IpState, Kind, OrgId, Partition, ProviderId, Region, Subtype, Target, Tier, UpstreamEndpoint,
     UpstreamScheme,
 };
-use dial::DialTimeouts;
+use dial::{DialTimeouts, ProxyStream};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use policy::{EffectivePolicy, InboundOptions, LeaseRequest as Narrowed, OnEmpty};
 use provider::{Adapter, UnitSpec};
 use rand::Rng as _;
-use rand::distributions::Alphanumeric;
 use store::loaded::Loaded;
 use store::{
     Admit, CostUsage, ExitIpClaim, Grant, InventoryRow, LeaseLimits, LeaseOutcome, LeaseRequest,
     MAX_RANK, Phase, SessionJob, Transition, UNIT_PENALTY_BASE, UNIT_PENALTY_MAX, UnitRecord,
 };
 use time::OffsetDateTime;
-use tokio::net::TcpStream;
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 use uuid::Uuid;
 use verify::{AdmitError, ExitIpError, ExitQuery, Refusal};
@@ -257,7 +257,7 @@ impl Req<'_> {
 
 /// A leased unit with an open tunnel to the target.
 pub(crate) struct Established {
-    pub stream: TcpStream,
+    pub stream: ProxyStream,
     pub lease: LeaseData,
 }
 
@@ -269,6 +269,8 @@ pub(crate) struct Candidate<'a> {
     /// Lease idle time: the request's `ttl` narrowed by this provider's own
     /// policy, route class included.
     ttl: Duration,
+    session_ttl: Duration,
+    strict: bool,
 }
 
 enum Step {
@@ -332,6 +334,99 @@ enum CheckError {
     Unverified,
 }
 
+/// A speculative grant stays owned even while its Redis reply is in flight.
+/// Dropping either the receiver or its dial releases only the unit counters;
+/// the real tunnel keeps its single org/provider slot.
+struct UnusedGrant {
+    hot: store::Hot,
+    tracker: tokio_util::task::TaskTracker,
+    grant: Option<Grant>,
+    sticky: String,
+}
+
+impl Drop for UnusedGrant {
+    fn drop(&mut self) {
+        let Some(grant) = self.grant.take() else {
+            return;
+        };
+        let hot = self.hot.clone();
+        let sticky = std::mem::take(&mut self.sticky);
+        self.tracker.spawn(async move {
+            let _ = redis(
+                "close a canceled race counter",
+                hot.unit_tunnel_cancel(&grant.tunnel),
+            )
+            .await;
+            if grant.fresh {
+                let _ = redis(
+                    "release a canceled race lease",
+                    hot.lease_unserved(&grant, &sticky),
+                )
+                .await;
+            }
+        });
+    }
+}
+
+/// A create owns its reservation, claim and scheduled job until ready_put
+/// commits it. Cancellation must not wait for a slow provider to answer.
+struct UnfinishedCreate {
+    hot: store::Hot,
+    tracker: tokio_util::task::TaskTracker,
+    partition: Partition,
+    reservation: String,
+    session: String,
+    claim: Option<IpAddr>,
+    job: Option<String>,
+    committed: bool,
+}
+
+impl Drop for UnfinishedCreate {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let hot = self.hot.clone();
+        let partition = self.partition.clone();
+        let reservation = std::mem::take(&mut self.reservation);
+        let session = std::mem::take(&mut self.session);
+        let claim = self.claim;
+        let job = self.job.take();
+        self.tracker.spawn(async move {
+            let _ = redis(
+                "abort a canceled reservation",
+                hot.create_abort(&partition, &reservation),
+            )
+            .await;
+            let _ = redis(
+                "abort a canceled create",
+                hot.create_abort(&partition, &session),
+            )
+            .await;
+            let retired = redis(
+                "retire an uncommitted session",
+                hot.unit_retire(&partition, &session),
+            )
+            .await;
+            if !retired.is_ok_and(|retired| retired.forgotten) {
+                // A ready_put reply may have been lost after another tunnel
+                // adopted the unit. Its job must drain it after that tunnel.
+                return;
+            }
+            if let Some(job) = job {
+                let _ = redis("forget an uncommitted session job", hot.due_done(&job)).await;
+            }
+            if let Some(ip) = claim {
+                let _ = redis(
+                    "release a canceled create claim",
+                    hot.release_exit_ip(ip, &session),
+                )
+                .await;
+            }
+        });
+    }
+}
+
 /// True when the org has a live upstream of its own (a customer unit). Such
 /// an org is served only by it: when the unit is not leasable the tunnel
 /// fails closed instead of leaving through a shared provider IP, which the
@@ -372,6 +467,9 @@ pub(crate) fn candidates<'a>(
                 .collect()
         };
         for adapter in adapters.into_iter().filter(|a| a.kind() == kind) {
+            if adapter.session_mode() == provider::SessionMode::PerRequest {
+                continue;
+            }
             let policy = loaded.policies.effective(org, Some(adapter.id()));
             let own = match policy.narrow(opts) {
                 Ok(own) => own,
@@ -379,6 +477,19 @@ pub(crate) fn candidates<'a>(
                     denied = Some(cause);
                     continue;
                 }
+            };
+            let session_ttl = if kind == Kind::Rotating {
+                match adapter
+                    .normalize_session_ttl(opts.ttl.unwrap_or_else(|| adapter.session_life()))
+                {
+                    Ok(ttl) => ttl,
+                    Err(_) => {
+                        denied = Some(Cause::OptionDenied);
+                        continue;
+                    }
+                }
+            } else {
+                own.ttl
             };
             for region in regions_for(loaded, org, pinned, adapter, kind, &own.regions) {
                 out.push(Candidate {
@@ -390,6 +501,8 @@ pub(crate) fn candidates<'a>(
                     },
                     policy,
                     ttl: own.ttl,
+                    session_ttl,
+                    strict: own.strict,
                 });
             }
         }
@@ -623,17 +736,22 @@ impl Gateway {
                     failure = Some(Cause::ProviderTimeout);
                     continue;
                 }
-                let after_create = match self.create_session(r, c).await? {
-                    Created::Ready => {
-                        self.try_candidate(r, c, false, Some("created"), MAX_RANK)
-                            .await?
+                let after_create = if race_width(r, c) > 1 {
+                    self.race_candidate(r, c, false, Some("created"), MAX_RANK, true)
+                        .await?
+                } else {
+                    match self.create_session(r, c, false).await? {
+                        Created::Ready => {
+                            self.try_candidate(r, c, false, Some("created"), MAX_RANK)
+                                .await?
+                        }
+                        // Units are still being created for other tunnels: wait for them.
+                        Created::Full => self.wait_for_creates(r, c).await?,
+                        Created::Blocked => Step::Failed(Cause::ProviderUnavailable),
+                        // nothing was created: still lease what is there, a
+                        // soft limit broken if need be
+                        Created::Failed => self.try_candidate(r, c, false, None, MAX_RANK).await?,
                     }
-                    // Units are still being created for other tunnels: wait for them.
-                    Created::Full => self.wait_for_creates(r, c).await?,
-                    Created::Blocked => Step::Failed(Cause::ProviderUnavailable),
-                    // nothing was created: still lease what is there, a
-                    // soft limit broken if need be
-                    Created::Failed => self.try_candidate(r, c, false, None, MAX_RANK).await?,
                 };
                 match after_create {
                     Step::Served(e) => return Ok(*e),
@@ -734,14 +852,108 @@ impl Gateway {
         how: Option<&'static str>,
         max_rank: u8,
     ) -> Result<Step, Cause> {
-        // A route class whose breaker is open is skipped, so the walk goes on
-        // to the next provider or kind instead of spending its budget on a
-        // dead provider. A probe that is due goes through.
+        if race_width(r, c) > 1 {
+            return self
+                .race_candidate(r, c, allow_create, how, max_rank, false)
+                .await;
+        }
+        self.try_unit(r, c, allow_create, how, max_rank, r.sticky, None)
+            .await
+    }
+
+    /// Only independent, per-connection rotating leases may speculate.
+    /// One due breaker probe remains serial.
+    #[allow(clippy::too_many_arguments)]
+    async fn race_candidate(
+        &self,
+        r: &Req<'_>,
+        c: &Candidate<'_>,
+        allow_create: bool,
+        how: Option<&'static str>,
+        max_rank: u8,
+        create: bool,
+    ) -> Result<Step, Cause> {
         let (_, admit) = redis(
-            "peek at the route class breaker",
+            "peek before racing a route class",
             self.hot.breaker_peek(&c.partition, &self.pacing.breaker),
         )
         .await?;
+        if admit != Admit::Go {
+            if create {
+                return self.create_then_serve(r, c, r.sticky, None).await;
+            }
+            return self
+                .try_unit(r, c, allow_create, how, max_rank, r.sticky, None)
+                .await;
+        }
+        let claimed = Mutex::new(Vec::new());
+        let attempts = FuturesUnordered::new();
+        for lane in 0..race_width(r, c) {
+            let claimed = &claimed;
+            attempts.push(async move {
+                let sticky = format!("{}-race-{lane}", r.sticky);
+                if create {
+                    self.create_then_serve(r, c, &sticky, Some(claimed)).await
+                } else {
+                    self.try_unit(r, c, allow_create, how, max_rank, &sticky, Some(claimed))
+                        .await
+                }
+            });
+        }
+        first_served(attempts).await
+    }
+
+    async fn create_then_serve(
+        &self,
+        r: &Req<'_>,
+        c: &Candidate<'_>,
+        sticky: &str,
+        claimed: Option<&Mutex<Vec<String>>>,
+    ) -> Result<Step, Cause> {
+        let created = self.create_session(r, c, claimed.is_some()).await?;
+        if matches!(created, Created::Blocked) {
+            return Ok(Step::Failed(Cause::ProviderUnavailable));
+        }
+        let until = (Instant::now() + c.policy.create_deadline).min(r.deadline);
+        loop {
+            let how = matches!(created, Created::Ready).then_some("created");
+            let step = self
+                .try_unit(r, c, false, how, MAX_RANK, sticky, claimed)
+                .await?;
+            if !matches!(created, Created::Full)
+                || !matches!(step, Step::Empty | Step::NeedCreate)
+                || Instant::now() >= until
+            {
+                return Ok(step);
+            }
+            sleep(WAIT_POLL.min(until.saturating_duration_since(Instant::now()))).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_unit(
+        &self,
+        r: &Req<'_>,
+        c: &Candidate<'_>,
+        allow_create: bool,
+        how: Option<&'static str>,
+        max_rank: u8,
+        sticky: &str,
+        claimed: Option<&Mutex<Vec<String>>>,
+    ) -> Result<Step, Cause> {
+        // A route class whose breaker is open is skipped, so the walk goes on
+        // to the next provider or kind instead of spending its budget on a
+        // dead provider. A probe that is due goes through.
+        let admit = if claimed.is_some() {
+            Admit::Go
+        } else {
+            redis(
+                "peek at the route class breaker",
+                self.hot.breaker_peek(&c.partition, &self.pacing.breaker),
+            )
+            .await?
+            .1
+        };
         let probing = match admit {
             Admit::Go => false,
             Admit::Probe => true,
@@ -757,27 +969,56 @@ impl Gateway {
         let mut dead = None;
         let mut probe_held = false;
         let mut skip: Vec<String> = Vec::new();
+        if !r.per_connection
+            && let Some(previous) = redis(
+                "exclude a deleted session's previous unit",
+                self.hot
+                    .affinity_rotation_skip(r.org, r.sticky, &c.partition),
+            )
+            .await?
+        {
+            skip.push(previous);
+        }
+        if c.kind == Kind::Rotating {
+            skip.extend(
+                redis(
+                    "list rotating recipe identities",
+                    self.hot.ready_ids(&c.partition),
+                )
+                .await?
+                .into_iter()
+                .filter(|id| !session_matches(c, id)),
+            );
+        }
         for _ in 0..MAX_RELEASES {
-            let req = LeaseRequest {
-                partition: &c.partition,
-                kind: c.kind,
-                org: r.org,
-                sticky: r.sticky,
-                target: r.target,
-                tunnel: r.tunnel_id,
-                pool: c.policy.pool,
-                limits: limits.clone(),
+            // Serialize selection, not dialing. Every lane skips all units
+            // already attempted by this race, including failed ones.
+            let mut selected = match claimed {
+                Some(claimed) => Some(claimed.lock().await),
+                None => None,
             };
-            let leased =
-                match redis_lease("lease a unit", self.hot.lease_ranked(&req, &skip, max_rank))
-                    .await
-                {
-                    Ok(leased) => leased,
-                    Err(cause) => {
-                        self.release_unseen_lease(r, c).await;
-                        return Err(cause);
-                    }
-                };
+            let mut skipped = skip.clone();
+            if let Some(selected) = &selected {
+                skipped.extend(selected.iter().cloned());
+            }
+            let (leased, mut cleanup) = self
+                .lease_attempt(
+                    r,
+                    c,
+                    limits.clone(),
+                    sticky,
+                    skipped,
+                    max_rank,
+                    claimed.is_some(),
+                )
+                .await?;
+            if let Some(selected) = &mut selected
+                && let LeaseOutcome::Hit(g) | LeaseOutcome::Free(g) | LeaseOutcome::Shared(g) =
+                    &leased
+            {
+                selected.push(g.unit.clone());
+            }
+            drop(selected);
             let (grant, outcome) = match leased {
                 LeaseOutcome::Hit(g) | LeaseOutcome::Free(g) => (g, "hit"),
                 LeaseOutcome::Shared(g) => (g, "shared"),
@@ -792,18 +1033,34 @@ impl Gateway {
                 LeaseOutcome::Blocked => return Ok(Step::Blocked),
                 LeaseOutcome::Lower(next) => return Ok(Step::Lower(next)),
             };
-            match self
+            // Another request may publish an incompatible recipe after the
+            // ready-id snapshot. Never render it with this caller's options.
+            if c.kind == Kind::Rotating && !session_matches(c, &grant.unit) {
+                self.give_back(r, sticky, &grant).await;
+                if let Some(cleanup) = &mut cleanup {
+                    cleanup.grant = None;
+                }
+                skip.push(grant.unit);
+                continue;
+            }
+            let served = self
                 .serve_grant(
                     r,
                     c,
+                    sticky,
                     grant,
                     limits.clone(),
                     how.unwrap_or(outcome),
                     probing,
                     &mut probe_held,
                 )
-                .await?
+                .await;
+            if let Some(cleanup) = &mut cleanup
+                && served.is_ok()
             {
+                cleanup.grant = None;
+            }
+            match served? {
                 Serve::Ready(e) => return Ok(Step::Served(e)),
                 Serve::Failed(cause) => return Ok(Step::Failed(cause)),
                 Serve::Dead(cause) => dead = Some(cause),
@@ -827,11 +1084,96 @@ impl Gateway {
         Ok(Step::Failed(dead.unwrap_or(Cause::CacheEmpty)))
     }
 
+    /// Keep the Redis command alive until its grant has an owner. A canceled
+    /// receiver drops the guard too, even if the reply was already queued.
+    #[allow(clippy::too_many_arguments)]
+    async fn lease_attempt(
+        &self,
+        r: &Req<'_>,
+        c: &Candidate<'_>,
+        limits: LeaseLimits,
+        sticky: &str,
+        skip: Vec<String>,
+        max_rank: u8,
+        speculative: bool,
+    ) -> Result<(LeaseOutcome, Option<UnusedGrant>), Cause> {
+        if !speculative {
+            let req = LeaseRequest {
+                partition: &c.partition,
+                kind: c.kind,
+                org: r.org,
+                sticky,
+                target: r.target,
+                tunnel: r.tunnel_id,
+                pool: c.policy.pool,
+                limits,
+            };
+            return match redis_lease("lease a unit", self.hot.lease_ranked(&req, &skip, max_rank))
+                .await
+            {
+                Ok(leased) => Ok((leased, None)),
+                Err(cause) => {
+                    self.release_unseen_lease(r, c).await;
+                    Err(cause)
+                }
+            };
+        }
+        let hot = self.hot.clone();
+        let tracker = self.tracker.clone();
+        let partition = c.partition.clone();
+        let kind = c.kind;
+        let org = r.org.clone();
+        let sticky = sticky.to_owned();
+        let target = r.target.clone();
+        let tunnel = r.tunnel_id;
+        let pool = c.policy.pool;
+        let (send, receive) = oneshot::channel();
+        self.tracker.spawn(async move {
+            let req = LeaseRequest {
+                partition: &partition,
+                kind,
+                org: &org,
+                sticky: &sticky,
+                target: &target,
+                tunnel,
+                pool,
+                limits,
+            };
+            let result = match hot.lease_ranked(&req, &skip, max_rank).await {
+                Ok(leased) => {
+                    let guard = match &leased {
+                        LeaseOutcome::Hit(g) | LeaseOutcome::Free(g) | LeaseOutcome::Shared(g) => {
+                            Some(UnusedGrant {
+                                hot: hot.clone(),
+                                tracker,
+                                grant: Some(g.clone()),
+                                sticky,
+                            })
+                        }
+                        _ => None,
+                    };
+                    Ok((leased, guard))
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "race lease failed");
+                    Err(Cause::CacheUnavailable)
+                }
+            };
+            // A rejected or unread reply owns its guard and releases it.
+            let _ = send.send(result);
+        });
+        timeout_at(r.deadline, receive)
+            .await
+            .map_err(|_| Cause::ProviderTimeout)?
+            .map_err(|_| Cause::CacheUnavailable)?
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn serve_grant(
         &self,
         r: &Req<'_>,
         c: &Candidate<'_>,
+        sticky: &str,
         grant: Grant,
         limits: LeaseLimits,
         outcome: &'static str,
@@ -841,14 +1183,14 @@ impl Gateway {
         let (endpoint, row) = match self.render(c, &grant, r.loaded).await {
             Ok(v) => v,
             Err(cause) => {
-                self.give_back(r, &grant).await;
+                self.give_back(r, sticky, &grant).await;
                 return Ok(Serve::Failed(cause));
             }
         };
         if !self.exit_ok(c, &grant, &endpoint, row, r.deadline).await {
             self.withdraw(c, &grant, "gateway exit ip check failed", None)
                 .await;
-            self.give_back(r, &grant).await;
+            self.give_back(r, sticky, &grant).await;
             return Ok(Serve::Retry);
         }
         if probing && !*probe_held {
@@ -861,7 +1203,7 @@ impl Gateway {
             )
             .await?;
             if admit == Admit::Blocked {
-                self.give_back(r, &grant).await;
+                self.give_back(r, sticky, &grant).await;
                 return Ok(Serve::Failed(Cause::ProviderUnavailable));
             }
             *probe_held = true;
@@ -898,7 +1240,7 @@ impl Gateway {
                         partition: c.partition.clone(),
                         kind: c.kind,
                         provider: c.adapter.id().clone(),
-                        sticky: r.sticky.to_owned(),
+                        sticky: sticky.to_owned(),
                         target: r.target.clone(),
                         tunnel_id: r.tunnel_id,
                         pool: c.policy.pool,
@@ -946,7 +1288,7 @@ impl Gateway {
                 if failure.unit_failed || elsewhere {
                     self.cool_unit(c, &grant, r, failure.cause).await;
                 }
-                self.give_back(r, &grant).await;
+                self.give_back(r, sticky, &grant).await;
                 if provider_wide {
                     return Ok(Serve::ProviderWide(failure.cause, grant.unit));
                 }
@@ -1020,17 +1362,25 @@ impl Gateway {
     /// `org_capacity`. A lease this call bound to the unit goes too, with its
     /// dwell key: a key whose tunnel failed on a provider is not young there,
     /// so it goes back to it as soon as it works, not a minute later.
-    async fn give_back(&self, r: &Req<'_>, grant: &Grant) {
+    async fn give_back(&self, r: &Req<'_>, sticky: &str, grant: &Grant) {
         // Best effort: redis() logged a failure already.
-        let _ = redis(
-            "close an unused tunnel counter",
-            self.hot.unit_tunnel_close(&grant.tunnel),
-        )
-        .await;
+        if sticky != r.sticky {
+            let _ = redis(
+                "close an unused race counter",
+                self.hot.unit_tunnel_cancel(&grant.tunnel),
+            )
+            .await;
+        } else {
+            let _ = redis(
+                "close an unused tunnel counter",
+                self.hot.unit_tunnel_close(&grant.tunnel),
+            )
+            .await;
+        }
         if grant.fresh {
             let _ = redis(
                 "end a lease that served no tunnel",
-                self.hot.lease_unserved(grant, r.sticky),
+                self.hot.lease_unserved(grant, sticky),
             )
             .await;
         }
@@ -1284,7 +1634,7 @@ impl Gateway {
         up: &UpstreamEndpoint,
         target: &Target,
         deadline: Instant,
-    ) -> Result<TcpStream, DialFailure> {
+    ) -> Result<ProxyStream, DialFailure> {
         let timeouts = DialTimeouts {
             keepalive: self.settings.keepalive(),
             ..DialTimeouts::default()
@@ -1368,10 +1718,89 @@ impl Gateway {
         }
     }
 
+    async fn reserve_session(
+        &self,
+        c: &Candidate<'_>,
+        session: String,
+        max_ready: u32,
+        until: Instant,
+    ) -> Result<Option<(store::Reservation, UnfinishedCreate)>, Cause> {
+        let hot = self.hot.clone();
+        let tracker = self.tracker.clone();
+        let partition = c.partition.clone();
+        let (send, receive) = oneshot::channel();
+        self.tracker.spawn(async move {
+            let result = match hot.reserve_create(&partition, max_ready).await {
+                Ok(Some(reservation)) => {
+                    let cleanup = UnfinishedCreate {
+                        hot,
+                        tracker,
+                        partition,
+                        reservation: reservation.id.to_string(),
+                        session,
+                        claim: None,
+                        job: None,
+                        committed: false,
+                    };
+                    Ok(Some((reservation, cleanup)))
+                }
+                Ok(None) => Ok(None),
+                Err(error) => {
+                    tracing::warn!(%error, "reserve a session failed");
+                    Err(Cause::CacheUnavailable)
+                }
+            };
+            let _ = send.send(result);
+        });
+        timeout_at(until, receive)
+            .await
+            .map_err(|_| Cause::ProviderTimeout)?
+            .map_err(|_| Cause::CacheUnavailable)?
+    }
+
+    /// Once publication starts, let it finish independently of the race.
+    /// A published, verified session is useful cache, not a speculative lease.
+    async fn commit_session(
+        &self,
+        mut cleanup: UnfinishedCreate,
+        unit: UnitRecord,
+        tier: Tier,
+        until: Instant,
+    ) -> Result<(), Cause> {
+        let (send, receive) = oneshot::channel();
+        self.tracker.spawn(async move {
+            let result = match cleanup
+                .hot
+                .ready_put_tier(&cleanup.partition, &unit, tier)
+                .await
+            {
+                Ok(()) => {
+                    cleanup.committed = true;
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "make a created unit ready failed");
+                    Err(Cause::CacheUnavailable)
+                }
+            };
+            drop(cleanup);
+            let _ = send.send(result);
+        });
+        timeout_at(until, receive)
+            .await
+            .map_err(|_| Cause::ProviderTimeout)?
+            .map_err(|_| Cause::CacheUnavailable)?
+    }
+
     /// Create a session on demand (`on_empty = create`): reserve, start, open
     /// the session through the provider, run the exit-IP quorum, make it
     /// leasable. Two tries inside `create_deadline`.
-    async fn create_session(&self, r: &Req<'_>, c: &Candidate<'_>) -> Result<Created, Cause> {
+    async fn create_session(
+        &self,
+        r: &Req<'_>,
+        c: &Candidate<'_>,
+        speculative: bool,
+    ) -> Result<Created, Cause> {
         let Some(id_len) = c.adapter.session_id_len() else {
             tracing::warn!(provider = %c.adapter.id(), "adapter has no session id option, cannot create");
             return Ok(Created::Failed);
@@ -1392,21 +1821,44 @@ impl Gateway {
             if Instant::now() >= until {
                 break;
             }
-            let Some(reservation) = redis(
-                "reserve a create",
-                self.hot.reserve_create(&c.partition, max_ready),
-            )
-            .await?
+            let alphabet = c.adapter.session_id_alphabet();
+            let sid: String = {
+                let mut rng = rand::thread_rng();
+                (0..id_len)
+                    .map(|_| char::from(alphabet[rng.gen_range(0..alphabet.len())]))
+                    .collect()
+            };
+            let session = c
+                .adapter
+                .encode_session(&sid, c.session_ttl, c.strict)
+                .map_err(|_| Cause::OptionDenied)?;
+            let Some((reservation, mut cleanup)) = self
+                .reserve_session(c, session.clone(), max_ready, until)
+                .await?
             else {
                 return Ok(Created::Full);
             };
             // Like a dial, a create goes through the route class breaker: an
             // open one refuses it, and a due probe is taken by one caller.
-            let (_, admit) = redis(
-                "claim the route class for a create",
-                self.hot.breaker_claim(&c.partition, &self.pacing.breaker),
-            )
-            .await?;
+            let admit = if speculative {
+                match redis(
+                    "peek at a speculative create breaker",
+                    self.hot.breaker_peek(&c.partition, &self.pacing.breaker),
+                )
+                .await?
+                .1
+                {
+                    Admit::Go => Admit::Go,
+                    Admit::Probe | Admit::Blocked => Admit::Blocked,
+                }
+            } else {
+                redis(
+                    "claim the route class for a create",
+                    self.hot.breaker_claim(&c.partition, &self.pacing.breaker),
+                )
+                .await?
+                .1
+            };
             let probing = match admit {
                 Admit::Go => false,
                 Admit::Probe => true,
@@ -1424,11 +1876,6 @@ impl Gateway {
                     return Ok(Created::Blocked);
                 }
             };
-            let session: String = rand::thread_rng()
-                .sample_iter(Alphanumeric)
-                .take(id_len)
-                .map(char::from)
-                .collect();
             let started = redis(
                 "start a create",
                 self.hot.create_start(
@@ -1448,13 +1895,12 @@ impl Gateway {
                     .cost_add(c.adapter.id(), 0, 1, OffsetDateTime::now_utc()),
             )
             .await;
-            match self.verify_new_session(r, c, &session, until).await {
+            match self
+                .verify_new_session(r, c, &session, until, &mut cleanup)
+                .await
+            {
                 Ok((unit, tier)) => {
-                    redis(
-                        "make a created unit ready",
-                        self.hot.ready_put_tier(&c.partition, &unit, tier),
-                    )
-                    .await?;
+                    self.commit_session(cleanup, unit, tier, r.deadline).await?;
                     self.report_breaker(r, c, probing, Outcome::Answered).await;
                     return Ok(Created::Ready);
                 }
@@ -1495,6 +1941,7 @@ impl Gateway {
         c: &Candidate<'_>,
         session: &str,
         until: Instant,
+        cleanup: &mut UnfinishedCreate,
     ) -> Result<(UnitRecord, Tier), CreateFailed> {
         let up = rotating_recipe(c, session).ok_or("recipe refused")?;
         let query = ExitQuery {
@@ -1519,12 +1966,13 @@ impl Gateway {
             }
         };
         let ip = IpAddr::V4(exit.ip);
-        let max_age = c.policy.rotating.max_age_for(c.adapter.session_life());
+        let max_age = c.policy.rotating.max_age_for(c.session_ttl);
         let ttl = max_age + UNIT_MARGIN;
         let now = OffsetDateTime::now_utc();
         let expires_at = time::Duration::try_from(max_age)
             .map(|d| now + d)
             .map_err(|_| "max_age out of range")?;
+        cleanup.claim = Some(ip);
         match redis(
             "claim the exit ip",
             self.hot.claim_exit_ip(ip, session, ttl),
@@ -1591,9 +2039,11 @@ impl Gateway {
             phase: Phase::fresh(unix),
         };
         let first = jittered(c.policy.keepalive_interval(), JOB_JITTER);
+        let encoded = job.encode();
+        cleanup.job = Some(encoded.clone());
         if redis(
             "schedule the session job",
-            self.hot.due_schedule(&job.encode(), now + first),
+            self.hot.due_schedule(&encoded, now + first),
         )
         .await
         .is_err()
@@ -1671,13 +2121,60 @@ fn recipe(adapter: &Adapter, spec: &UnitSpec<'_>) -> Option<UpstreamEndpoint> {
 }
 
 fn rotating_recipe(c: &Candidate<'_>, session: &str) -> Option<UpstreamEndpoint> {
+    let options = c.adapter.decode_session(session).ok()?;
     let spec = UnitSpec::Rotating {
-        session_id: session,
-        ttl_minutes: c.adapter.session_minutes(),
+        session_id: options.session_id,
+        ttl: options.ttl,
         region: &c.partition.region,
-        strict: false,
+        strict: options.strict,
     };
     recipe(c.adapter, &spec)
+}
+
+fn race_width(r: &Req<'_>, c: &Candidate<'_>) -> u32 {
+    if r.per_connection && c.kind == Kind::Rotating {
+        c.policy.dial.race.clamp(1, 16)
+    } else {
+        1
+    }
+}
+
+fn session_matches(c: &Candidate<'_>, id: &str) -> bool {
+    c.adapter
+        .decode_session(id)
+        .is_ok_and(|s| s.ttl == c.session_ttl && s.strict == c.strict)
+}
+
+/// Ignore early failures while another candidate can still succeed. Dropping
+/// the remaining futures cancels sockets and runs their ownership guards.
+async fn first_served<F>(mut attempts: FuturesUnordered<F>) -> Result<Step, Cause>
+where
+    F: Future<Output = Result<Step, Cause>>,
+{
+    let mut step = Step::Empty;
+    let mut error = None;
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok(Step::Served(e)) => return Ok(Step::Served(e)),
+            Ok(Step::NeedCreate) => step = Step::NeedCreate,
+            Ok(Step::Lower(rank)) => match &mut step {
+                Step::Lower(previous) => *previous = (*previous).min(rank),
+                Step::NeedCreate => {}
+                _ => step = Step::Lower(rank),
+            },
+            Ok(next) if !matches!(step, Step::NeedCreate | Step::Lower(_)) => {
+                if !matches!(next, Step::Empty) {
+                    step = next;
+                }
+            }
+            Ok(_) => {}
+            Err(cause) => error = Some(cause),
+        }
+    }
+    match error {
+        Some(cause) => Err(cause),
+        None => Ok(step),
+    }
 }
 
 /// True when the provider's day or hour budget is spent (`policy.cost`). Both
@@ -1691,6 +2188,122 @@ fn over_budget(cost: &policy::Cost, used: &CostUsage) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn established() -> Established {
+        use policy::Pool;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let stream = TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("stream");
+        let partition = Partition {
+            provider: "race".parse().expect("provider"),
+            region: "fr".parse().expect("region"),
+        };
+        let org: OrgId = "race-tests".parse().expect("org");
+        let tunnel_id = Uuid::new_v4();
+        Established {
+            stream: stream.into(),
+            lease: LeaseData {
+                org: org.clone(),
+                partition: partition.clone(),
+                kind: Kind::Rotating,
+                provider: partition.provider.clone(),
+                sticky: "race".into(),
+                target: Target {
+                    host: "example.test".into(),
+                    port: 443,
+                },
+                tunnel_id,
+                pool: Pool::Shared,
+                limits: LeaseLimits {
+                    lease_ttl: Duration::from_secs(60),
+                    tunnel_ttl: Duration::from_secs(60),
+                    orgs_hard: None,
+                    max_conns_per_ip: None,
+                    provider_conns_per_ip: None,
+                    rest_after_release: Duration::ZERO,
+                    min_remaining: Duration::ZERO,
+                    allow_create: false,
+                },
+                grant: Grant {
+                    unit: "session".into(),
+                    ip: "198.18.0.1".parse().expect("ip"),
+                    orgs: 1,
+                    tunnels: 1,
+                    expires_at: None,
+                    broke: None,
+                    struck: false,
+                    fresh: true,
+                    tunnel: store::TunnelRef {
+                        partition,
+                        unit: "session".into(),
+                        org,
+                        id: tunnel_id,
+                        provider_counted: false,
+                    },
+                },
+                per_connection: true,
+                after_release: None,
+                fair_use_gb: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn race_ignores_early_failure_and_drops_slow_dial_at_first_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let winner = established().await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        type Attempt = std::pin::Pin<Box<dyn Future<Output = Result<Step, Cause>>>>;
+        let attempts: FuturesUnordered<Attempt> = FuturesUnordered::new();
+        attempts.push(Box::pin(async { Err(Cause::ProviderUnavailable) }));
+        let slow = Dropped(Arc::clone(&dropped));
+        attempts.push(Box::pin(async move {
+            let _slow = slow;
+            std::future::pending().await
+        }));
+        attempts.push(Box::pin(async move {
+            tokio::task::yield_now().await;
+            Ok(Step::Served(Box::new(winner)))
+        }));
+        let answer = timeout(Duration::from_secs(1), first_served(attempts))
+            .await
+            .expect("first success");
+        assert!(matches!(answer, Ok(Step::Served(_))));
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "unfinished dial is dropped before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn race_preserves_create_and_best_rank_after_all_candidates_finish() {
+        let attempts = FuturesUnordered::new();
+        for rank in [7, 3, 5] {
+            attempts.push(async move { Ok(Step::Lower(rank)) });
+        }
+        assert!(matches!(first_served(attempts).await, Ok(Step::Lower(3))));
+        let attempts = FuturesUnordered::new();
+        for create in [false, true] {
+            attempts.push(async move {
+                Ok(if create {
+                    Step::NeedCreate
+                } else {
+                    Step::Empty
+                })
+            });
+        }
+        assert!(matches!(first_served(attempts).await, Ok(Step::NeedCreate)));
+    }
 
     #[test]
     fn a_create_is_refused_at_either_limit() {
