@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-First public development line, version 0.1.0.
+## [0.1.0] - 2026-11-12
+
+First public release.
 
 ### Added
 
@@ -140,3 +142,6 @@ First public development line, version 0.1.0.
 - The shipped ClickHouse DDL assumes a replicated cluster with a `tiered` storage policy; a single node needs `PROXYX_CONTROL_CLICKHOUSE__LOCAL_SINGLE_NODE` set for `proxyx migrate control`.
 - TCP keepalive cannot be set on Redis sockets with the pinned client library; Redis calls are bounded by timeouts instead.
 - No binaries, container images or crates.io packages are published; build from source.
+
+[Unreleased]: https://github.com/noxred-research/proxyx/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/noxred-research/proxyx/releases/tag/v0.1.0
