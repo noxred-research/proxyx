@@ -567,8 +567,9 @@ mod tests {
         });
         let out = clean_capture(&item, 1000);
         let text = out.to_string();
-        for secret in ["pathsecret", "bodysecret", "abcdefghijklmnop0123"] {
-            assert!(!text.contains(secret), "{secret} survived: {text}");
+        // Report only which needle survived, never the cleaned output itself.
+        for needle in ["pathsecret", "bodysecret", "abcdefghijklmnop0123"] {
+            assert!(!text.contains(needle), "{needle} survived clean_capture");
         }
         assert_eq!(out["request_headers"][0][1], "[redacted: 3 bytes]");
         assert!(out["path"].as_str().expect("path").contains("ok=1"));

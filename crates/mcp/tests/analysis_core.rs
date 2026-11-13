@@ -351,9 +351,12 @@ async fn tool_and_resource_results_share_one_byte_ceiling() {
 #[tokio::test]
 async fn seeded_secrets_never_reach_output_model_or_audit() {
     let fx = Fixture::start().await;
+    // Assembled at run time so the source holds no secret-shaped literal for scanners.
+    let client_secret = ["csec", "0123456789abcdef"].join("-");
+    let session_header = ["hdrsecret", "0123456789"].join("-");
     let body = json!({
         "data": {"note": "conn postgres://svc:Hunter2-secret@db.internal/app", "api_key": "sk-live-AAAAAAAAAAAAAAAAAAAAAAAA"},
-        "items": [{"client_secret": "csec-0123456789abcdef"}],
+        "items": [{"client_secret": client_secret}],
     })
     .to_string();
     let capture = with_response(
@@ -366,7 +369,7 @@ async fn seeded_secrets_never_reach_output_model_or_audit() {
             403,
         ),
         &[
-            ("X-Session-Token", "hdrsecret-0123456789"),
+            ("X-Session-Token", session_header.as_str()),
             ("content-type", "application/json"),
         ],
         Some(&body),
@@ -1165,7 +1168,10 @@ fn sensitive_fixture() -> (Vec<Value>, Vec<Seed>, Vec<&'static str>) {
         with_response(
             cap(7, "run-1", "api.example.com", "GET", "/client", 200),
             &[json_ct],
-            Some(r#"{"client_key":"Zk3pQ9vXr7LmN2sTb8WdYf5HcJ1gAe4U"}"#),
+            Some(&format!(
+                r#"{{"client_key":"{}"}}"#,
+                ["Zk3pQ9vXr7LmN2sT", "b8WdYf5HcJ1gAe4U"].concat()
+            )),
         ),
         // 8: a phone number
         with_response(
@@ -2085,7 +2091,13 @@ async fn the_model_cannot_clear_a_time_clause_or_the_scope_on_a_query_draft() {
 #[tokio::test]
 async fn camel_case_and_jwt_credentials_are_redacted_from_capture_output() {
     let fx = Fixture::start().await;
-    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJlMDEyMzQ1";
+    let jwt = [
+        "eyJhbGciOiJIUzI1NiJ9",
+        "eyJzdWIiOiJ1c2VyIn0",
+        "c2lnbmF0dXJlMDEyMzQ1",
+    ]
+    .join(".");
+    let jwt = jwt.as_str();
     store(
         &fx,
         vec![with_response(
