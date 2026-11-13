@@ -485,6 +485,25 @@ pub fn capture(id: &str, status: u64, host: &str, body: &str) -> Value {
 pub struct ControlState {
     pub captures: Vec<Value>,
     pub sessions_created: u32,
+    /// Answer `400` to a search that carries a cursor, like a store that lost the position.
+    pub reject_cursors: bool,
+}
+
+/// The cursor of the capture at `index`: 40 bytes whose first 16 order by position.
+pub fn cursor_at(index: usize) -> String {
+    use base64::Engine as _;
+    let mut bytes = (index as u128 + 1).to_be_bytes().to_vec();
+    bytes.extend([0_u8; 24]);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn position_of(cursor: &str) -> Option<usize> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let head: [u8; 16] = bytes.get(..16)?.try_into().ok()?;
+    usize::try_from(u128::from_be_bytes(head)).ok()
 }
 
 pub type Control = Arc<Mutex<ControlState>>;
@@ -519,6 +538,7 @@ pub async fn fake_control() -> (Fake, Control) {
             ),
         ],
         sessions_created: 0,
+        reject_cursors: false,
     }));
     let router = Router::new()
         .route("/rpc/sessions", post(ctl_session_create))
@@ -529,6 +549,8 @@ pub async fn fake_control() -> (Fake, Control) {
         .route("/rpc/sessions/{id}/status", get(ctl_session_status))
         .route("/rpc/requests/search", post(ctl_search))
         .route("/rpc/requests/count", post(ctl_count))
+        .route("/rpc/ws/count", post(ctl_count))
+        .route("/rpc/sequence", get(ctl_sequence))
         .route("/rpc/orgs/{org}/requests/{id}", get(ctl_capture))
         .route("/rpc/ws/search", post(|| async { Json(json!({"items": [], "next_cursor": null})) }))
         .route(
@@ -626,24 +648,75 @@ async fn ctl_session_delete() -> Json<Value> {
     Json(json!({}))
 }
 
-async fn ctl_search(State(s): State<Control>, Json(body): Json<Value>) -> Json<Value> {
+async fn ctl_search(State(s): State<Control>, Json(body): Json<Value>) -> Response {
     let limit = body["limit"].as_u64().unwrap_or(100) as usize;
-    let want_bodies = body.get("response_body_max_fetch_size").is_some();
-    let items: Vec<Value> = s
+    let want_request = body.get("request_body_max_fetch_size").is_some();
+    let want_response = body.get("response_body_max_fetch_size").is_some();
+    let state = s.lock().expect("control");
+    if state.reject_cursors && body["cursor"].is_string() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "undecodable cursor"})),
+        )
+            .into_response();
+    }
+    let after = body["cursor"].as_str().and_then(position_of);
+    let end = body["end_cursor"].as_str().and_then(position_of);
+    if let (Some(after), Some(end)) = (after, end)
+        && end < after
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "end_cursor before cursor"})),
+        )
+            .into_response();
+    }
+    let mut rows: Vec<(usize, Value)> = state
+        .captures
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| after.is_none_or(|a| *i >= a) && end.is_none_or(|e| *i < e))
+        .map(|(i, c)| {
+            let mut c = c.clone();
+            if !want_response {
+                c["response_body"] = Value::Null;
+            }
+            if !want_request {
+                c["request_body"] = Value::Null;
+            }
+            (i, c)
+        })
+        .collect();
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let next = more
+        .then(|| rows.last().map(|(i, _)| cursor_at(*i)))
+        .flatten();
+    Json(json!({
+        "items": rows.into_iter().map(|(_, c)| c).collect::<Vec<_>>(),
+        "next_cursor": next,
+        "total_count": null
+    }))
+    .into_response()
+}
+
+async fn ctl_sequence(
+    State(s): State<Control>,
+    Query(q): Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let source = q.get("source_id").cloned().unwrap_or_default();
+    let newest = s
         .lock()
         .expect("control")
         .captures
         .iter()
-        .take(limit)
-        .map(|c| {
-            let mut c = c.clone();
-            if !want_bodies {
-                c["response_body"] = Value::Null;
-            }
-            c
-        })
-        .collect();
-    Json(json!({"items": items, "next_cursor": null, "total_count": null}))
+        .enumerate()
+        .filter(|(_, c)| c["source_id"] == source.as_str())
+        .map(|(i, _)| i)
+        .max();
+    Json(
+        json!({"org_id": q.get("org_id"), "source_id": source, "cursor": newest.map(cursor_at), "count": 0}),
+    )
 }
 
 async fn ctl_count(State(s): State<Control>) -> Json<Value> {
@@ -771,6 +844,8 @@ pub struct LlmScript {
     pub answers: Arc<Mutex<BTreeMap<String, String>>>,
     /// Reject `json_schema` response formats with a 400, like a server that lacks support.
     pub refuse_json_schema: Arc<Mutex<bool>>,
+    /// Milliseconds every request waits before it is answered.
+    pub delay_ms: Arc<Mutex<u64>>,
 }
 
 pub async fn fake_llm() -> (Fake, LlmScript) {
@@ -788,6 +863,10 @@ async fn llm_complete(
 ) -> Response {
     if !bearer_is(&headers, "llm-api-key-0123456789") {
         return unauthorized();
+    }
+    let delay = *s.delay_ms.lock().expect("delay");
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let format = &body["response_format"];
     if format["type"] == "json_schema" && *s.refuse_json_schema.lock().expect("flag") {
@@ -853,6 +932,7 @@ impl Fixture {
             ("confirm-token", CONFIRM_TOKEN),
             ("upstream-password", UPSTREAM_PASSWORD),
             ("llm-key", "llm-api-key-0123456789"),
+            ("fingerprint-key", "operator-fingerprint-key-0123456789"),
         ] {
             write_file(&dir, name, &format!("{value}\n"));
         }
@@ -943,6 +1023,21 @@ state_dir = "{d}/state"
             self.llm.url(),
             self.dir.display()
         )
+    }
+
+    /// An `[analysis]` section: the sources and origins the test captures use, auth analysis on,
+    /// and `extra` lines appended inside `[analysis]` (or further tables).
+    pub fn analysis_config(&self, extra: &str) -> String {
+        format!(
+            "[analysis]\nenabled = true\nallowed_source_ids = [\"run-1\", \"run-2\"]\nallowed_origins = [\"api.example.com\", \"*.example.org\"]\nauth.enabled = true\nauth.fingerprint_key_file = \"{}/fingerprint-key\"\n{extra}\n",
+            self.dir.display()
+        )
+    }
+
+    /// A server with analysis enabled and optional extra configuration (appended as is).
+    pub fn analysis_server(&self, safety: &str, analysis: &str, tables: &str) -> Arc<Server> {
+        let config = format!("{}\n{tables}", self.analysis_config(analysis));
+        self.server(safety, &config)
     }
 
     pub fn server(&self, safety: &str, extra: &str) -> Arc<Server> {
@@ -1072,4 +1167,72 @@ pub fn tool_names(reply: &Value) -> Vec<String> {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name").to_owned())
         .collect()
+}
+
+// --- analysis fixtures ------------------------------------------------------------------------------------
+
+/// A capture id (a UUID) from a small number.
+pub fn uid(n: u32) -> String {
+    format!("0190bbbb-0000-4000-8000-{n:012}")
+}
+
+fn text_body(text: &str) -> Value {
+    json!({"status": "body", "value": text})
+}
+
+/// A capture summary of `source` on `host`, `n` seconds into the run.
+pub fn cap(n: u32, source: &str, host: &str, method: &str, path: &str, status: u64) -> Value {
+    json!({
+        "id": uid(n), "org_id": "acme", "timestamp": format!("2026-11-10T10:{:02}:{:02}.000Z", n / 60, n % 60),
+        "session_offset": n, "method": method, "path": path, "host": host, "scheme": "https",
+        "session_id": SESSION_ID, "proxy_id": "proxy-1", "request_size": 0, "status_code": status,
+        "response_size": 0, "duration_ms": 10, "ratelimit_wait_ms": 0, "source": "mcp", "source_id": source,
+        "request_headers": [], "response_headers": [], "request_body": null, "response_body": null
+    })
+}
+
+/// Set request headers and an optional body.
+pub fn with_request(mut capture: Value, headers: &[(&str, &str)], body: Option<&str>) -> Value {
+    capture["request_headers"] = Value::Array(headers.iter().map(|(n, v)| json!([n, v])).collect());
+    capture["request_body"] = body.map_or(Value::Null, text_body);
+    capture
+}
+
+/// Set response headers and an optional body.
+pub fn with_response(mut capture: Value, headers: &[(&str, &str)], body: Option<&str>) -> Value {
+    capture["response_headers"] =
+        Value::Array(headers.iter().map(|(n, v)| json!([n, v])).collect());
+    capture["response_body"] = body.map_or(Value::Null, text_body);
+    if let Some(body) = body {
+        capture["response_size"] = json!(body.len());
+    }
+    capture
+}
+
+/// Replace the fake control plane's stored captures.
+pub fn store(fx: &Fixture, captures: Vec<Value>) {
+    fx.control_state.lock().expect("control").captures = captures;
+}
+
+/// Open an analysis scope on `run-1` (or the given sources) and return its handle.
+pub async fn open_scope(server: &Arc<Server>, sources: &[&str]) -> String {
+    let scope = tool_ok(
+        server,
+        "open_analysis_scope",
+        json!({"source_ids": sources}),
+    )
+    .await;
+    scope["scope_id"].as_str().expect("scope id").to_owned()
+}
+
+/// The audit log's text.
+pub fn audit_text(fx: &Fixture) -> String {
+    std::fs::read_to_string(fx.audit_path()).unwrap_or_default()
+}
+
+/// Assert none of `secrets` occurs in `haystack`.
+pub fn assert_absent(what: &str, haystack: &str, secrets: &[&str]) {
+    for secret in secrets {
+        assert!(!haystack.contains(secret), "{secret} leaked into {what}");
+    }
 }

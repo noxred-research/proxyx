@@ -10,18 +10,7 @@ use serde_json::{Map, Value, json};
 use super::Ctx;
 use super::util::{Args, ToolError, ToolResult, clip};
 use crate::audit::sha256_hex;
-
-/// Header names whose values are credentials or session material.
-const SENSITIVE_HEADERS: [&str; 8] = [
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "x-api-key",
-    "api-key",
-    "x-auth-token",
-    "x-csrf-token",
-];
+use crate::redact::{is_sensitive_header, redact_body, redact_text};
 
 #[derive(Clone, Copy)]
 enum Field {
@@ -72,6 +61,39 @@ const WS_FIELDS: &[(&str, Field)] = &[
     ("payload_is_text", Field::Bool),
     ("payload_truncated", Field::Bool),
 ];
+
+/// The string filter operators, for error messages and the generated reference.
+pub const TEXT_OPS: &str =
+    "contains, exact, regex_match, length, is_null, is_present, all, any, not";
+/// The integer filter operators.
+pub const INT_OPS: &str = "exact, lt, lte, gt, gte, all, any, not";
+
+impl Field {
+    const fn describe(self) -> &'static str {
+        match self {
+            Field::Text => "string filter",
+            Field::Int => "integer filter",
+            Field::Bool => "true or false",
+            Field::Header => "{\"key\": \"...\", \"value\": \"...\"}",
+            Field::SourceId => "a string or a list of strings",
+            Field::SingleText => "a string",
+            Field::Uuid => "a UUID string",
+        }
+    }
+}
+
+/// The query language as text, generated from the tables the validator itself uses.
+pub fn dsl_reference(ws: bool) -> String {
+    let fields = if ws { WS_FIELDS } else { HTTP_FIELDS };
+    let mut out = format!(
+        "A query is a list of branches (OR). A branch is an object whose present fields must all match (AND).\nString filter: {{\"op\": one of {TEXT_OPS}, ...}} with `value` (contains, exact, regex_match), `value` as an integer filter (length), `filters` (all, any) or `filter` (not).\nInteger filter: {{\"op\": one of {INT_OPS}, ...}} with an integer `value` (or `filters`/`filter`).\nFields:\n"
+    );
+    for (name, kind) in fields {
+        out.push_str(&format!("- {name}: {}\n", kind.describe()));
+    }
+    out.push_str("There is no timestamp field: a time range cannot be expressed.\n");
+    out
+}
 
 /// Check query branches against the documented language, with messages that say how to fix
 /// them. The server validates again; this saves a round trip and explains better.
@@ -196,7 +218,7 @@ fn check_text_filter(value: &Value, path: &str, issues: &mut Vec<String>, depth:
             None => issues.push(format!("{path}.filter: required")),
         },
         Some(other) => issues.push(format!(
-            "{path}.op: `{other}` is not an operator (contains, exact, regex_match, length, is_null, is_present, all, any, not)"
+            "{path}.op: `{other}` is not an operator ({TEXT_OPS})"
         )),
         None => issues.push(format!("{path}.op: required")),
     }
@@ -225,7 +247,7 @@ fn check_int_filter(value: &Value, path: &str, issues: &mut Vec<String>, depth: 
             None => issues.push(format!("{path}.filter: required")),
         },
         Some(other) => issues.push(format!(
-            "{path}.op: `{other}` is not an int operator (exact, lt, lte, gt, gte, all, any, not)"
+            "{path}.op: `{other}` is not an int operator ({INT_OPS})"
         )),
         None => issues.push(format!("{path}.op: required")),
     }
@@ -262,24 +284,28 @@ pub fn alias_session(id: &str) -> String {
     format!("sess:{}", &sha256_hex(id)[..8])
 }
 
-fn body_cap(ctx: &Ctx, requested: Option<u64>) -> usize {
+/// The bytes of one body a result may carry: what was asked for, never more than the
+/// operator's `limits.max_body_bytes`, and at most half of `limits.max_result_bytes`.
+pub fn body_cap(ctx: &Ctx, requested: Option<u64>) -> usize {
     let configured = ctx.cfg.limits.max_body_bytes;
     let wanted = requested
         .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(configured);
+        .map_or(configured, |n| n.min(configured));
     wanted.min(ctx.cfg.limits.max_result_bytes / 2).max(1)
+}
+
+/// Credentials are removed before the cut, so a secret cannot survive as a half-shown prefix.
+fn clip_text(text: &str, cap: usize) -> Value {
+    let cleaned = redact_body(text);
+    let (kept, cut) = clip(&cleaned, cap);
+    json!({"text": kept, "bytes": text.len(), "truncated": cut})
 }
 
 fn clip_body(body: &Value, cap: usize) -> Value {
     match body {
-        Value::String(text) => {
-            let (kept, cut) = clip(text, cap);
-            json!({"text": kept, "bytes": text.len(), "truncated": cut})
-        }
+        Value::String(text) => clip_text(text, cap),
         Value::Object(map) if map.get("status").and_then(Value::as_str) == Some("body") => {
-            let text = map.get("value").and_then(Value::as_str).unwrap_or("");
-            let (kept, cut) = clip(text, cap);
-            json!({"text": kept, "bytes": text.len(), "truncated": cut})
+            clip_text(map.get("value").and_then(Value::as_str).unwrap_or(""), cap)
         }
         Value::Object(map) if map.get("status").and_then(Value::as_str) == Some("too_large") => {
             json!({"text": null, "bytes": map.get("size"), "truncated": true, "note": "larger than the fetch cap; get_capture returns it truncated"})
@@ -291,10 +317,10 @@ fn clip_body(body: &Value, cap: usize) -> Value {
 
 fn clean_headers(headers: &Value) -> Value {
     let hide = |name: &str, value: &str| -> String {
-        if SENSITIVE_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+        if is_sensitive_header(name) {
             format!("[redacted: {} bytes]", value.len())
         } else {
-            value.to_owned()
+            redact_text(value)
         }
     };
     match headers {
@@ -321,7 +347,8 @@ fn clean_headers(headers: &Value) -> Value {
     }
 }
 
-/// A capture (summary or full) with bodies clipped, credentials hidden and the session aliased.
+/// A capture (summary or full) with credentials removed from headers, bodies and the URL, bodies
+/// clipped after that, and the session aliased. The model-bound path uses this same cleaning.
 pub fn clean_capture(item: &Value, cap: usize) -> Value {
     let mut out = item.clone();
     if let Some(map) = out.as_object_mut() {
@@ -334,6 +361,10 @@ pub fn clean_capture(item: &Value, cap: usize) -> Value {
             if let Some(body) = map.get(key).cloned() {
                 map.insert(key.to_owned(), clip_body(&body, cap));
             }
+        }
+        if let Some(path) = map.get("path").and_then(Value::as_str) {
+            let cleaned = redact_text(path);
+            map.insert("path".to_owned(), json!(cleaned));
         }
         if let Some(id) = map
             .get("session_id")
@@ -509,6 +540,39 @@ mod tests {
         }
         assert!(validate_branches(&json!([]), false).is_err());
         assert!(validate_branches(&json!([{"parent_event_id": "nope"}]), true).is_err());
+    }
+
+    #[test]
+    fn the_generated_reference_lists_every_field_and_operator_the_validator_knows() {
+        for ws in [false, true] {
+            let reference = dsl_reference(ws);
+            let fields = if ws { WS_FIELDS } else { HTTP_FIELDS };
+            for (name, _) in fields {
+                assert!(
+                    reference.contains(&format!("- {name}:")),
+                    "{name} in the reference"
+                );
+            }
+            assert!(reference.contains(TEXT_OPS) && reference.contains(INT_OPS));
+            assert!(reference.contains("no timestamp field"));
+        }
+    }
+
+    #[test]
+    fn captures_are_cleaned_like_model_input() {
+        let item = json!({
+            "id": "1", "path": "/cb?token=pathsecret&ok=1",
+            "request_headers": [["X-Session-Token", "hdr"], ["x-note", "Bearer abcdefghijklmnop0123"]],
+            "response_body": {"status": "body", "value": r#"{"data":{"api_key":"bodysecret"},"msg":"hi"}"#}
+        });
+        let out = clean_capture(&item, 1000);
+        let text = out.to_string();
+        // Report only which needle survived, never the cleaned output itself.
+        for needle in ["pathsecret", "bodysecret", "abcdefghijklmnop0123"] {
+            assert!(!text.contains(needle), "{needle} survived clean_capture");
+        }
+        assert_eq!(out["request_headers"][0][1], "[redacted: 3 bytes]");
+        assert!(out["path"].as_str().expect("path").contains("ok=1"));
     }
 
     #[test]

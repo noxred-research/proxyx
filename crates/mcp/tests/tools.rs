@@ -572,14 +572,21 @@ async fn traffic_summary_and_block_page_classification_run_without_an_llm() {
     .await;
     assert_eq!(fine["classification"], "none");
     assert!(fine["suggested_signal"].is_null());
-    // the read-only server may not report, and says so rather than pretending
-    let refused = tool_ok(
+    // classification only advises: it names the separate reporting call and what it still lacks
+    let advice = tool_ok(
         &server,
         "classify_block_page",
-        json!({"status": 429, "host": "api.example.com", "exit_ip": "203.0.113.5", "report": true}),
+        json!({"status": 429, "host": "api.example.com", "exit_ip": "203.0.113.5"}),
     )
     .await;
-    assert_eq!(refused["reported"]["error"]["kind"], "refused");
+    assert_eq!(advice["subtype"], "http_429");
+    assert_eq!(advice["reporting"]["tool"], "report_block_signal");
+    assert_eq!(
+        advice["reporting"]["reportable"], false,
+        "one observation is below min_observations"
+    );
+    assert_eq!(advice["reporting"]["arguments"]["exit_ip"], "203.0.113.5");
+    assert!(advice.get("reported").is_none());
     assert!(fx.pool.log.mutations().is_empty());
 }
 

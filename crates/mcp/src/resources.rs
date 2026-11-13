@@ -166,6 +166,12 @@ pub fn templates(ctx: &Ctx) -> Vec<Value> {
     if listed(ctx, "get_capture") {
         out.push(json!({"uriTemplate": "proxyx://captures/{org}/{id}", "name": "capture", "description": "One captured HTTP exchange (untrusted content, bodies truncated).", "mimeType": "application/json"}));
     }
+    if listed(ctx, "read_capture_feed") {
+        out.push(json!({"uriTemplate": "proxyx://feeds/{org}/{feed_id}", "name": "capture-feed", "description": "The next page of a capture feed: stored captures since the last read, with a cursor and an explicit note that ingestion lags (untrusted content). Reading advances the feed.", "mimeType": "application/json"}));
+    }
+    if listed(ctx, "get_api_schema_draft") {
+        out.push(json!({"uriTemplate": "proxyx://analysis/{org}/{draft_id}/openapi", "name": "api-draft", "description": "The OpenAPI 3.1 draft inferred from captures (observed, not a contract; untrusted content). A draft over several origins returns an index.", "mimeType": "application/json"}));
+    }
     if listed(ctx, "get_org") {
         out.push(json!({"uriTemplate": "proxyx://orgs/{org}", "name": "org", "description": "An org's rate limit, live bucket and egress proxy.", "mimeType": "application/json"}));
     }
@@ -201,11 +207,60 @@ async fn via_tool(
     Ok(contents(uri, "application/json", json_text(&value)))
 }
 
-/// Read a resource.
+/// An analysis resource: the tool's result through the same gate and audit as a tool call. An
+/// unknown, expired or other-org handle is not found; any other refusal is reported.
+async fn analysis_resource(
+    ctx: &Arc<Ctx>,
+    uri: &str,
+    tool: &str,
+    args: Value,
+    info: &CallInfo,
+) -> Result<Vec<Value>, ReadError> {
+    if !listed(ctx, tool) {
+        return Err(ReadError::NotFound);
+    }
+    let completed = tools::run(ctx, tool, args, info)
+        .await
+        .map_err(|_| ReadError::NotFound)?;
+    let mut value = match completed.result {
+        Ok(value) => value,
+        Err(error) if error.message.starts_with("unknown or expired") => {
+            return Err(ReadError::NotFound);
+        }
+        Err(error) => return Err(ReadError::Failed(error.message)),
+    };
+    // an inferred document is served as the document itself
+    if let Some(document) = value.get("openapi_document").cloned() {
+        value = document;
+        crate::redact::redact_text_only(&mut value);
+    } else {
+        crate::redact::redact_value(&mut value);
+    }
+    Ok(contents(uri, "application/json", json_text(&value)))
+}
+
+/// Read a resource. Every content shares the byte ceiling of a tool result.
 ///
 /// # Errors
 /// [`ReadError::NotFound`] for an unknown or unavailable URI.
 pub async fn read(ctx: &Arc<Ctx>, uri: &str, info: &CallInfo) -> Result<Vec<Value>, ReadError> {
+    let mut contents = read_uncapped(ctx, uri, info).await?;
+    let max = ctx.cfg.limits.max_result_bytes;
+    for content in &mut contents {
+        if let Some(text) = content["text"].as_str()
+            && text.len() > max
+        {
+            content["text"] = Value::String(crate::tools::util::cap_text(text, max));
+        }
+    }
+    Ok(contents)
+}
+
+async fn read_uncapped(
+    ctx: &Arc<Ctx>,
+    uri: &str,
+    info: &CallInfo,
+) -> Result<Vec<Value>, ReadError> {
     if let Some(doc) = DOCS.iter().find(|doc| doc.uri == uri) {
         return Ok(contents(uri, doc.mime, document(doc.uri, ctx)));
     }
@@ -253,6 +308,26 @@ pub async fn read(ctx: &Arc<Ctx>, uri: &str, info: &CallInfo) -> Result<Vec<Valu
             via_tool(ctx, uri, "get_capture", json!({"org": org, "id": id}), info).await
         }
         ["orgs", org] => via_tool(ctx, uri, "get_org", json!({"org": org}), info).await,
+        ["feeds", org, feed_id] => {
+            analysis_resource(
+                ctx,
+                uri,
+                "read_capture_feed",
+                json!({"org": org, "feed_id": feed_id}),
+                info,
+            )
+            .await
+        }
+        ["analysis", org, draft_id, "openapi"] => {
+            analysis_resource(
+                ctx,
+                uri,
+                "get_api_schema_draft",
+                json!({"org": org, "draft_id": draft_id}),
+                info,
+            )
+            .await
+        }
         _ => Err(ReadError::NotFound),
     }
 }

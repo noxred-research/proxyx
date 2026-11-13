@@ -1181,7 +1181,7 @@ async fn an_endpoint_that_carries_a_credential_is_refused() {
 }
 
 #[tokio::test]
-async fn nested_reporting_enforces_underlying_tool_allow_and_deny_lists() {
+async fn classification_is_independent_of_the_reporting_tool_and_its_allow_and_deny_lists() {
     let fx = Fixture::start().await;
     for rules in [
         "deny_tools = [\"report_block_signal\"]",
@@ -1191,15 +1191,19 @@ async fn nested_reporting_enforces_underlying_tool_allow_and_deny_lists() {
         let classified = tool_ok(
             &server,
             "classify_block_page",
-            json!({
-                "status": 403, "host": "example.com", "exit_ip": "203.0.113.50", "report": true
-            }),
+            json!({"status": 403, "host": "example.com", "exit_ip": "203.0.113.50"}),
         )
         .await;
-        assert!(
-            classified["reported"].to_string().contains("disabled"),
-            "{classified}"
-        );
+        assert_eq!(classified["classification"], "forbidden");
+        assert!(classified.get("reported").is_none(), "{classified}");
+        // the reporting call is its own tool and obeys the lists by itself
+        let refused = tool_err(
+            &server,
+            "report_block_signal",
+            json!({"type": "forbidden", "target": "example.com", "exit_ip": "203.0.113.50"}),
+        )
+        .await;
+        assert!(refused.to_string().contains("disabled"), "{refused}");
         assert!(fx.pool.log.mutations().is_empty());
     }
 }

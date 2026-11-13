@@ -86,6 +86,13 @@ pub fn capabilities(ctx: &Ctx) -> ToolResult {
             "llm": ctx.llm.is_some(),
             "credential_refs": ctx.credentials.keys().collect::<Vec<_>>(),
         },
+        "analysis": {
+            "enabled": cfg.analysis.enabled,
+            "allow_external_llm": cfg.analysis.allow_external_llm,
+            "sources": cfg.analysis.allowed_source_ids.len(),
+            "origins": cfg.analysis.allowed_origins.len(),
+            "details": "call analysis_capabilities",
+        },
         "audit_log": ctx.audit.path().display().to_string(),
         "listed_tools": listed,
         "unlisted_tools": hidden,
@@ -101,7 +108,13 @@ fn why_hidden(ctx: &Ctx, def: &super::ToolDef) -> String {
     {
         return format!("capability `{}` is not enabled", capability.as_str());
     }
-    "its backend is not configured".into()
+    def.needs
+        .iter()
+        .find(|need| !ctx.satisfied(**need))
+        .map_or_else(
+            || "its backend is not configured".to_owned(),
+            |need| format!("it needs {}", super::need_text(*need)),
+        )
 }
 
 pub async fn list_inventory(ctx: &Ctx, args: &Args) -> ToolResult {

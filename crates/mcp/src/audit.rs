@@ -18,6 +18,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::redact::redacted;
 
+/// Most bytes of redacted arguments one audit line carries.
+const MAX_LOGGED_ARGUMENT_BYTES: usize = 256 * 1024;
+
+/// Most characters of detail one audit line carries.
+const MAX_LOGGED_DETAIL_CHARS: usize = 8192;
+
 /// The hash of the entry before the first one.
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -39,6 +45,10 @@ pub enum Phase {
     Intent,
     /// The final outcome of a call.
     Result,
+    /// One call to an external model: sizes, timing and evidence ids, never content.
+    Model,
+    /// The evidence an analysis relied on: ids, digests and counts, never content.
+    Evidence,
 }
 
 impl Phase {
@@ -46,6 +56,8 @@ impl Phase {
         match self {
             Phase::Intent => "intent",
             Phase::Result => "result",
+            Phase::Model => "model",
+            Phase::Evidence => "evidence",
         }
     }
 }
@@ -235,9 +247,22 @@ impl Audit {
     /// # Errors
     /// When opening, locking, reading the tail or writing fails. A broken tail is not reset.
     pub fn record(&self, entry: &Entry<'_>) -> io::Result<u64> {
-        let arguments = redacted(entry.arguments);
+        let mut arguments = redacted(entry.arguments);
+        // one line must stay inside the window the tail reader scans: an oversized argument
+        // set is recorded by its size and digest
+        let canonical = canonical_json(&arguments);
+        if canonical.len() > MAX_LOGGED_ARGUMENT_BYTES {
+            arguments = json!({
+                "_truncated": true,
+                "bytes": canonical.len(),
+                "sha256": sha256_hex(&canonical),
+            });
+        }
         let caller = serde_json::to_value(entry.caller).unwrap_or(Value::Null);
-        let detail = crate::redact::redact_text(entry.detail.unwrap_or(""));
+        let detail: String = crate::redact::redact_text(entry.detail.unwrap_or(""))
+            .chars()
+            .take(MAX_LOGGED_DETAIL_CHARS)
+            .collect();
         let mut file = Self::locked_file(&self.path)?;
         let (last_seq, prev) = Self::tail_state(&mut file)?;
         let seq = last_seq

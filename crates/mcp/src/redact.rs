@@ -28,7 +28,11 @@ static SAFE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Credential shapes found inside free text.
 static SECRET_TEXT: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    let rules: [(&str, &str); 10] = [
+    let rules: [(&str, &str); 11] = [
+        (
+            r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*",
+            REDACTED,
+        ),
         (r"\bak_[A-Za-z0-9_-]{16,}", REDACTED),
         (r"\bpxk_[A-Za-z0-9_-]{16,}", REDACTED),
         (r"\bpt1\.\d+\.[A-Za-z0-9_-]{8,}", REDACTED),
@@ -79,9 +83,24 @@ static HEADER_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^([A-Za-z0-9_-]+):[^\r\n]*").expect("header-line pattern is valid")
 });
 
+/// `accessToken` as `access_token`: names are matched the way they are spelled in snake case.
+fn snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    let mut previous_lower = false;
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() && previous_lower {
+            out.push('_');
+        }
+        previous_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
 /// True when a member with this name must not be shown.
 pub fn is_secret_name(name: &str) -> bool {
-    !SAFE_SUFFIX.is_match(name) && SECRET_NAME.is_match(name)
+    let snake = snake_case(name);
+    !SAFE_SUFFIX.is_match(&snake) && SECRET_NAME.is_match(&snake)
 }
 
 fn is_secret_query_name(name: &str) -> bool {
@@ -145,6 +164,8 @@ pub fn is_sensitive_header(name: &str) -> bool {
     lower.starts_with("proxy-")
         || matches!(compact.as_str(), "authorization" | "cookie" | "setcookie")
         || compact.contains("apikey")
+        || compact.contains("jwt")
+        || compact.contains("assertion")
         || is_secret_name(name)
 }
 
@@ -228,7 +249,8 @@ pub const REVEALED: &str = "revealed_once";
 /// refused any entry with a password or key, so only the text patterns apply to it.
 pub const ENDPOINTS: &str = "endpoints";
 
-fn redact_text_only(value: &mut Value) {
+/// Remove credential shapes from the text of every string in `value`, leaving member names.
+pub fn redact_text_only(value: &mut Value) {
     match value {
         Value::Object(map) => map.values_mut().for_each(redact_text_only),
         Value::Array(items) => items.iter_mut().for_each(redact_text_only),
@@ -242,6 +264,16 @@ fn redact_text_only(value: &mut Value) {
     }
 }
 
+/// Members whose names are data, not secrets: query filters (`{"key": "server", ...}`) and
+/// inferred API documents (a property may be called `token`). Only credential shapes in their
+/// text are removed.
+const TEXT_ONLY: [&str; 4] = [
+    ENDPOINTS,
+    "openapi_document",
+    "branches",
+    "branches_before_scope",
+];
+
 /// Redact `value` in place.
 pub fn redact_value(value: &mut Value) {
     match value {
@@ -250,7 +282,7 @@ pub fn redact_value(value: &mut Value) {
                 if name == REVEALED {
                     continue;
                 }
-                if name == ENDPOINTS {
+                if TEXT_ONLY.contains(&name.as_str()) {
                     redact_text_only(member);
                     continue;
                 }
@@ -288,6 +320,29 @@ pub fn redacted(value: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn camel_case_names_and_jwt_values_are_redacted() {
+        // Assembled at run time so the source holds no secret-shaped literal for scanners.
+        let jwt = [
+            "eyJhbGciOiJIUzI1NiJ9",
+            "eyJzdWIiOiJ1c2VyIn0",
+            "c2lnbmF0dXJlMDEyMzQ1",
+        ]
+        .join(".");
+        let value = json!({
+            "accessToken": "abc", "idToken": "def", "clientSecret": "ghi", "apiKey": "jkl",
+            "credentialRef": "kept", "sessionTokenHint": "kept", "note": format!("see {jwt}"),
+        });
+        let out = redacted(&value);
+        for name in ["accessToken", "idToken", "clientSecret", "apiKey"] {
+            assert_eq!(out[name], REDACTED, "{name}");
+        }
+        assert_eq!(out["credentialRef"], "kept");
+        assert_eq!(out["sessionTokenHint"], "kept");
+        assert!(!out["note"].as_str().expect("note").contains("eyJ"));
+        assert!(is_sensitive_header("X-Jwt-Assertion"));
+    }
 
     #[test]
     fn secret_members_are_replaced() {

@@ -152,25 +152,55 @@ async fn json_schema_fallback_and_auth_errors() {
 }
 
 #[tokio::test]
-async fn classification_can_report_a_signal_only_with_the_capability() {
+async fn classification_never_writes_and_reporting_is_a_separate_gated_call() {
     let fx = Fixture::start().await;
     answer(
         &fx.llm_script,
         "block_page",
         "{\"classification\":\"challenge\",\"confidence\":0.9,\"reason\":\"captcha\"}",
     );
-    let read_only = fx.server("", &fx.llm_config());
-    let args = json!({"status": 403, "body": "captcha wall", "host": "shop.example", "use_llm": true, "report": true, "exit_ip": "203.0.113.50", "session": "5f0a7c9e2b1d4c6f8a3e0b7d9c2a1f48"});
-    let refused = tool_ok(&read_only, "classify_block_page", args.clone()).await;
-    assert_eq!(refused["reported"]["error"]["kind"], "refused");
-    assert!(fx.pool.log.mutations().is_empty());
-
+    let args = json!({"status": 403, "body": "captcha wall", "host": "shop.example", "use_llm": true, "exit_ip": "203.0.113.50", "session": "5f0a7c9e2b1d4c6f8a3e0b7d9c2a1f48"});
+    // even a server that may report signals only classifies: the old `report` argument is gone
     let operator = fx.server("profile = \"operator\"", &fx.llm_config());
-    let reported = tool_ok(&operator, "classify_block_page", args).await;
-    assert_eq!(reported["reported"]["status"], "applied");
+    let error = tool_err(
+        &operator,
+        "classify_block_page",
+        json!({"status": 403, "report": true}),
+    )
+    .await;
+    assert_eq!(error["error"]["kind"], "invalid_arguments");
+    let classified = tool_ok(&operator, "classify_block_page", args).await;
+    assert_eq!(classified["classification"], "challenge");
+    assert_eq!(classified["confidence_kind"], "self_reported");
+    assert_eq!(
+        classified["reporting"]["reportable"], false,
+        "a model's answer never makes a classification reportable"
+    );
+    assert_eq!(classified["reporting"]["tool"], "report_block_signal");
+    assert!(
+        fx.pool.log.mutations().is_empty(),
+        "classification wrote nothing"
+    );
+
+    // reporting is its own call with its own capability
+    let read_only = fx.server("", &fx.llm_config());
+    let refused = tool_err(
+        &read_only,
+        "report_block_signal",
+        json!({"type": "challenge", "target": "shop.example", "exit_ip": "203.0.113.50"}),
+    )
+    .await;
+    assert_eq!(refused["error"]["kind"], "refused", "{refused}");
+    assert!(refused.to_string().contains("signals"), "{refused}");
+    let reported = tool_ok(
+        &operator,
+        "report_block_signal",
+        classified["reporting"]["arguments"].clone(),
+    )
+    .await;
+    assert_eq!(reported["status"], "applied");
     let sent = &fx.pool.log.calls("POST", "/v1/block-signals")[0].body[0];
     assert_eq!(sent["type"], "challenge");
-    assert_eq!(sent["target"], "shop.example:443");
     assert_eq!(sent["exit_ip"], "203.0.113.50");
 }
 

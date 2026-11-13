@@ -6,6 +6,7 @@
 //! audit entry. Mutating tools run detached from the request, so a client that disconnects
 //! cannot leave a half-applied change without its audit entry.
 
+mod analysis_tools;
 mod assess;
 mod catalog;
 mod explain_tools;
@@ -55,6 +56,8 @@ pub enum Need {
     Roles,
     Llm,
     ConfirmToken,
+    /// Capture analysis, enabled by `[analysis]`.
+    Analysis,
 }
 
 /// MCP tool annotations. Hints only: a client must not trust them.
@@ -140,6 +143,8 @@ pub struct Ctx {
     pub store: Store,
     pub sampler: Sampler,
     pub llm: Option<Llm>,
+    /// Scopes, findings, drafts and feeds of the analysis tools. In memory only.
+    pub analysis: crate::analysis::State,
     /// SHA-256 of the confirm token, when `confirm_change` is enabled.
     pub confirm_token: Option<String>,
     pub credentials: BTreeMap<String, Credential>,
@@ -165,6 +170,7 @@ impl Ctx {
         let store = Store::open(cfg.state_dir())?;
         let audit = Audit::open(&cfg.audit_path(), cfg.scope.engagement.clone())?;
         let llm = cfg.llm.as_ref().map(Llm::new).transpose()?;
+        let analysis = crate::analysis::State::new(&cfg.analysis)?;
         let confirm_token = cfg
             .safety
             .confirm_token_file
@@ -191,6 +197,7 @@ impl Ctx {
             audit,
             store,
             llm,
+            analysis,
             confirm_token,
             credentials,
             tools,
@@ -247,6 +254,7 @@ impl Ctx {
             Need::Roles => !self.backends.roles.is_empty(),
             Need::Llm => self.llm.is_some(),
             Need::ConfirmToken => self.confirm_token.is_some(),
+            Need::Analysis => self.cfg.analysis.enabled,
         }
     }
 
@@ -464,13 +472,7 @@ async fn execute(ctx: &Arc<Ctx>, def: &ToolDef, arguments: Value, info: &CallInf
             return Err(ToolError::not_configured(format!(
                 "tool `{}` needs {} which this server does not have configured",
                 def.name,
-                match need {
-                    Need::Pool => "the pool gateway control API (endpoints.pool)",
-                    Need::Control => "the session control plane (endpoints.control)",
-                    Need::Roles => "at least one role endpoint (endpoints.roles)",
-                    Need::Llm => "an LLM endpoint ([llm])",
-                    Need::ConfirmToken => "a confirm token (safety.confirm_token_file)",
-                }
+                need_text(*need)
             )));
         }
     }
@@ -484,6 +486,18 @@ async fn execute(ctx: &Arc<Ctx>, def: &ToolDef, arguments: Value, info: &CallInf
         .with_detail(json!({"issues": issues}))
     })?;
     dispatch(ctx, def.name, Args::from_value(checked), info).await
+}
+
+/// What an unmet need is, in words that name the setting.
+pub(crate) fn need_text(need: Need) -> &'static str {
+    match need {
+        Need::Pool => "the pool gateway control API (endpoints.pool)",
+        Need::Control => "the session control plane (endpoints.control)",
+        Need::Roles => "at least one role endpoint (endpoints.roles)",
+        Need::Llm => "an LLM endpoint ([llm])",
+        Need::ConfirmToken => "a confirm token (safety.confirm_token_file)",
+        Need::Analysis => "capture analysis ([analysis] enabled = true)",
+    }
 }
 
 async fn dispatch(ctx: &Arc<Ctx>, name: &'static str, args: Args, info: &CallInfo) -> ToolResult {
@@ -517,9 +531,23 @@ async fn dispatch(ctx: &Arc<Ctx>, name: &'static str, args: Args, info: &CallInf
         "get_capture" => traffic::get_capture(ctx, &args).await,
         "search_ws" => traffic::search_ws(ctx, &args).await,
         "get_ws_conversation" => traffic::get_ws_conversation(ctx, &args).await,
-        "summarize_traffic" => llm_tools::summarize_traffic(ctx, &args).await,
+        "summarize_traffic" => llm_tools::summarize_traffic(ctx, &args, info).await,
         "classify_block_page" => llm_tools::classify_block_page(ctx, &args, info).await,
-        "suggest_policy" => llm_tools::suggest_policy(ctx, &args).await,
+        "suggest_policy" => llm_tools::suggest_policy(ctx, &args, info).await,
+        // passive capture analysis
+        "analysis_capabilities" => analysis_tools::analysis_capabilities(ctx),
+        "open_analysis_scope" => analysis_tools::open_analysis_scope(ctx, &args),
+        "analyze_auth_flows" => analysis_tools::analyze_auth_flows(ctx, &args, info).await,
+        "scan_sensitive_data" => analysis_tools::scan_sensitive_data(ctx, &args, info).await,
+        "draft_traffic_query" => analysis_tools::draft_traffic_query(ctx, &args, info).await,
+        "run_traffic_query" => analysis_tools::run_traffic_query(ctx, &args).await,
+        "infer_api_schema" => analysis_tools::infer_api_schema(ctx, &args, info).await,
+        "get_api_schema_draft" => analysis_tools::get_api_schema_draft(ctx, &args),
+        "get_analysis_result" => analysis_tools::get_analysis_result(ctx, &args),
+        "delete_analysis_result" => analysis_tools::delete_analysis_result(ctx, &args),
+        "open_capture_feed" => analysis_tools::open_capture_feed(ctx, &args, info).await,
+        "read_capture_feed" => analysis_tools::read_capture_feed(ctx, &args).await,
+        "close_capture_feed" => analysis_tools::close_capture_feed(ctx, &args),
         // offline explanations
         "explain_refusal" => explain_tools::explain_refusal(&args),
         "explain_selector" => explain_tools::explain_selector(ctx, &args).await,

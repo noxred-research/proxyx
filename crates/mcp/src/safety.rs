@@ -39,6 +39,8 @@ pub struct Gate {
     require_engagement: bool,
     expires: Option<OffsetDateTime>,
     allowed_orgs: Vec<String>,
+    /// Tools that wait for approval because analysis is enabled, whatever `approval` says.
+    analysis_approval: Vec<&'static str>,
     max_calls_per_minute: u32,
     max_mutations_per_hour: u32,
     calls: Mutex<VecDeque<Instant>>,
@@ -89,6 +91,13 @@ impl Gate {
             require_engagement: config.scope.require_engagement,
             expires,
             allowed_orgs: config.scope.allowed_orgs.clone(),
+            analysis_approval: if config.analysis.enabled
+                && config.analysis.blocks.report_requires_approval
+            {
+                vec!["report_block_signal"]
+            } else {
+                Vec::new()
+            },
             max_calls_per_minute: config.limits.max_calls_per_minute,
             max_mutations_per_hour: config.limits.max_mutations_per_hour,
             calls: Mutex::new(VecDeque::new()),
@@ -118,6 +127,9 @@ impl Gate {
 
     /// Whether `tool` needs an operator's approval before it runs.
     pub fn approval_required(&self, tool: &str) -> bool {
+        if self.analysis_approval.contains(&tool) {
+            return true;
+        }
         match self.approval {
             ApprovalMode::Off => false,
             ApprovalMode::All => true,
@@ -192,6 +204,33 @@ impl Gate {
                 self.max_mutations_per_hour
             )))
         }
+    }
+
+    /// The engagement must be named when required and must not have expired. Reads that
+    /// disclose captured content check this too.
+    ///
+    /// # Errors
+    /// [`Refusal`] naming what is missing.
+    pub fn check_engagement(&self) -> Result<(), Refusal> {
+        if self.require_engagement && self.engagement.is_none() {
+            return Err(Refusal(
+                "analysis needs an engagement: set scope.engagement to the reference of the written authorization".into(),
+            ));
+        }
+        if let Some(expires) = self.expires
+            && OffsetDateTime::now_utc() >= expires
+        {
+            return Err(Refusal(format!(
+                "the engagement authorization expired at {}",
+                expires.format(&Rfc3339).unwrap_or_default()
+            )));
+        }
+        Ok(())
+    }
+
+    /// When the engagement authorization ends, in Unix seconds.
+    pub fn engagement_expiry(&self) -> Option<i64> {
+        self.expires.map(OffsetDateTime::unix_timestamp)
     }
 
     /// True when the server is not limited to specific orgs, so changes to shared resources

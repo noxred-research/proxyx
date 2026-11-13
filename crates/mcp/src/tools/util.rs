@@ -220,6 +220,19 @@ pub fn clip(text: &str, max: usize) -> (&str, bool) {
     (&text[..end], true)
 }
 
+/// `text` when it fits in `max_bytes`, else its start with a notice that says it was cut.
+pub fn cap_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let (kept, _) = clip(text, max_bytes.saturating_sub(512));
+    format!(
+        "{kept}\n\n[output truncated: {} of {} bytes shown; narrow the query (limit, filters, a smaller window) to see the rest]",
+        kept.len(),
+        text.len()
+    )
+}
+
 /// A UUID path segment check shared by the session and block tools.
 pub fn is_uuid(text: &str) -> bool {
     crate::schema::is_uuid(text)
