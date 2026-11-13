@@ -62,6 +62,7 @@ Clients choose per lease with the username options `ttl` (session lifetime, boun
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `database_url` | `PROXYX_POOL_DATABASE_URL` | `postgres://proxyx@localhost/proxyx` | The relational database, the source of truth: org keys, policies, inventory, scores, blocks, audit. The scheme selects the backend: `postgres://` (default), `mariadb://` or `mysql://` (MariaDB 10.6 or newer), `sqlite://PATH?mode=rwc` (one host only). See [databases.md](databases.md). |
+| `database_schema` | `PROXYX_POOL_DATABASE_SCHEMA` | unset | PostgreSQL schema for the pool's tables and migration history, so that several products can share one database (see [backends.md](backends.md#shared-instances)). Created by `proxyx migrate pool`. Unset keeps the connection's default schema. Refused with MariaDB (the database is in the URL) and SQLite (one file per product). |
 | `redis_url` | `PROXYX_POOL_REDIS_URL` | `redis://localhost:6379` | Redis or Valkey for hot state (leases, ready sets, counters, cooldowns, breakers). Loss of this state is accepted and rebuilt from the database. Keep it separate from the session proxy's Redis, or use another database number (`redis://host:6379/1`). |
 | `connect_listen` | `PROXYX_POOL_CONNECT_LISTEN` | `0.0.0.0:8080` | HTTP CONNECT listener. |
 | `socks_listen` | `PROXYX_POOL_SOCKS_LISTEN` | `0.0.0.0:1080` | SOCKS5 listener. |
@@ -185,6 +186,7 @@ Required when `capture_store.backend = "opensearch"`. OpenSearch 2.x or 3.x, or 
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
 | `url` | `PROXYX_CONTROL_CAPTURE_STORE__OPENSEARCH__URL` | required | `http://` or `https://` URL of the cluster or a coordinating node. |
+| `kind` | `..__KIND` | unset | `opensearch` or `elasticsearch`. ProxyX always detects the engine and version from `GET /` and refuses an unsupported one (OpenSearch before 2, Elasticsearch before 8); with `kind` set it also refuses the other engine. |
 | `username`, `password` | `..__USERNAME`, `..__PASSWORD` | unset | Basic authentication. |
 | `api_key` | `..__API_KEY` | unset | Elasticsearch API key (`Authorization: ApiKey`). Exclusive with `username`. |
 | `ca_cert` | `..__CA_CERT` | unset | PEM file with the CA of the server certificate. |
@@ -294,6 +296,7 @@ Required when `broker_kind = "rabbitmq"`; shared with the control plane. See [ca
 | `http.per_key_burst` | `PROXYX_CONTROL_HTTP__PER_KEY_BURST` | `200` | Burst capacity for each source-IP and normalized-credential bucket. |
 | `internal_allowed_cidrs` | `PROXYX_CONTROL_INTERNAL_ALLOWED_CIDRS` | empty | Comma-separated CIDR allowlist for `/rpc/*` in `trusted_headers` mode, matched against the `X-Forwarded-For` client. Enforced outside `env = "dev"`. |
 | `database_url` | `PROXYX_CONTROL_DATABASE_URL` | empty | Database URL (orgs, session lifecycle, export jobs, API keys). Required. The scheme selects the backend as for the pool: `postgres://`, `mariadb://` or `mysql://`, `sqlite://PATH?mode=rwc`. The pool and the control plane may use different backends but need separate databases or files. See [databases.md](databases.md). |
+| `database_schema` | `PROXYX_CONTROL_DATABASE_SCHEMA` | unset | PostgreSQL schema for the control plane's tables and migration history, as `database_schema` of the pool. The pool and the control plane need different schemas (or databases): both keep a `_sqlx_migrations` table. |
 | `api_addr` | `PROXYX_CONTROL_API_ADDR` | `0.0.0.0:9000` | API listener. |
 | `ingester_health_addr` | `PROXYX_CONTROL_INGESTER_HEALTH_ADDR` | `0.0.0.0:9001` | Ingester health and metrics listener. |
 | `redis_url` | `PROXYX_CONTROL_REDIS_URL` | `redis://127.0.0.1:6379` | Redis for sessions and the capture stream. Required by the API and the Redis-stream ingester; optional for a Kafka or RabbitMQ ingester. The same URL forms as the session proxy. |
@@ -355,6 +358,10 @@ Exports exist only with the ClickHouse capture store; with `opensearch` they ans
 | `traffic_views_azure_account` | `PROXYX_CONTROL_TRAFFIC_VIEWS_AZURE_ACCOUNT` | empty | Storage account name. Required for `azure`. |
 | `traffic_views_s3_region` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_REGION` | `us-east-1` | AWS region of the bucket. |
 | `traffic_views_s3_endpoint` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_ENDPOINT` | unset | Optional HTTP(S) S3-compatible endpoint, with path-style bucket URLs for both ClickHouse exports and SDK HEAD/DELETE; reachable from the API and ClickHouse. Rejects userinfo, query strings and fragments. |
+| `traffic_views_s3_profile` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_PROFILE` | `standard` without an endpoint, `compatible` with one | `standard` (the original S3 service), `edge` (an edge object store with an S3 API), `self-hosted` (for example MinIO) or `compatible` (any S3 API). Everything but `standard` needs `traffic_views_s3_endpoint`; a combination that cannot work is refused at load time. See [backends.md](backends.md#object-storage). |
+| `traffic_views_s3_path_style` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_PATH_STYLE` | `true` with an endpoint | Bucket in the URL path (`endpoint/bucket/key`) or in the host name (`bucket.endpoint/key`). `standard` always uses the host name and refuses the key. |
+| `traffic_views_s3_credentials_file` | `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_CREDENTIALS_FILE` | unset | File with `access_key_id = ...`, `secret_access_key = ...` and optionally `session_token = ...` lines (mode `0600`). Unset: the AWS environment and profile chain. Keys are never configuration values. |
+| `traffic_views_prefix` | `PROXYX_CONTROL_TRAFFIC_VIEWS_PREFIX` | `proxyx/` | Key prefix of every export (empty, or ending in `/`, without glob characters), so products can share a bucket. Exports are `<prefix>traffic-views/<org>/<view>.parquet`; finished exports keep the key stored on their row. |
 | `traffic_views_ttl_secs` | `PROXYX_CONTROL_TRAFFIC_VIEWS_TTL_SECS` | `86400` | How long a completed export is kept, counted from completion. The reaper then deletes the object and the job row. |
 | `cloudfront_domain` | `PROXYX_CONTROL_CLOUDFRONT_DOMAIN` | empty | CloudFront distribution domain for signed download URLs. Required for signed URLs. |
 | `cloudfront_key_pair_id` | `PROXYX_CONTROL_CLOUDFRONT_KEY_PAIR_ID` | empty | CloudFront key pair id. |

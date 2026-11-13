@@ -27,6 +27,10 @@ The two planes keep separate schemas and separate migration histories. They may 
 
 Switching backends later means starting from an empty database. ProxyX has no data copy between backends: the pool re-reads policies and inventory from the git files under `data_dir` at start, and org keys, customer upstreams, orgs and API keys are created again through the control APIs and `proxyx control keys`. Redis hot state is rebuilt from the database as after any loss.
 
+## Sharing a database with other products
+
+PostgreSQL can hold several products, or both ProxyX planes, in one database: set `database_schema` (`PROXYX_POOL_DATABASE_SCHEMA`, `PROXYX_CONTROL_DATABASE_SCHEMA`) and every connection searches only that schema. `proxyx migrate` creates the schema and keeps `_sqlx_migrations` inside it, so each owner has its own history. MariaDB takes its namespace from the database in the URL and SQLite from the file, so `database_schema` is refused there. See [backends.md](backends.md#shared-instances).
+
 ## Migrations
 
 The three backends have one migration directory each (`crates/store/migrations/{postgres,mariadb,sqlite}` and `crates/control/migrations/{postgres,mariadb,sqlite}`) with the same versions, so a `--check` on any backend reports the same names:

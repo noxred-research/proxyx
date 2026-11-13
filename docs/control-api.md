@@ -455,7 +455,7 @@ A view is an asynchronous Parquet export of the captures matching a set of branc
 px -X POST $API/rpc/views -d '{"branches":[{"source_id":"run-001"}]}'
 # 202 {"view_id":"2c9f...","status":"running","s3_key":null}
 px $API/rpc/views/2c9f...
-# 200 {"view_id":"2c9f...","status":"completed","s3_key":"traffic-views/acme/2c9f....parquet"}
+# 200 {"view_id":"2c9f...","status":"completed","s3_key":"proxyx/traffic-views/acme/2c9f....parquet"}
 ```
 
 `POST /rpc/views` takes `{"org_id"?, "branches": [...]}` with the same HTTP branches as search (cursor, order and body options do not apply). The `view_id` is a UUIDv5 of the org and the canonical branches, so submitting an identical query returns the same view instead of exporting again. Response status: `200` if already `completed`, otherwise `202`. `status` is `pending`, `running`, `completed` or `failed`. A failed job retains its error until the next `POST` retries it. Each retry has a fresh ClickHouse query id, so a previous attempt's query log cannot determine the new attempt's status; the view id and object key stay the same.
@@ -470,7 +470,9 @@ The REST response carries no download link; the signed URL is returned by the Gr
 | `traffic_views_bucket` | empty | S3 bucket, or Azure container |
 | `traffic_views_azure_account` | empty | Azure storage account (required for `azure`) |
 | `traffic_views_s3_region` | `us-east-1` | region of the S3 bucket |
-| `traffic_views_s3_endpoint` | unset | optional HTTP(S) endpoint for S3-compatible storage; uses path-style URLs for both ClickHouse writes and API object checks/deletes |
+| `traffic_views_s3_endpoint` | unset | optional HTTP(S) endpoint for S3-compatible storage; path-style URLs by default for both ClickHouse writes and API object checks/deletes |
+| `traffic_views_s3_profile`, `traffic_views_s3_path_style`, `traffic_views_s3_credentials_file` | see [configuration.md](configuration.md) | kind of S3-API store, bucket addressing, credentials from a file |
+| `traffic_views_prefix` | `proxyx/` | key prefix of every export, for a bucket shared with other products |
 | `traffic_views_ttl_secs` | 86400 | completed exports are deleted this long after completion |
 | `cloudfront_domain`, `cloudfront_key_pair_id`, `cloudfront_private_key` | empty | S3 download URLs are CloudFront-signed; without all three there is no URL |
 | `export_preferred_block_size_bytes` | 33554432 | ClickHouse read block size for wide rows |
@@ -483,7 +485,7 @@ Backends:
 - **S3.** ClickHouse writes with `s3()` using the API's own AWS credentials, which are sent in the `INSERT` statement and therefore appear in ClickHouse's query log. `traffic_views_s3_region` configures both export URLs and SDK signing. For MinIO or another compatible service, set `traffic_views_s3_endpoint` to an HTTP(S) URL reachable from both the API and ClickHouse; optional path prefixes are preserved. Endpoint URLs must not contain credentials, a query or a fragment. Download URLs remain CloudFront canned-policy signed URLs valid for one hour.
 - **Azure Blob Storage.** ClickHouse writes with `azureBlobStorage()` and no credentials (its own workload identity); the API uses its workload identity for existence checks, deletes and user-delegation SAS read URLs valid for one hour. The API start fails with `creating Azure workload identity credential` unless the Entra workload-identity variables (`AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_FEDERATED_TOKEN_FILE`) are set, and both sides address `https://{account}.blob.core.windows.net`. A storage emulator such as Azurite cannot stand in: ClickHouse's credential-less `azureBlobStorage()` asks for an Entra bearer token, which it refuses to send over plain HTTP, and the SAS URLs need a user-delegation key from Entra. Live delivery needs an Azure storage account, a ClickHouse server whose identity may write the container, and an identity for the API with the data actions to read, delete and request user-delegation keys.
 
-Objects are named `traffic-views/{org_id}/{view_id}.parquet`. In the object key (and `s3_key`) the characters `*`, `?`, `{`, `}`, `/`, `%` and control characters of the org id are written as `%XX` (an org id of only dots is written that way entirely), because ClickHouse reads `*`, `?`, `{` and `}` in an S3 path as a glob and refuses to write to it and rejects empty segments; every other character stays as is, so ordinary org ids keep the key shown above. The download URL percent-encodes the key as a URL path. The export selects every column of the base table with bodies, without a cursor, and does not de-duplicate rows still present on disk twice. The reaper (every 60 s) deletes the object first and the job row second for completed views older than `traffic_views_ttl_secs`, measured from completion, in batches of 500.
+Objects are named `<traffic_views_prefix>traffic-views/{org_id}/{view_id}.parquet` (`proxyx/traffic-views/...` by default; exports finished before the prefix existed keep the key on their row). In the object key (and `s3_key`) the characters `*`, `?`, `{`, `}`, `/`, `%` and control characters of the org id are written as `%XX` (an org id of only dots is written that way entirely), because ClickHouse reads `*`, `?`, `{` and `}` in an S3 path as a glob and refuses to write to it and rejects empty segments; every other character stays as is, so ordinary org ids keep the key shown above. The download URL percent-encodes the key as a URL path. The export selects every column of the base table with bodies, without a cursor, and does not de-duplicate rows still present on disk twice. The reaper (every 60 s) deletes the object first and the job row second for completed views older than `traffic_views_ttl_secs`, measured from completion, in batches of 500.
 
 ## GraphQL
 

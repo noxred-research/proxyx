@@ -37,7 +37,7 @@ use crate::query::ws::WsTrafficQuery;
 use crate::views::ViewExporter;
 
 pub use clickhouse::ClickHouseStore;
-pub use opensearch::{OpenSearchConfig, OpenSearchStore, Rollover};
+pub use opensearch::{OpenSearchConfig, OpenSearchStore, Rollover, SearchKind};
 
 /// Which backend stores captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

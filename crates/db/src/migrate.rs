@@ -12,6 +12,10 @@ pub struct Migrators {
     pub postgres: Migrator,
     pub mariadb: Migrator,
     pub sqlite: Migrator,
+    /// PostgreSQL extensions the PostgreSQL migrations use. An extension exists
+    /// once per database, so when the connection is pinned to a schema they are
+    /// installed in `public`, where every product's schema can resolve them.
+    pub postgres_extensions: &'static [&'static str],
 }
 
 impl Migrators {
@@ -31,10 +35,14 @@ impl Migrators {
 #[macro_export]
 macro_rules! migrators {
     () => {
+        $crate::migrators!(extensions = [])
+    };
+    (extensions = [$($extension:literal),* $(,)?]) => {
         $crate::Migrators {
             postgres: ::sqlx::migrate!("./migrations/postgres"),
             mariadb: ::sqlx::migrate!("./migrations/mariadb"),
             sqlite: ::sqlx::migrate!("./migrations/sqlite"),
+            postgres_extensions: &[$($extension),*],
         }
     };
 }
@@ -55,6 +63,25 @@ impl Pool {
                 let mut conn = pool.acquire().await?;
                 conn.execute("SET statement_timeout = 0; SET lock_timeout = 0")
                     .await?;
+                // A product namespace (`database_schema`) is created on first
+                // migration; the connections already search only that schema.
+                if let Some(schema) =
+                    crate::backend::pinned_schema(pool.connect_options().get_options())
+                {
+                    // The name was validated by `url_with_schema` (lowercase
+                    // identifier); it is also quoted.
+                    conn.execute(sqlx::AssertSqlSafe(format!(
+                        "CREATE SCHEMA IF NOT EXISTS \"{schema}\""
+                    )))
+                    .await?;
+                    for extension in migrators.postgres_extensions {
+                        // names come from the crate's own `migrators!` call
+                        conn.execute(sqlx::AssertSqlSafe(format!(
+                            "CREATE EXTENSION IF NOT EXISTS \"{extension}\" SCHEMA public"
+                        )))
+                        .await?;
+                    }
+                }
                 let applied = migrator.run(&mut *conn).await;
                 let restored = conn
                     .execute("RESET statement_timeout; RESET lock_timeout")

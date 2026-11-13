@@ -99,9 +99,33 @@ fn default_circuit_reset() -> u64 {
     60
 }
 
+/// Which engine answers at `capture_store.opensearch.url`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchKind {
+    OpenSearch,
+    Elasticsearch,
+}
+
+impl SearchKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenSearch => "opensearch",
+            Self::Elasticsearch => "elasticsearch",
+        }
+    }
+}
+
 /// `[capture_store.opensearch]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenSearchConfig {
+    /// The engine this URL must be: `opensearch` or `elasticsearch`. Unset
+    /// accepts either. ProxyX always detects the engine and version at start
+    /// and refuses a server it does not support; with `kind` set it also
+    /// refuses the other engine, so a wrong URL cannot send captures to a
+    /// cluster you did not mean.
+    #[serde(default)]
+    pub kind: Option<SearchKind>,
     /// Base URL of the cluster or a coordinating node, e.g.
     /// `https://opensearch:9200`.
     pub url: String,
@@ -196,6 +220,7 @@ impl OpenSearchConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            kind: None,
             username: None,
             password: None,
             api_key: None,

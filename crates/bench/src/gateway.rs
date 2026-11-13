@@ -255,16 +255,23 @@ async fn seed(database_url: &str, redis_url: &str, provider_port: u16) -> Result
     db.record_check(UNIT_IP, Some(UNIT_IP), OffsetDateTime::now_utc())
         .await?;
 
-    // The Redis database is the benchmark's own: start it empty.
+    // The Redis database is the benchmark's own and must start empty. It is
+    // checked, not flushed: a server-wide or database-wide delete is never
+    // ProxyX's to run on an instance other products may share.
     let client = redis::Client::open(redis_url).context("open Redis")?;
     let mut conn = client
         .get_multiplexed_async_connection()
         .await
         .context("connect to Redis")?;
-    redis::cmd("FLUSHDB")
-        .query_async::<()>(&mut conn)
+    let keys: i64 = redis::cmd("DBSIZE")
+        .query_async(&mut conn)
         .await
-        .context("flush the benchmark Redis database")?;
+        .context("count the keys of the benchmark Redis database")?;
+    anyhow::ensure!(
+        keys == 0,
+        "the benchmark Redis database holds {keys} keys: give it an empty database index (redis://host:port/N) \
+         or empty it yourself"
+    );
     let hot = Hot::connect(redis_url).await.context("connect to Redis")?;
     let partition = Partition {
         provider: entry.provider.clone(),

@@ -28,23 +28,27 @@ use crate::config::{ControlConfig, TrafficViewsBackend};
 const DOWNLOAD_URL_TTL_SECS: i64 = 3600;
 
 pub enum ViewStore {
-    // Boxed: `SdkConfig` makes the S3 variant ~3x the Azure one.
+    // Boxed: both carry a client, a prefix and their settings.
     S3(Box<S3Store>),
-    Azure(AzureStore),
+    Azure(Box<AzureStore>),
 }
 
 pub struct S3Store {
+    prefix: String,
     aws_cfg: aws_config::SdkConfig,
     client: aws_sdk_s3::Client,
     bucket: String,
     region: String,
     endpoint: Option<reqwest::Url>,
+    /// Bucket in the path (`endpoint/bucket/key`) rather than the host.
+    path_style: bool,
     cloudfront_domain: String,
     cloudfront_key_pair_id: String,
     cloudfront_private_key: String,
 }
 
 pub struct AzureStore {
+    prefix: String,
     account: String,
     container: String,
     service: BlobServiceClient,
@@ -54,24 +58,30 @@ impl ViewStore {
     pub async fn from_config(config: &ControlConfig) -> Result<Self> {
         match config.traffic_views_backend {
             TrafficViewsBackend::S3 => {
+                config.validate_traffic_views()?;
                 let endpoint = config
                     .traffic_views_s3_endpoint
                     .as_deref()
                     .map(parse_s3_endpoint)
                     .transpose()?;
-                let aws_cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                let path_style = config.traffic_views_path_style();
+                let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
                     .region(aws_sdk_s3::config::Region::new(
                         config.traffic_views_s3_region.clone(),
-                    ))
-                    .load()
-                    .await;
-                let client_config = s3_client_config(&aws_cfg, endpoint.as_ref());
+                    ));
+                if let Some(file) = &config.traffic_views_s3_credentials_file {
+                    loader = loader.credentials_provider(read_credentials_file(file)?);
+                }
+                let aws_cfg = loader.load().await;
+                let client_config = s3_client_config(&aws_cfg, endpoint.as_ref(), path_style);
                 Ok(Self::S3(Box::new(S3Store {
+                    prefix: config.traffic_views_prefix.clone(),
                     client: aws_sdk_s3::Client::from_conf(client_config),
                     aws_cfg,
                     bucket: config.traffic_views_bucket.clone(),
                     region: config.traffic_views_s3_region.clone(),
                     endpoint,
+                    path_style,
                     cloudfront_domain: config.cloudfront_domain.trim().to_owned(),
                     cloudfront_key_pair_id: config.cloudfront_key_pair_id.trim().to_owned(),
                     cloudfront_private_key: config.cloudfront_private_key.trim().to_owned(),
@@ -91,12 +101,22 @@ impl ViewStore {
                     None,
                 )
                 .context("creating Azure blob service client")?;
-                Ok(Self::Azure(AzureStore {
+                config.validate_traffic_views()?;
+                Ok(Self::Azure(Box::new(AzureStore {
+                    prefix: config.traffic_views_prefix.clone(),
                     account: account.to_owned(),
                     container: config.traffic_views_bucket.clone(),
                     service,
-                }))
+                })))
             }
+        }
+    }
+
+    /// Key prefix of every object this store writes (`traffic_views_prefix`).
+    pub fn prefix(&self) -> &str {
+        match self {
+            Self::S3(s3) => &s3.prefix,
+            Self::Azure(az) => &az.prefix,
         }
     }
 
@@ -104,7 +124,13 @@ impl ViewStore {
     pub async fn export_target_sql(&self, key: &str) -> Result<String> {
         match self {
             Self::S3(s3) => {
-                let url = s3_object_url(s3.endpoint.as_ref(), &s3.bucket, &s3.region, key)?;
+                let url = s3_object_url(
+                    s3.endpoint.as_ref(),
+                    s3.path_style,
+                    &s3.bucket,
+                    &s3.region,
+                    key,
+                )?;
                 let creds = s3
                     .aws_cfg
                     .credentials_provider()
@@ -227,18 +253,87 @@ fn parse_s3_endpoint(endpoint: &str) -> Result<reqwest::Url> {
 fn s3_client_config(
     aws_cfg: &aws_config::SdkConfig,
     endpoint: Option<&reqwest::Url>,
+    path_style: bool,
 ) -> aws_sdk_s3::Config {
     let mut builder = aws_sdk_s3::config::Builder::from(aws_cfg);
     if let Some(endpoint) = endpoint {
         builder = builder
             .endpoint_url(endpoint.as_str())
-            .force_path_style(true);
+            .force_path_style(path_style);
     }
     builder.build()
 }
 
+/// Static credentials from a file of `name = value` lines: `access_key_id`,
+/// `secret_access_key` and optionally `session_token`. Blank lines and `#`
+/// comments are skipped. The values never leave the process except in the
+/// `s3()` call ClickHouse needs, as with credentials from the environment.
+pub fn read_credentials_file(
+    path: &std::path::Path,
+) -> Result<aws_credential_types::provider::SharedCredentialsProvider> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read traffic_views_s3_credentials_file {}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!(
+                file = %path.display(),
+                "the object store credentials file is readable by group or others; restrict it to the owner"
+            );
+        }
+    }
+    let (mut access, mut secret, mut token) = (None, None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line
+            .split_once('=')
+            .with_context(|| format!("{}: expected `name = value` lines", path.display()))?;
+        let value = value.trim().trim_matches('"').to_owned();
+        match name.trim() {
+            "access_key_id" => access = Some(value),
+            "secret_access_key" => secret = Some(value),
+            "session_token" => token = Some(value),
+            other => anyhow::bail!(
+                "{}: unknown name {other:?} (access_key_id, secret_access_key, session_token)",
+                path.display()
+            ),
+        }
+    }
+    let (Some(access), Some(secret)) = (
+        access.filter(|v| !v.is_empty()),
+        secret.filter(|v| !v.is_empty()),
+    ) else {
+        anyhow::bail!(
+            "{}: access_key_id and secret_access_key are required",
+            path.display()
+        );
+    };
+    Ok(
+        aws_credential_types::provider::SharedCredentialsProvider::new(
+            aws_credential_types::Credentials::new(
+                access,
+                secret,
+                token,
+                None,
+                "proxyx-credentials-file",
+            ),
+        ),
+    )
+}
+
 fn s3_object_url(
     endpoint: Option<&reqwest::Url>,
+    path_style: bool,
     bucket: &str,
     region: &str,
     key: &str,
@@ -251,6 +346,19 @@ fn s3_object_url(
         return Ok(url.into());
     };
     let mut url = endpoint.clone();
+    if !path_style {
+        // virtual-hosted: the bucket is the first label of the host
+        let host = endpoint
+            .host_str()
+            .context("traffic_views_s3_endpoint has no host")?;
+        url.set_host(Some(&format!("{bucket}.{host}")))
+            .context("the bucket name does not form a host name with traffic_views_s3_endpoint")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("traffic_views_s3_endpoint cannot hold path segments"))?
+            .pop_if_empty()
+            .extend(key.split('/'));
+        return Ok(url.into());
+    }
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("traffic_views_s3_endpoint cannot hold path segments"))?
         .pop_if_empty()
@@ -381,7 +489,7 @@ mod tests {
     #[test]
     fn s3_default_url_keeps_aws_virtual_host() {
         assert_eq!(
-            s3_object_url(None, "traffic-views", "eu-west-1", "org/view.parquet").unwrap(),
+            s3_object_url(None, true, "traffic-views", "eu-west-1", "org/view.parquet").unwrap(),
             "https://traffic-views.s3.eu-west-1.amazonaws.com/org/view.parquet"
         );
         assert_eq!(
@@ -395,6 +503,7 @@ mod tests {
         assert_eq!(
             s3_object_url(
                 None,
+                true,
                 "traffic-views",
                 "eu-west-1",
                 "org/a b?#%\\\"é.parquet",
@@ -415,6 +524,7 @@ mod tests {
             let endpoint = parse_s3_endpoint(endpoint).unwrap();
             let url = s3_object_url(
                 Some(&endpoint),
+                true,
                 "bucket/name",
                 "us-east-1",
                 "org/a b?#%\\é.parquet",
@@ -468,7 +578,7 @@ mod tests {
             .build();
         for endpoint in ["http://minio:9000/storage", "http://minio:9000/storage/"] {
             let endpoint = parse_s3_endpoint(endpoint).unwrap();
-            let client_config = s3_client_config(&aws_cfg, Some(&endpoint));
+            let client_config = s3_client_config(&aws_cfg, Some(&endpoint), true);
             assert_eq!(client_config.region().unwrap().as_ref(), "ap-southeast-2");
             let client = aws_sdk_s3::Client::from_conf(client_config);
             let signed = client
@@ -493,6 +603,7 @@ mod tests {
             assert_eq!(
                 s3_object_url(
                     Some(&endpoint),
+                    true,
                     "traffic-views",
                     "ap-southeast-2",
                     "org/view.parquet",
@@ -519,7 +630,7 @@ mod tests {
             r"azureBlobStorage('https://account\\\'.blob.core.windows.net', 'container\\\'', 'key\\\'', 'Parquet')"
         );
         let key = "org/x'); SELECT 1 --\\";
-        let url = s3_object_url(None, "bucket", "us-east-1", key).unwrap();
+        let url = s3_object_url(None, true, "bucket", "us-east-1", key).unwrap();
         assert_eq!(
             s3_function_sql(&url, "access", "secret", ""),
             r"s3('https://bucket.s3.us-east-1.amazonaws.com/org/x\');%20SELECT%201%20--%5C', 'access', 'secret', 'Parquet')"

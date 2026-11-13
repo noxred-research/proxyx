@@ -74,7 +74,7 @@ pub use views::{ViewJobRow, ViewJobUpsert};
 /// The embedded migrations: `migrations/postgres`, `migrations/mariadb` and
 /// `migrations/sqlite`, the same versions in each.
 fn migrators() -> Migrators {
-    proxyx_db::migrators!()
+    proxyx_db::migrators!(extensions = ["pg_trgm"])
 }
 
 /// Pool of database connections: PostgreSQL, MariaDB or SQLite, by the scheme

@@ -218,7 +218,11 @@ pub(super) fn template(config: &OpenSearchConfig, kind: Kind) -> Value {
 /// Create or replace both templates. Existing indices keep the mapping they
 /// were created with.
 pub(super) async fn install_templates(client: &OsClient, config: &OpenSearchConfig) -> Result<()> {
-    client.ping().await.context("OpenSearch is not reachable")?;
+    let engine = client
+        .detect(config.kind)
+        .await
+        .context("the search engine is not reachable or not supported")?;
+    tracing::info!(engine = engine.kind.as_str(), version = %engine.version, "search engine detected");
     for kind in [Kind::Http, Kind::Ws] {
         let name = template_name(config, kind);
         let response = client
@@ -232,6 +236,11 @@ pub(super) async fn install_templates(client: &OsClient, config: &OpenSearchConf
 
 /// Fail unless both templates exist at the schema version of this binary.
 pub(super) async fn verify_templates(client: &OsClient, config: &OpenSearchConfig) -> Result<()> {
+    let engine = client
+        .detect(config.kind)
+        .await
+        .context("the search engine is not reachable or not supported")?;
+    tracing::info!(engine = engine.kind.as_str(), version = %engine.version, "search engine detected");
     for kind in [Kind::Http, Kind::Ws] {
         let name = template_name(config, kind);
         let response = client

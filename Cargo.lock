@@ -5400,6 +5400,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "prometheus",
+ "proxyx-db",
  "rand 0.8.8",
  "sentry",
  "sentry-tracing",

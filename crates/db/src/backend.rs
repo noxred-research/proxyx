@@ -61,6 +61,58 @@ impl Backend {
     }
 }
 
+/// `url` with every connection pinned to the PostgreSQL schema `schema`
+/// (`search_path`), so several products can share one database, each with its
+/// own tables and its own `_sqlx_migrations`. [`crate::Pool::migrate`] creates
+/// the schema when it is missing. `public` stays on the search path behind it
+/// only so that objects of extensions, which exist once per database, resolve.
+///
+/// # Errors
+/// When the URL is not a PostgreSQL URL (MariaDB names its namespace in the
+/// URL's database and SQLite is one file per product), or `schema` is not a
+/// plain lowercase identifier.
+pub fn url_with_schema(url: &str, schema: &str) -> Result<String, String> {
+    match Backend::from_url(url) {
+        Ok(Backend::Postgres) => {}
+        Ok(other) => {
+            return Err(format!(
+                "database_schema applies to PostgreSQL only; {other} names its namespace in the \
+                 URL (the MariaDB database, the SQLite file)"
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let valid = (1..=63).contains(&schema.len())
+        && schema.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && schema
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !valid || schema.starts_with("pg_") || matches!(schema, "public" | "information_schema") {
+        return Err(format!(
+            "database_schema {schema:?} must be 1 to 63 lowercase letters, digits or underscores, \
+             start with a letter or underscore, and not be public, information_schema or pg_*"
+        ));
+    }
+    if url.contains("options=") {
+        return Err(
+            "database_schema cannot be combined with an `options` parameter in the URL".to_owned(),
+        );
+    }
+    let joiner = if url.contains('?') { '&' } else { '?' };
+    Ok(format!(
+        "{url}{joiner}options=-c%20search_path%3D{schema}%2Cpublic"
+    ))
+}
+
+/// The schema a PostgreSQL connection is pinned to by [`url_with_schema`].
+pub(crate) fn pinned_schema(options: Option<&str>) -> Option<String> {
+    options?
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("search_path="))
+        .and_then(|path| path.split(',').next())
+        .map(str::to_owned)
+}
+
 impl fmt::Display for Backend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -103,6 +155,35 @@ mod tests {
         for bad in ["", "redis://h", "pool.db", "http://h", "oracle://h/d"] {
             assert!(Backend::from_url(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_schema_is_added_to_postgres_urls_only() {
+        assert_eq!(
+            url_with_schema("postgres://u@h/d", "proxyx").expect("pg"),
+            "postgres://u@h/d?options=-c%20search_path%3Dproxyx%2Cpublic"
+        );
+        assert_eq!(
+            url_with_schema("postgres://u@h/d?sslmode=require", "proxyx").expect("pg"),
+            "postgres://u@h/d?sslmode=require&options=-c%20search_path%3Dproxyx%2Cpublic"
+        );
+        for (url, schema) in [
+            ("mariadb://u@h/d", "proxyx"),
+            ("sqlite:///x.db", "proxyx"),
+            ("postgres://u@h/d", "Proxy X"),
+            ("postgres://u@h/d", "public"),
+            ("postgres://u@h/d", "pg_catalog"),
+            ("postgres://u@h/d", ""),
+            ("postgres://u@h/d?options=-c%20x%3Dy", "proxyx"),
+            ("redis://h", "proxyx"),
+        ] {
+            assert!(url_with_schema(url, schema).is_err(), "{url} {schema}");
+        }
+        assert_eq!(
+            pinned_schema(Some("-c statement_timeout=5 -c search_path=proxyx,public")).as_deref(),
+            Some("proxyx")
+        );
+        assert_eq!(pinned_schema(None), None);
     }
 
     #[test]
