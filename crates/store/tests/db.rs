@@ -667,6 +667,9 @@ async fn org_blocks_expire_and_can_be_revoked() -> TestResult {
     );
     assert_eq!(mine(db.active_org_blocks(now).await?), 3);
 
+    // The store rejects an expiry that is already past when the block is created, so
+    // give it a margin a loaded CI host cannot eat, then ask about an instant after it.
+    let expires = OffsetDateTime::now_utc() + time::Duration::seconds(5);
     let short = db
         .create_org_block(
             &hot,
@@ -674,14 +677,12 @@ async fn org_blocks_expire_and_can_be_revoked() -> TestResult {
             &BlockScope::Pool(Pool::Shared),
             "test",
             "ops",
-            Some(now + time::Duration::milliseconds(300)),
+            Some(expires),
         )
         .await?;
     assert_eq!(mine(db.active_org_blocks(now).await?), 4);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let later = OffsetDateTime::now_utc();
     assert!(
-        db.active_org_blocks(later)
+        db.active_org_blocks(expires + time::Duration::milliseconds(1))
             .await?
             .iter()
             .all(|b| b.id != short.id)
