@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     permissions:
       contents: read
     timeout-minutes: 5
@@ -88,8 +88,9 @@ jobs:
 
   analyze:
     name: analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: [self-hosted, noxred]
+    # The Rust database build shares a busy host with production services.
+    timeout-minutes: 120
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event.repository.private == false
     permissions:

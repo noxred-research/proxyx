@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   authorize:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     permissions:
       contents: read
     timeout-minutes: 5
@@ -93,7 +93,7 @@ jobs:
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
   advisories:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     timeout-minutes: 20
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
@@ -113,7 +113,7 @@ jobs:
         run: cargo deny --locked check advisories
 
   secret-history:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     timeout-minutes: 20
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
@@ -139,7 +139,7 @@ jobs:
         run: gitleaks git --log-opts="--all" --config .gitleaks.toml --redact
 
   workflow-audit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     timeout-minutes: 15
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request'
@@ -157,7 +157,7 @@ jobs:
           annotations: true
 
   dependency-review:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     timeout-minutes: 15
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event_name == 'pull_request' && github.event.repository.private == false
@@ -173,7 +173,7 @@ jobs:
           comment-summary-in-pr: never
 
   scorecard:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, noxred]
     timeout-minutes: 20
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.event.repository.private == false

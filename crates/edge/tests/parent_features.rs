@@ -1011,8 +1011,11 @@ async fn redis_manager_recovers_after_its_transparent_bridge_disconnects() {
     };
     let _bridge = Bridge { task, stop };
     let prefix = format!("edge-reconnect:{}:{}", std::process::id(), free_port());
+    // A generous claim timeout: the disconnected claim below fails on the cut
+    // connection, not on this timer, and a loaded CI host can take well over
+    // 200 ms for the first claim through the bridge.
     let cfg = Config::parse(&format!(
-        "[stick]\nttl='30s'\n[stick.redis]\nurl={}\nkey_prefix='{prefix}'\ntimeout='200ms'\n",
+        "[stick]\nttl='30s'\n[stick.redis]\nurl={}\nkey_prefix='{prefix}'\ntimeout='2s'\n",
         serde_json::to_string(&bridge_url).unwrap()
     ))
     .unwrap();

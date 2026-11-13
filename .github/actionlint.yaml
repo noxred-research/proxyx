@@ -1,0 +1,4 @@
+# Labels of the organization self-hosted runners (runner group noxred-selfhosted).
+self-hosted-runner:
+  labels:
+    - noxred
