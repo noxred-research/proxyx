@@ -121,6 +121,8 @@ pub struct Config {
     pub audit: AuditConfig,
     pub metrics: MetricsConfig,
     pub llm: Option<LlmConfig>,
+    /// Passive analysis of captured traffic. Off unless an operator enables it.
+    pub analysis: AnalysisConfig,
     /// Named credentials a tool can reference (`credential_ref`) instead of taking a secret as
     /// an argument.
     pub credentials: BTreeMap<String, CredentialFiles>,
@@ -399,6 +401,9 @@ pub struct LlmConfig {
     pub max_input_chars: usize,
     #[serde(default = "default_llm_output")]
     pub max_output_tokens: u32,
+    /// A name for this endpoint in audit records. Defaults to the endpoint's host.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 fn default_llm_timeout() -> u64 {
@@ -409,6 +414,234 @@ fn default_llm_input() -> usize {
 }
 fn default_llm_output() -> u32 {
     1024
+}
+
+/// Operator-owned settings of the passive capture-analysis tools. Nothing here can be widened by
+/// a tool argument or a model answer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AnalysisConfig {
+    /// Master switch. Off: no analysis tool is listed.
+    pub enabled: bool,
+    /// Capture sources an analysis scope may name. Required when enabled.
+    pub allowed_source_ids: Vec<String>,
+    /// Origins an analysis scope may cover: `host`, `*.suffix`, optionally with a scheme and a
+    /// port (`https://api.example.com:8443`). Required when enabled.
+    pub allowed_origins: Vec<String>,
+    /// Allow analysis tools to send sanitized evidence to the `[llm]` endpoint.
+    pub allow_external_llm: bool,
+    /// Most captures one analysis reads.
+    pub max_captures: usize,
+    /// Most bytes of capture content (headers and bodies) one analysis reads.
+    pub max_input_bytes: usize,
+    /// Most bytes of one body an analysis fetches.
+    pub max_body_bytes: usize,
+    /// Most characters of all content in the prompts of one analysis.
+    pub max_total_prompt_chars: usize,
+    /// One absolute deadline for an analysis, fetching and model calls together.
+    pub deadline_secs: u64,
+    /// How long scopes, findings, drafts and feeds are kept in memory.
+    pub retention_secs: u64,
+    pub auth: AuthAnalysisConfig,
+    pub sensitive: SensitiveAnalysisConfig,
+    pub query: QueryAnalysisConfig,
+    pub openapi: OpenApiAnalysisConfig,
+    pub blocks: BlocksAnalysisConfig,
+    pub feeds: FeedsAnalysisConfig,
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_source_ids: Vec::new(),
+            allowed_origins: Vec::new(),
+            allow_external_llm: false,
+            max_captures: 500,
+            max_input_bytes: 256 * 1024,
+            max_body_bytes: 16 * 1024,
+            max_total_prompt_chars: 24_000,
+            deadline_secs: 60,
+            retention_secs: 86_400,
+            auth: AuthAnalysisConfig::default(),
+            sensitive: SensitiveAnalysisConfig::default(),
+            query: QueryAnalysisConfig::default(),
+            openapi: OpenApiAnalysisConfig::default(),
+            blocks: BlocksAnalysisConfig::default(),
+            feeds: FeedsAnalysisConfig::default(),
+        }
+    }
+}
+
+/// `[analysis.auth]`: authentication and session-flow discovery.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthAnalysisConfig {
+    /// Off by default: it needs `fingerprint_key_file`.
+    pub enabled: bool,
+    /// Most distinct credential values tracked in one analysis.
+    pub max_token_candidates: usize,
+    /// The operator-held key that turns credential values into fingerprints. Fingerprints only
+    /// link within one engagement: the engagement is mixed into every fingerprint.
+    pub fingerprint_key_file: Option<PathBuf>,
+    /// Report the claim names of a decoded JWT (never values).
+    pub include_jwt_claim_names: bool,
+}
+
+impl Default for AuthAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_token_candidates: 200,
+            fingerprint_key_file: None,
+            include_jwt_claim_names: false,
+        }
+    }
+}
+
+/// `[analysis.sensitive]`: sensitive-data findings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SensitiveAnalysisConfig {
+    pub enabled: bool,
+    /// Which finding categories to report: `credential`, `personal_data`, `candidate`.
+    pub categories: Vec<String>,
+    /// Shannon entropy (bits per character) a high-entropy candidate needs.
+    pub min_entropy: f64,
+    pub max_findings: usize,
+    /// Characters of a match shown in `masked_preview`. 0 shows only the length.
+    pub preview_chars: usize,
+    /// Extra detectors (TOML `[[rule]]` tables: name, category, severity, pattern). Operator
+    /// owned: a model never supplies rules.
+    pub custom_rules_file: Option<PathBuf>,
+    /// Keep findings for at most this long. Never longer than `analysis.retention_secs`.
+    pub retention_secs: Option<u64>,
+}
+
+impl Default for SensitiveAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            categories: vec![
+                "credential".to_owned(),
+                "personal_data".to_owned(),
+                "candidate".to_owned(),
+            ],
+            min_entropy: 4.0,
+            max_findings: 200,
+            preview_chars: 0,
+            custom_rules_file: None,
+            retention_secs: None,
+        }
+    }
+}
+
+/// `[analysis.query]`: natural-language query drafts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QueryAnalysisConfig {
+    pub enabled: bool,
+    pub max_branches: usize,
+    /// Let a draft filter on bodies or payloads (reads the wide columns: the slowest queries).
+    pub allow_body_scan: bool,
+    /// Let a draft use regular expressions.
+    pub allow_regex: bool,
+    pub max_regex_bytes: usize,
+    pub draft_ttl_secs: u64,
+}
+
+impl Default for QueryAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_branches: 16,
+            allow_body_scan: false,
+            allow_regex: false,
+            max_regex_bytes: 1000,
+            draft_ttl_secs: 600,
+        }
+    }
+}
+
+/// `[analysis.openapi]`: API schema drafts inferred from captures.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OpenApiAnalysisConfig {
+    pub enabled: bool,
+    pub max_routes: usize,
+    pub max_schema_depth: usize,
+    pub max_properties: usize,
+    /// `none`: a draft carries no example values. No other value exists yet.
+    pub examples: String,
+    pub allowed_content_types: Vec<String>,
+}
+
+impl Default for OpenApiAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_routes: 200,
+            max_schema_depth: 12,
+            max_properties: 200,
+            examples: "none".to_owned(),
+            allowed_content_types: vec!["application/json".to_owned()],
+        }
+    }
+}
+
+/// `[analysis.blocks]`: evidence-calibrated block-page classification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BlocksAnalysisConfig {
+    /// Equivalent observations a classification needs before it is eligible for reporting.
+    pub min_observations: usize,
+    /// A subtype whose measured precision on the published fixtures is below this is never
+    /// eligible for reporting.
+    pub min_calibrated_precision: Option<f64>,
+    /// Let the model judge pages the rules cannot.
+    pub allow_model: bool,
+    /// The version of the labelled fixture set the operator calibrated against; echoed in results.
+    pub fixture_version: Option<String>,
+    /// With `[analysis]` enabled, `report_block_signal` waits for an operator's approval.
+    pub report_requires_approval: bool,
+}
+
+impl Default for BlocksAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            min_observations: 2,
+            min_calibrated_precision: None,
+            allow_model: true,
+            fixture_version: None,
+            report_requires_approval: true,
+        }
+    }
+}
+
+/// `[analysis.feeds]`: cursor-based capture feeds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FeedsAnalysisConfig {
+    pub enabled: bool,
+    pub max_feeds: usize,
+    pub ttl_secs: u64,
+    pub min_poll_interval_ms: u64,
+    pub max_page_rows: usize,
+    /// Let a feed carry bodies.
+    pub include_bodies: bool,
+}
+
+impl Default for FeedsAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_feeds: 16,
+            ttl_secs: 3600,
+            min_poll_interval_ms: 1000,
+            max_page_rows: 100,
+            include_bodies: false,
+        }
+    }
 }
 
 /// Files that hold the username and password a tool may use by name.
@@ -550,7 +783,14 @@ impl Config {
             check_url("llm.endpoint", &llm.endpoint)?;
             ensure!(!llm.model.trim().is_empty(), "llm.model must not be empty");
             ensure!(llm.timeout_secs >= 1, "llm.timeout_secs must be at least 1");
+            if let Some(alias) = &llm.alias {
+                ensure!(
+                    is_operator(alias),
+                    "llm.alias must be 1 to 64 characters of [A-Za-z0-9-_.@]"
+                );
+            }
         }
+        self.analysis.validate()?;
         Ok(())
     }
 
@@ -611,6 +851,162 @@ pub fn is_provider_id(text: &str) -> bool {
         && text
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+impl AnalysisConfig {
+    /// Check the values that serde cannot.
+    ///
+    /// # Errors
+    /// With the first problem found.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.max_captures >= 1 && self.max_captures <= 5000,
+            "analysis.max_captures must be 1 to 5000"
+        );
+        ensure!(
+            self.max_input_bytes >= 1024,
+            "analysis.max_input_bytes must be at least 1024"
+        );
+        ensure!(
+            self.max_body_bytes >= 1,
+            "analysis.max_body_bytes must be at least 1"
+        );
+        ensure!(
+            self.max_total_prompt_chars >= 256,
+            "analysis.max_total_prompt_chars must be at least 256"
+        );
+        ensure!(
+            self.deadline_secs >= 1,
+            "analysis.deadline_secs must be at least 1"
+        );
+        ensure!(
+            self.retention_secs >= 1,
+            "analysis.retention_secs must be at least 1"
+        );
+        for source in &self.allowed_source_ids {
+            ensure!(
+                is_source_id(source),
+                "analysis.allowed_source_ids: invalid source id {source:?} (1 to 128 of [A-Za-z0-9._:-])"
+            );
+        }
+        for origin in &self.allowed_origins {
+            crate::analysis::OriginPattern::parse(origin).map_err(|error| {
+                anyhow::anyhow!("analysis.allowed_origins: {origin:?}: {error}")
+            })?;
+        }
+        ensure!(
+            self.allowed_origins.len() <= 64,
+            "analysis.allowed_origins lists at most 64 origins"
+        );
+        if self.enabled {
+            ensure!(
+                !self.allowed_source_ids.is_empty(),
+                "analysis.enabled needs analysis.allowed_source_ids: an analysis reads only sources an operator named"
+            );
+            ensure!(
+                !self.allowed_origins.is_empty(),
+                "analysis.enabled needs analysis.allowed_origins: an analysis covers only origins an operator named"
+            );
+        }
+        if self.auth.enabled {
+            ensure!(
+                self.auth.fingerprint_key_file.is_some(),
+                "analysis.auth.enabled needs analysis.auth.fingerprint_key_file"
+            );
+        }
+        ensure!(
+            self.auth.max_token_candidates >= 1,
+            "analysis.auth.max_token_candidates must be at least 1"
+        );
+        for category in &self.sensitive.categories {
+            ensure!(
+                matches!(
+                    category.as_str(),
+                    "credential" | "personal_data" | "candidate"
+                ),
+                "analysis.sensitive.categories: {category:?} is not credential, personal_data or candidate"
+            );
+        }
+        ensure!(
+            self.sensitive.min_entropy > 0.0 && self.sensitive.min_entropy <= 8.0,
+            "analysis.sensitive.min_entropy must be above 0 and at most 8"
+        );
+        ensure!(
+            self.sensitive.max_findings >= 1,
+            "analysis.sensitive.max_findings must be at least 1"
+        );
+        ensure!(
+            self.sensitive.preview_chars <= 8,
+            "analysis.sensitive.preview_chars is at most 8"
+        );
+        ensure!(
+            self.sensitive.retention_secs.is_none_or(|secs| secs >= 1),
+            "analysis.sensitive.retention_secs must be at least 1"
+        );
+        ensure!(
+            (1..=64).contains(&self.query.max_branches),
+            "analysis.query.max_branches must be 1 to 64"
+        );
+        ensure!(
+            (1..=1000).contains(&self.query.max_regex_bytes),
+            "analysis.query.max_regex_bytes must be 1 to 1000"
+        );
+        ensure!(
+            self.query.draft_ttl_secs >= 1,
+            "analysis.query.draft_ttl_secs must be at least 1"
+        );
+        ensure!(
+            self.openapi.max_routes >= 1,
+            "analysis.openapi.max_routes must be at least 1"
+        );
+        ensure!(
+            (1..=32).contains(&self.openapi.max_schema_depth),
+            "analysis.openapi.max_schema_depth must be 1 to 32"
+        );
+        ensure!(
+            self.openapi.max_properties >= 1,
+            "analysis.openapi.max_properties must be at least 1"
+        );
+        ensure!(
+            self.openapi.examples == "none",
+            "analysis.openapi.examples must be \"none\" (no other value exists)"
+        );
+        ensure!(
+            !self.openapi.allowed_content_types.is_empty(),
+            "analysis.openapi.allowed_content_types must not be empty"
+        );
+        ensure!(
+            self.blocks.min_observations >= 1,
+            "analysis.blocks.min_observations must be at least 1"
+        );
+        if let Some(precision) = self.blocks.min_calibrated_precision {
+            ensure!(
+                (0.0..=1.0).contains(&precision),
+                "analysis.blocks.min_calibrated_precision must be between 0 and 1"
+            );
+        }
+        ensure!(
+            (1..=64).contains(&self.feeds.max_feeds),
+            "analysis.feeds.max_feeds must be 1 to 64"
+        );
+        ensure!(
+            self.feeds.ttl_secs >= 1,
+            "analysis.feeds.ttl_secs must be at least 1"
+        );
+        ensure!(
+            (1..=1000).contains(&self.feeds.max_page_rows),
+            "analysis.feeds.max_page_rows must be 1 to 1000"
+        );
+        Ok(())
+    }
+}
+
+/// `[A-Za-z0-9._:-]{1,128}`: a capture source id.
+pub fn is_source_id(text: &str) -> bool {
+    (1..=128).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 /// Read a credential file: trimmed, non-empty. Warns when others can read it.

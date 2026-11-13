@@ -6,6 +6,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- **Passive capture analysis** in the MCP server (`[analysis]`, off by default; see [ai.md](docs/ai.md#passive-capture-analysis)): a scope-aware, evidence-bearing boundary shared by all analysis tools.
+  - `open_analysis_scope`, `analysis_capabilities`, `get_analysis_result`, `delete_analysis_result`: server-held scope handles inside operator-listed sources and origins, intersected into every query branch and checked against every returned capture; keyed per-engagement fingerprints instead of credential values; evidence references with coverage, truncation and lag; bounded retention.
+  - `analyze_auth_flows`: authentication mechanisms, cookie attributes, and issue, send, replace, clear and reuse edges; JWT structure is decoded without verification.
+  - `scan_sensitive_data`: credential, personal-data and high-entropy candidate findings with masked previews, locations and fingerprints, never values; explicit coverage loss; operator-owned custom rules.
+  - `draft_traffic_query`, `run_traffic_query`: natural-language questions compiled to the query language by templates (optionally a model), with the scope intersected into every OR branch, an explicit cost, unsupported clauses (a time range is never simulated) and a separate run step.
+  - `infer_api_schema`, `get_api_schema_draft` and the `proxyx://analysis/{org}/{draft_id}/openapi` resource: OpenAPI 3.1 drafts of what was observed (`x-proxyx-observed-required`, evidence, diagnostics, no examples).
+  - `open_capture_feed`, `read_capture_feed`, `close_capture_feed` and the `proxyx://feeds/{org}/{feed_id}` resource: cursor-based polling of stored captures with stable ids and an explicit statement that it is not a live stream.
+  - Model calls from analysis tools need `analysis.allow_external_llm`, cite only evidence the analysis produced, and are audited (`model` and `evidence` audit phases) without prompts or content.
+- `classify_block_page` returns a `subtype`, evidence references, `confidence_kind`, `abstained` and the rules' `detector_version`; it tells authorization answers, maintenance pages and proxy-made refusals from blocks, abstains on pages that only discuss a CAPTCHA, accepts `capture_ids` and reports whether repeated observations make a classification eligible for reporting. Rules are measured on published fixtures.
+- `llm.alias` names the model endpoint in audit records.
+
+### Changed
+
+- **`classify_block_page` no longer reports.** The `report` and `dry_run` arguments are removed: classification is a pure read that returns the arguments of a separate `report_block_signal` call. With `[analysis]` enabled, `report_block_signal` waits for an operator's approval unless `analysis.blocks.report_requires_approval = false`.
+- A model call has one absolute deadline: the `json_object` fallback attempt shares `llm.timeout_secs` with the first attempt, and all prompt fragments share one budget (`llm.max_input_chars`).
+
+### Fixed
+
+- A requested `max_body_bytes` could exceed `limits.max_body_bytes`; it is now the smaller of the two.
+- Resource reads bypassed `limits.max_result_bytes`; tools and resources share one ceiling.
+- Capture output removed fewer secrets than the model-bound path (JSON body members, form fields, URL query and header values); both now use one cleaner, applied before bodies are clipped.
+- The untrusted-data wrapper could be closed by a differently cased or spaced closing tag in captured content.
+- An oversized tool call could leave an audit line longer than the window the log's tail reader scans, after which every later audit write failed; arguments over 256 KiB are now recorded by size and digest.
+- Redaction missed camelCase member names (`accessToken`) and JWT-shaped values outside a recognized header or member; both are now removed from tool output, resources and model input.
+
 ## [0.1.0] - 2026-11-12
 
 First public release.

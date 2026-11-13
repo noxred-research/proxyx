@@ -11,6 +11,9 @@
 //!   applies it, and policy documents are validated with the gateway's own `proxyx-policy`.
 //! * **Assist**: optional LLM-backed tools (traffic narrative, block page classification, policy
 //!   drafts) through any chat-completions compatible endpoint; a model advises and never authorizes.
+//! * **Analyse**: passive, scope-bound analysis of stored captures (authentication flows,
+//!   sensitive data, API drafts, query drafts, capture feeds) in [`analysis`], off unless an
+//!   operator enables it.
 //!
 //! Two transports share one protocol engine: newline-delimited JSON-RPC on stdio, and
 //! streamable HTTP with a bearer token. Both speak revision 2026-07-28 (stateless, per-request
@@ -18,6 +21,7 @@
 //!
 //! The entry point for a binary is [`run`] with [`McpArgs`] (`proxyx mcp ...`).
 
+pub mod analysis;
 pub mod audit;
 pub mod backend;
 pub mod cli;

@@ -111,3 +111,65 @@ history = 120
 # timeout_secs = 60
 # max_input_chars = 24000
 # max_output_tokens = 1024
+
+# --- Passive capture analysis (off by default) -------------------------------------------------------
+# Tools that read stored captures and return evidence-bearing findings: authentication flows,
+# sensitive data, API drafts, natural-language query drafts and capture feeds. They never send a
+# request to a target. An agent can analyse only the sources and origins listed here.
+# [analysis]
+# enabled = false
+# allowed_source_ids = ["run-001"]          # required when enabled
+# allowed_origins = ["api.example.com", "*.example.org"]   # host, *.suffix or scheme://host:port; required when enabled
+# allow_external_llm = false                # true: sanitized evidence may be sent to [llm]
+# max_captures = 500
+# max_input_bytes = 262144                  # headers and bodies read by one analysis
+# max_body_bytes = 16384                    # per body
+# max_total_prompt_chars = 24000
+# deadline_secs = 60                        # fetching and model calls together
+# retention_secs = 86400                    # scopes, findings, drafts, feeds (memory only)
+#
+# [analysis.auth]
+# enabled = false
+# max_token_candidates = 200
+# fingerprint_key_file = "/etc/proxyx/secrets/mcp-fingerprint-key"   # required when enabled
+# include_jwt_claim_names = false
+#
+# [analysis.sensitive]
+# enabled = true
+# categories = ["credential", "personal_data", "candidate"]
+# min_entropy = 4.0
+# max_findings = 200
+# preview_chars = 0                         # 0: only the length of a match is shown
+# # custom_rules_file = "/etc/proxyx/mcp-rules.toml"   # [[rule]] name, category, severity, pattern
+# # retention_secs = 3600
+#
+# [analysis.query]
+# enabled = true
+# max_branches = 16
+# allow_body_scan = false                   # body and payload filters read the wide columns
+# allow_regex = false
+# max_regex_bytes = 1000
+# draft_ttl_secs = 600
+#
+# [analysis.openapi]
+# enabled = true
+# max_routes = 200
+# max_schema_depth = 12
+# max_properties = 200
+# examples = "none"
+# allowed_content_types = ["application/json"]
+#
+# [analysis.blocks]
+# min_observations = 2                      # equivalent observations before a classification is reportable
+# # min_calibrated_precision = 0.95
+# allow_model = true
+# # fixture_version = "my-labelled-set-1"
+# report_requires_approval = true           # with analysis enabled, report_block_signal waits for approval
+#
+# [analysis.feeds]
+# enabled = true
+# max_feeds = 16
+# ttl_secs = 3600
+# min_poll_interval_ms = 1000
+# max_page_rows = 100
+# include_bodies = false

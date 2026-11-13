@@ -3,21 +3,24 @@
 //! Each works without an LLM where that makes sense (statistics, rules) and calls the
 //! configured model only when asked to and only for the part a model adds. A model never
 //! applies anything: its answer is parsed against a strict schema, validated with the
-//! gateway's own crates, and returned as a draft or a suggestion.
+//! gateway's own crates, and returned as a draft or a suggestion. Every model call shares one
+//! absolute deadline, one total prompt budget and one audit record of its sizes and timing.
 
 use std::collections::BTreeMap;
 
 use policy::PolicyFile;
 use serde_json::{Value, json};
 
-use super::manage::Action;
 use super::policy_tools::{
     check_policy_scope, doc_json, effective_summary, scoped_stored_policies, validate_merged,
 };
 use super::traffic::{clean_capture, validate_branches};
 use super::util::{Args, FailKind, ToolError, ToolResult};
 use super::{CallInfo, Ctx};
-use crate::llm::{Llm, LlmError, SYSTEM_RULES, untrusted};
+use crate::analysis::blocks::{self, Classification, Input};
+use crate::analysis::{self, Evidence, Side};
+use crate::audit::Phase;
+use crate::llm::{Llm, LlmError, PromptBudget, Request, SYSTEM_RULES};
 use crate::redact::{redact_body, redact_headers, redact_prompt_value};
 
 fn llm_error(error: LlmError) -> ToolError {
@@ -28,6 +31,77 @@ fn need_llm(ctx: &Ctx) -> Result<&Llm, ToolError> {
     ctx.llm.as_ref().ok_or_else(|| {
         ToolError::not_configured("no LLM is configured ([llm] in the server configuration)")
     })
+}
+
+/// One model call with the shared contract: the configured timeout as an absolute deadline over
+/// every attempt, and an audit record of the call's sizes and timing (never its content).
+async fn ask(
+    ctx: &Ctx,
+    info: &CallInfo,
+    tool: &str,
+    schema_name: &str,
+    prompt_version: &str,
+    user: &str,
+    schema: &Value,
+) -> Result<Value, ToolError> {
+    let llm = need_llm(ctx)?;
+    if ctx.cfg.analysis.enabled {
+        if !ctx.cfg.analysis.allow_external_llm {
+            return Err(ToolError::new(
+                FailKind::Refused,
+                "sending content to the model is not allowed: with [analysis] enabled an operator must set analysis.allow_external_llm",
+            ));
+        }
+        ctx.gate.check_engagement()?;
+    }
+    // like a mutation, a disclosure is recorded before it happens
+    if !analysis::audit(
+        ctx,
+        info,
+        Phase::Model,
+        tool,
+        "intent",
+        &json!({
+            "endpoint_alias": llm.alias(),
+            "model": llm.model(),
+            "prompt_version": prompt_version,
+            "schema": schema_name,
+            "evidence_ids": [],
+        }),
+    ) {
+        return Err(ToolError::new(
+            FailKind::Refused,
+            "the audit log could not be written: nothing was sent to the model",
+        ));
+    }
+    let (result, stats) = llm
+        .complete_json(&Request {
+            name: schema_name,
+            system: SYSTEM_RULES,
+            user,
+            schema,
+            deadline: None,
+        })
+        .await;
+    analysis::audit(
+        ctx,
+        info,
+        Phase::Model,
+        tool,
+        if result.is_ok() { "ok" } else { "error" },
+        &json!({
+            "endpoint_alias": llm.alias(),
+            "model": llm.model(),
+            "prompt_version": prompt_version,
+            "schema": schema_name,
+            "input_bytes": stats.input_bytes,
+            "output_bytes": stats.output_bytes,
+            "duration_ms": stats.duration_ms,
+            "attempts": stats.attempts,
+            "evidence_ids": [],
+        }),
+    );
+    result.map_err(llm_error)
 }
 
 // --- summarize_traffic ------------------------------------------------------------------------------
@@ -117,11 +191,28 @@ pub fn traffic_stats(items: &[Value]) -> Value {
     })
 }
 
-pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
+pub async fn summarize_traffic(ctx: &Ctx, args: &Args, info: &CallInfo) -> ToolResult {
     let control = ctx.control()?;
-    let branches = args.get("branches").cloned().unwrap_or(Value::Null);
+    let mut branches = args.get("branches").cloned().unwrap_or(Value::Null);
     validate_branches(&branches, false)?;
-    let org = ctx.org(args)?;
+    // what goes to a model stays inside an analysis scope once analysis is enabled
+    let scope = if ctx.cfg.analysis.enabled && args.bool("use_llm").unwrap_or(false) {
+        let Some(scope_id) = args.str("scope_id") else {
+            return Err(ToolError::invalid(
+                "capture analysis is enabled: give `scope_id` (from open_analysis_scope) to summarize with a model",
+            ));
+        };
+        let scope = analysis::resolve_scope(ctx, scope_id)?;
+        analysis::scope_org(&scope, args.str("org"))?;
+        branches = scope.constrain(&branches, false, ctx.cfg.analysis.query.max_branches)?;
+        Some(scope)
+    } else {
+        None
+    };
+    let org = match &scope {
+        Some(scope) => scope.org.clone(),
+        None => ctx.org(args)?,
+    };
     let sample = args.u64("sample").unwrap_or(500).clamp(1, 5000);
     let body = json!({"org_id": org, "branches": branches, "limit": sample, "order": "desc"});
     let reply = control
@@ -129,6 +220,9 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
         .post(&["rpc", "requests", "search"], &body)
         .await?;
     let mut items: Vec<Value> = reply["items"].as_array().cloned().unwrap_or_default();
+    if let Some(scope) = &scope {
+        items.retain(|item| scope.admits(item));
+    }
     items.iter_mut().for_each(redact_prompt_value);
     let stats = traffic_stats(&items);
     let mut out = json!({
@@ -153,18 +247,25 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
             "required": ["narrative", "notable", "suggested_next_tools"],
             "additionalProperties": false
         });
+        let mut budget = PromptBudget::new(llm.max_input_chars);
         let user = format!(
             "Summarize what these traffic statistics show for a security researcher: what the traffic is, whether targets are blocking or rate limiting, and what to look at next.\n{}",
-            untrusted(
+            budget.untrusted(
                 "traffic_statistics",
                 &stats.to_string(),
                 llm.max_input_chars
             )
         );
-        let answer = llm
-            .complete_json("traffic_summary", SYSTEM_RULES, &user, &schema)
-            .await
-            .map_err(llm_error)?;
+        let answer = ask(
+            ctx,
+            info,
+            "summarize_traffic",
+            "traffic_summary",
+            "traffic-summary-1",
+            &user,
+            &schema,
+        )
+        .await?;
         out["narrative"] = answer;
     }
     Ok(out)
@@ -172,161 +273,195 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args) -> ToolResult {
 
 // --- classify_block_page -----------------------------------------------------------------------------
 
-const CHALLENGE_MARKERS: [&str; 15] = [
-    "cf-chl", // detection-data
-    "challenge-platform",
-    "just a moment",
-    "attention required",
-    "captcha",
-    "recaptcha",  // detection-data
-    "hcaptcha",   // detection-data
-    "px-captcha", // detection-data
-    "datadome",   // detection-data
-    "/sorry/",
-    "unusual traffic",
-    "verify you are human",
-    "are you a robot",
-    "request unsuccessful. incapsula", // detection-data
-    "access denied - sucuri",          // detection-data
-];
-
-/// A rule-based classification of a response.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Verdict {
-    /// `challenge`, `forbidden`, `rate_limited` or `none`.
-    pub classification: &'static str,
-    pub confidence: f64,
-    pub evidence: Vec<String>,
+/// One response to classify.
+struct Observation {
+    capture_id: Option<String>,
+    status: u64,
+    headers: Vec<(String, String)>,
+    body: String,
+    host: Option<String>,
 }
 
-/// Classify by status, headers and the start of the body. Conservative: a lone 403 is only
-/// `forbidden` at moderate confidence, and a 200 with a challenge marker is a possible
-/// challenge.
-pub fn classify_rules(status: u64, headers: &Value, body: &str) -> Verdict {
-    let lower = body.to_lowercase();
-    let mut evidence = Vec::new();
-    let header_text: String = match headers {
-        Value::Object(map) => map
-            .iter()
-            .map(|(k, v)| format!("{k}: {}", v.as_str().unwrap_or("")))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Array(pairs) => pairs
-            .iter()
-            .map(|p| {
-                format!(
-                    "{}: {}",
-                    p[0].as_str().unwrap_or(""),
-                    p[1].as_str().unwrap_or("")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-    .to_lowercase();
-    let markers: Vec<&str> = CHALLENGE_MARKERS
+const SEVERITY: [&str; 4] = ["challenge", "rate_limited", "forbidden", "none"];
+
+fn severity_rank(class: &str) -> usize {
+    SEVERITY
         .iter()
-        .copied()
-        .filter(|marker| lower.contains(marker) || header_text.contains(marker))
-        .collect();
-    // detection-data: the challenge header of a CDN
-    let challenge_header = header_text.contains("cf-mitigated: challenge");
-    let sorry_redirect = (300..400).contains(&status) && header_text.contains("/sorry/");
-    if status == 429 {
-        evidence.push("HTTP 429".to_owned());
-        if !markers.is_empty() {
-            evidence.push(format!("markers: {markers:?}"));
-        }
-        return Verdict {
-            classification: "rate_limited",
-            confidence: 0.95,
-            evidence,
-        };
+        .position(|c| *c == class)
+        .unwrap_or(SEVERITY.len())
+}
+
+/// Whether the rules' verdict is weak enough for a model to be worth asking.
+fn needs_model(verdict: &Classification) -> bool {
+    verdict.abstained || (verdict.classification != "none" && verdict.strength < 0.9)
+}
+
+fn evidence_refs(
+    ctx: &Ctx,
+    org: &str,
+    observation: &Observation,
+    verdict: &Classification,
+) -> Vec<Value> {
+    let fp = ctx
+        .analysis
+        .fingerprinter(org, ctx.cfg.scope.engagement.as_deref());
+    let mut evidence = Evidence::default();
+    let capture = observation.capture_id.as_deref().unwrap_or("pasted");
+    for signal in &verdict.signals {
+        evidence.add(
+            &fp,
+            capture,
+            Side::Response,
+            &signal.location,
+            &signal.detail,
+        );
     }
-    if challenge_header || sorry_redirect || (!markers.is_empty() && matches!(status, 403 | 503)) {
-        evidence.push(format!("HTTP {status}"));
-        if challenge_header {
-            // detection-data: the challenge header of a CDN
-            evidence.push("cf-mitigated: challenge header".to_owned());
-        }
-        if sorry_redirect {
-            evidence.push("redirect to /sorry/".to_owned());
-        }
-        if !markers.is_empty() {
-            evidence.push(format!("markers: {markers:?}"));
-        }
-        return Verdict {
-            classification: "challenge",
-            confidence: 0.9,
-            evidence,
-        };
-    }
-    if !markers.is_empty() && (200..300).contains(&status) {
-        return Verdict {
-            classification: "challenge",
-            confidence: 0.55,
-            evidence: vec![format!(
-                "HTTP {status} but the page carries challenge markers: {markers:?}"
-            )],
-        };
-    }
-    if status == 403 {
-        return Verdict {
-            classification: "forbidden",
-            confidence: 0.6,
-            evidence: vec!["HTTP 403 without a challenge marker; one 403 can be an ordinary authorization answer, repeated ones from one exit IP are a block".to_owned()],
-        };
-    }
-    Verdict {
-        classification: "none",
-        confidence: 0.7,
-        evidence: vec![format!("HTTP {status} with no block marker")],
-    }
+    evidence.to_json()["refs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub async fn classify_block_page(ctx: &Ctx, args: &Args, info: &CallInfo) -> ToolResult {
-    let (status, headers, body, host) = if let Some(id) = args.str("capture_id") {
-        let control = ctx.control()?;
-        let org = ctx.org(args)?;
-        let mut capture = control
-            .api
-            .get(&["rpc", "orgs", &org, "requests", id], &[])
-            .await?;
-        redact_prompt_value(&mut capture);
-        let cleaned = clean_capture(&capture, 16 * 1024);
-        (
-            capture["status_code"].as_u64().unwrap_or(0),
-            cleaned["response_headers"].clone(),
-            cleaned["response_body"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned(),
-            capture["host"].as_str().map(str::to_owned),
-        )
-    } else {
+    let analysis_on = ctx.cfg.analysis.enabled;
+    let mut ids: Vec<String> = args
+        .get("capture_ids")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(id) = args.str("capture_id") {
+        ids.insert(0, id.to_owned());
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    ids.retain(|id| unique.insert(id.clone()));
+    let mut org = None;
+    let mut observations: Vec<Observation> = Vec::new();
+    if ids.is_empty() {
         let Some(status) = args.u64("status") else {
             return Err(ToolError::invalid(
-                "give `capture_id`, or `status` with optional `headers` and `body`",
+                "give `capture_id` (or `capture_ids`), or `status` with optional `headers` and `body`",
             ));
         };
         let mut headers = args.get("headers").cloned().unwrap_or(Value::Null);
         redact_headers(&mut headers);
-        (
+        observations.push(Observation {
+            capture_id: None,
             status,
-            headers,
-            redact_body(args.str("body").unwrap_or("")),
-            args.string("host"),
-        )
-    };
-    let mut verdict = classify_rules(status, &headers, &body);
+            headers: analysis::headers_of(&headers),
+            body: redact_body(args.str("body").unwrap_or("")),
+            host: args.string("host"),
+        });
+    } else {
+        let control = ctx.control()?;
+        let scope = if analysis_on {
+            let Some(scope_id) = args.str("scope_id") else {
+                return Err(ToolError::invalid(
+                    "capture analysis is enabled: give `scope_id` (from open_analysis_scope) with capture ids",
+                ));
+            };
+            Some(analysis::resolve_scope(ctx, scope_id)?)
+        } else {
+            None
+        };
+        let org_name = match &scope {
+            Some(scope) => {
+                analysis::scope_org(scope, args.str("org"))?;
+                scope.org.clone()
+            }
+            None => ctx.org(args)?,
+        };
+        for id in &ids {
+            let capture = control
+                .api
+                .get(&["rpc", "orgs", &org_name, "requests", id], &[])
+                .await?;
+            if let Some(scope) = &scope
+                && !scope.admits(&capture)
+            {
+                return Err(ToolError::new(
+                    FailKind::Refused,
+                    "a capture is outside the analysis scope (source or origin)",
+                ));
+            }
+            let cleaned = clean_capture(&capture, 16 * 1024);
+            observations.push(Observation {
+                capture_id: Some(id.clone()),
+                status: capture["status_code"].as_u64().unwrap_or(0),
+                headers: analysis::headers_of(&cleaned["response_headers"]),
+                body: cleaned["response_body"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+                host: capture["host"].as_str().map(str::to_owned),
+            });
+        }
+        org = Some(org_name);
+    }
+    let rule_verdicts: Vec<Classification> = observations
+        .iter()
+        .map(|o| {
+            blocks::classify(&Input {
+                status: o.status,
+                headers: &o.headers,
+                body: &o.body,
+            })
+        })
+        .collect();
+    // the class most observations agree on; ties go to the more severe class
+    let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
+    for verdict in &rule_verdicts {
+        if !verdict.abstained {
+            *tally.entry(verdict.classification).or_insert(0) += 1;
+        }
+    }
+    let chosen = tally
+        .iter()
+        .filter(|(class, _)| **class != "none")
+        .max_by(|a, b| {
+            a.1.cmp(b.1)
+                .then(severity_rank(b.0).cmp(&severity_rank(a.0)))
+        })
+        .map_or("none", |(class, _)| *class);
+    let primary_index = rule_verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.classification == chosen && !v.abstained)
+        .max_by(|a, b| a.1.strength.total_cmp(&b.1.strength).then(b.0.cmp(&a.0)))
+        .map_or(0, |(index, _)| index);
+    let primary_verdict = rule_verdicts[primary_index].clone();
+    let primary = &observations[primary_index];
+    let matching = rule_verdicts
+        .iter()
+        .filter(|v| {
+            v.classification == chosen && !v.abstained && v.subtype == primary_verdict.subtype
+        })
+        .count();
+    let org_label = org.clone().unwrap_or_else(|| "pasted".to_owned());
+    let refs = evidence_refs(ctx, &org_label, primary, &primary_verdict);
+
     let mut method = "rules";
+    let mut classification = primary_verdict.classification;
+    let mut subtype = primary_verdict.subtype;
+    let mut strength = primary_verdict.strength;
+    let mut basis = primary_verdict.basis;
+    let mut abstained = primary_verdict.abstained;
+    let mut model: Value = json!({"status": "not_requested"});
     let mut llm_answer: Option<Value> = None;
-    let ambiguous =
-        verdict.confidence < 0.9 && (!body.is_empty() || verdict.classification != "none");
     if args.bool("use_llm").unwrap_or(false) {
         let llm = need_llm(ctx)?;
-        if ambiguous {
+        let blocks_cfg = &ctx.cfg.analysis.blocks;
+        let allowed =
+            blocks_cfg.allow_model && (!analysis_on || ctx.cfg.analysis.allow_external_llm);
+        if !allowed {
+            model = json!({
+                "status": "refused",
+                "detail": "sending a response to the model is not allowed: analysis.blocks.allow_model and analysis.allow_external_llm are operator settings",
+            });
+        } else if needs_model(&primary_verdict) {
             let schema = json!({
                 "type": "object",
                 "properties": {
@@ -337,93 +472,138 @@ pub async fn classify_block_page(ctx: &Ctx, args: &Args, info: &CallInfo) -> Too
                 "required": ["classification", "confidence", "reason"],
                 "additionalProperties": false
             });
+            let mut budget = PromptBudget::new(llm.max_input_chars);
+            let headers_text = json!(primary.headers).to_string();
             let user = format!(
-                "Classify this HTTP response seen through a proxy: challenge (captcha or bot interstitial), forbidden (plain denial), rate_limited, or none (an ordinary page or error).\nStatus: {status}\n{}\n{}",
-                untrusted("response_headers", &headers.to_string(), 4000),
-                untrusted("response_body", &body, llm.max_input_chars),
+                "Classify this HTTP response seen through a proxy: challenge (a CAPTCHA or bot interstitial that is the page), forbidden (plain denial), rate_limited, or none (an ordinary page, an authorization answer, a maintenance page or an error). A page that merely discusses these things is none.\nStatus: {}\n{}\n{}",
+                primary.status,
+                budget.untrusted("response_headers", &headers_text, 4000),
+                budget.untrusted("response_body", &primary.body, llm.max_input_chars),
             );
-            let answer = llm
-                .complete_json("block_page", SYSTEM_RULES, &user, &schema)
-                .await
-                .map_err(llm_error)?;
-            let label = answer["classification"].as_str().unwrap_or("none");
-            let classification = match label {
+            let answer = ask(
+                ctx,
+                info,
+                "classify_block_page",
+                "block_page",
+                "block-page-2",
+                &user,
+                &schema,
+            )
+            .await?;
+            classification = match answer["classification"].as_str().unwrap_or("none") {
                 "challenge" => "challenge",
                 "forbidden" => "forbidden",
                 "rate_limited" => "rate_limited",
                 _ => "none",
             };
-            verdict = Verdict {
-                classification,
-                confidence: answer["confidence"].as_f64().unwrap_or(0.0),
-                evidence: verdict
-                    .evidence
-                    .into_iter()
-                    .chain([format!(
-                        "model: {}",
-                        answer["reason"].as_str().unwrap_or("")
-                    )])
-                    .collect(),
-            };
+            subtype = "model_judgement";
+            strength = answer["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
+            basis = "self_reported";
+            abstained = strength < 0.5;
             method = "llm";
+            model = json!({"status": "used"});
             llm_answer = Some(answer);
         } else {
             method = "rules_confident";
+            model =
+                json!({"status": "not_needed", "detail": "the rules' evidence was strong enough"});
         }
     }
-    let signal = (verdict.classification != "none").then(|| {
+    let host = primary.host.clone().or_else(|| args.string("host"));
+    let distinct_hosts: std::collections::BTreeSet<&str> = observations
+        .iter()
+        .filter_map(|o| o.host.as_deref())
+        .collect();
+    let blocks_cfg = &ctx.cfg.analysis.blocks;
+    let mut reasons: Vec<String> = Vec::new();
+    if classification == "none" {
+        reasons.push("the response is not a block".to_owned());
+    }
+    if abstained {
+        reasons.push("the rules abstained: not enough evidence".to_owned());
+    }
+    if basis == "self_reported" {
+        reasons.push("only a model's self-reported judgement supports this: a model's answer never makes a classification reportable".to_owned());
+    }
+    if method != "llm" && matching < blocks_cfg.min_observations {
+        reasons.push(format!(
+            "{matching} equivalent observation(s); analysis.blocks.min_observations is {}. Classify more captures of this target first.",
+            blocks_cfg.min_observations
+        ));
+    }
+    if distinct_hosts.len() > 1 {
+        reasons.push("the observations come from more than one target host".to_owned());
+    }
+    if let Some(minimum) = blocks_cfg.min_calibrated_precision {
+        match blocks::measured_precision(subtype) {
+            Some(precision) if precision >= minimum => {}
+            _ => reasons.push(format!(
+                "no measured precision of at least {minimum} exists for subtype {subtype}"
+            )),
+        }
+    }
+    let reportable = reasons.is_empty();
+    let mut missing: Vec<&str> = Vec::new();
+    if args.str("exit_ip").is_none() {
+        missing.push("exit_ip");
+    }
+    if host.is_none() {
+        missing.push("target");
+    }
+    let signal = (classification != "none").then(|| {
         json!({
-            "type": verdict.classification,
-            "target": host.clone().or_else(|| args.string("host")),
+            "type": classification,
+            "target": host,
             "exit_ip": args.str("exit_ip"),
             "session": args.str("session"),
         })
     });
-    let mut out = json!({
-        "classification": verdict.classification,
-        "confidence": verdict.confidence,
-        "method": method,
-        "evidence": verdict.evidence,
-        "http_status": status,
-        "llm_answer": llm_answer,
-        "suggested_signal": signal,
-        "reported": null,
-        "note": "A classification is a suggestion. A wrong block signal cools a healthy IP for that target, so confirm repeated evidence before reporting.",
-    });
-    if args.bool("report").unwrap_or(false) {
-        let Some(signal) = out["suggested_signal"].as_object().cloned() else {
-            out["reported"] = json!({"status": "skipped", "reason": "the response is not a block"});
-            return Ok(out);
-        };
-        let (Some(exit_ip), Some(target)) = (
-            args.str("exit_ip"),
-            signal.get("target").and_then(Value::as_str),
-        ) else {
-            return Err(ToolError::invalid(
-                "`report` needs `exit_ip` and a target host (`host`, or a capture with a host)",
-            ));
-        };
-        let mut report =
-            json!({"exit_ip": exit_ip, "target": target, "type": verdict.classification});
-        if let Some(session) = args.str("session") {
-            report["session"] = json!(session);
-        }
-        if args.bool("dry_run").unwrap_or(false) {
-            report["dry_run"] = json!(true);
-        }
-        let reported = super::manage::run_direct(
-            ctx,
-            Action::ReportBlockSignal,
-            Args::from_value(report),
-            info,
-        )
-        .await;
-        out["reported"] = match reported {
-            Ok(value) => value,
-            Err(error) => error.to_value(),
-        };
+    let mut reporting_args = json!({"type": classification, "target": host});
+    if let Some(ip) = args.str("exit_ip") {
+        reporting_args["exit_ip"] = json!(ip);
     }
-    Ok(out)
+    if let Some(session) = args.str("session") {
+        reporting_args["session"] = json!(session);
+    }
+    let requires_approval = ctx.gate.approval_required("report_block_signal");
+    Ok(json!({
+        "classification": classification,
+        "subtype": subtype,
+        "confidence": strength,
+        "confidence_kind": basis,
+        "confidence_scale": if basis == "self_reported" { "the model's own number: not calibrated" } else { "ordinal rule strength, not a probability" },
+        "abstained": abstained,
+        "detector_version": blocks::DETECTOR_VERSION,
+        "fixture_version": blocks_cfg.fixture_version,
+        "method": method,
+        "http_status": primary.status,
+        "evidence": primary_verdict.signals.iter().map(|s| format!("{}: {}", s.location, s.detail)).collect::<Vec<_>>(),
+        "evidence_refs": refs,
+        "recommendation": primary_verdict.recommendation,
+        "rule_assessment": blocks::describe(&primary_verdict),
+        "model": model,
+        "llm_answer": llm_answer,
+        "observations": {
+            "total": observations.len(),
+            "matching": matching,
+            "hosts": distinct_hosts,
+            "classes": tally,
+        },
+        "per_observation": rule_verdicts.iter().zip(&observations).map(|(v, o)| json!({
+            "capture_id": o.capture_id, "classification": v.classification, "subtype": v.subtype, "abstained": v.abstained,
+        })).collect::<Vec<_>>(),
+        "suggested_signal": signal,
+        "reporting": {
+            "reportable": reportable,
+            "why_not": reasons,
+            "tool": "report_block_signal",
+            "arguments": reporting_args,
+            "missing": missing,
+            "requires_approval": requires_approval,
+            "note": "Classification never writes. Reporting is a separate call that needs the `signals` capability and, when required, an operator's approval. A wrong report cools a healthy IP for that target.",
+        },
+        "untrusted_content": true,
+    }))
 }
 
 // --- suggest_policy ---------------------------------------------------------------------------------
@@ -441,7 +621,7 @@ on_score_unavailable = "allow"|"deny", [policy.on_empty] static = "wait"|"fail",
 [policy.cost] max_gb_per_day, max_creates_per_hour, fair_use_gb_per_ip_month, [policy.limits] max_gb_per_day, max_creates_per_hour, fair_use_gb_per_ip_month, org_max_gb_per_day.
 Precedence global < route_class < org, field by field; limits are ceilings that only tighten. Change as little as possible and set only the fields the request needs."#;
 
-pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
+pub async fn suggest_policy(ctx: &Ctx, args: &Args, info: &CallInfo) -> ToolResult {
     let llm = need_llm(ctx)?;
     let request = args.require_str("request")?;
     let org = match args.str("org") {
@@ -488,25 +668,33 @@ pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
         "required": ["toml", "rationale", "assumptions"],
         "additionalProperties": false
     });
-    let user = format!(
-        "Write the smallest policy change that satisfies the request.\n{}\n{}\n{}\n{}",
-        untrusted(
-            "requested_scope",
-            &json!({"scope": scope, "org": org}).to_string(),
-            2000
-        ),
-        untrusted("policy_format", POLICY_REFERENCE, 6000),
-        untrusted(
-            "current_policies",
-            &Value::Array(current).to_string(),
-            llm.max_input_chars
-        ),
-        untrusted("request", request, 2000),
+    // the request and the format come first: the stored policies take what is left of the budget
+    let mut budget = PromptBudget::new(llm.max_input_chars);
+    let request_block = budget.untrusted("request", request, 2000);
+    let scope_block = budget.untrusted(
+        "requested_scope",
+        &json!({"scope": scope, "org": org}).to_string(),
+        2000,
     );
-    let answer = llm
-        .complete_json("policy_draft", SYSTEM_RULES, &user, &schema)
-        .await
-        .map_err(llm_error)?;
+    let format_block = budget.untrusted("policy_format", POLICY_REFERENCE, 6000);
+    let current_block = budget.untrusted(
+        "current_policies",
+        &Value::Array(current).to_string(),
+        llm.max_input_chars,
+    );
+    let user = format!(
+        "Write the smallest policy change that satisfies the request.\n{scope_block}\n{format_block}\n{current_block}\n{request_block}"
+    );
+    let answer = ask(
+        ctx,
+        info,
+        "suggest_policy",
+        "policy_draft",
+        "policy-draft-1",
+        &user,
+        &schema,
+    )
+    .await?;
     let draft = answer["toml"].as_str().unwrap_or("");
     let file = PolicyFile::parse(draft).map_err(|error| {
         ToolError::new(
@@ -544,45 +732,6 @@ pub async fn suggest_policy(ctx: &Ctx, args: &Args) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rules_classify_the_documented_block_shapes() {
-        let none = json!(null);
-        assert_eq!(
-            classify_rules(429, &none, "").classification,
-            "rate_limited"
-        );
-        let challenge = classify_rules(
-            403,
-            // detection-data: the challenge header of a CDN
-            &json!({"cf-mitigated": "challenge"}),
-            "<title>Just a moment...</title>",
-        );
-        assert_eq!(
-            (challenge.classification, challenge.confidence >= 0.9),
-            ("challenge", true)
-        );
-        let captcha = classify_rules(503, &none, "<div class=\"captcha-widget\">");
-        assert_eq!(captcha.classification, "challenge");
-        let sorry = classify_rules(
-            302,
-            &json!([["Location", "https://search.example.test/sorry/index"]]),
-            "",
-        );
-        assert_eq!(sorry.classification, "challenge");
-        let plain = classify_rules(403, &none, "<h1>Forbidden</h1>");
-        assert_eq!(
-            (plain.classification, plain.confidence < 0.9),
-            ("forbidden", true)
-        );
-        let page = classify_rules(200, &none, "<html>welcome</html>");
-        assert_eq!(page.classification, "none");
-        let soft = classify_rules(200, &none, "please verify you are human");
-        assert_eq!(
-            (soft.classification, soft.confidence < 0.9),
-            ("challenge", true)
-        );
-    }
 
     #[test]
     fn statistics_count_blocks_and_errors() {

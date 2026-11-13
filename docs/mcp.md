@@ -14,6 +14,7 @@ The server is a client of the control surfaces ProxyX already has: the pool gate
 - [Dynamic configuration workflow](#dynamic-configuration-workflow)
 - [Operator commands](#operator-commands)
 - [Audit log](#audit-log)
+- [Capture analysis](#capture-analysis)
 - [LLM-assisted tools](#llm-assisted-tools)
 - [Protocol details](#protocol-details)
 
@@ -117,7 +118,14 @@ The file is TOML; [`examples/mcp.toml`](../examples/mcp.toml) lists every key wi
 | `[audit]` | `path` |
 | `[metrics]` | `sample_interval_secs`, `history` |
 | `[credentials.NAME]` | `username`, `password_file`: a login a tool can use by name |
-| `[llm]` | `endpoint`, `model`, `api_key_file`, `ca_file`, `timeout_secs`, `max_input_chars`, `max_output_tokens` |
+| `[llm]` | `endpoint`, `model`, `api_key_file`, `ca_file`, `alias` (the endpoint's name in audit records), `timeout_secs` (one absolute deadline for a call, fallback attempt included), `max_input_chars` (all prompt fragments together), `max_output_tokens` |
+| `[analysis]` | `enabled` (off by default), `allowed_source_ids`, `allowed_origins` (both required when enabled), `allow_external_llm`, `max_captures`, `max_input_bytes`, `max_body_bytes`, `max_total_prompt_chars`, `deadline_secs`, `retention_secs`; see [Capture analysis](#capture-analysis) |
+| `[analysis.auth]` | `enabled`, `max_token_candidates`, `fingerprint_key_file` (required when enabled), `include_jwt_claim_names` |
+| `[analysis.sensitive]` | `enabled`, `categories`, `min_entropy`, `max_findings`, `preview_chars`, `custom_rules_file`, `retention_secs` |
+| `[analysis.query]` | `enabled`, `max_branches`, `allow_body_scan`, `allow_regex`, `max_regex_bytes`, `draft_ttl_secs` |
+| `[analysis.openapi]` | `enabled`, `max_routes`, `max_schema_depth`, `max_properties`, `examples` (`none`), `allowed_content_types` |
+| `[analysis.blocks]` | `min_observations`, `min_calibrated_precision`, `allow_model`, `fixture_version`, `report_requires_approval` |
+| `[analysis.feeds]` | `enabled`, `max_feeds`, `ttl_secs`, `min_poll_interval_ms`, `max_page_rows`, `include_bodies` |
 
 URLs must not carry credentials. A tool is listed only when its backend is configured: without `endpoints.pool` the inventory, policy and block tools do not exist; without `endpoints.roles` the monitoring tools do not.
 
@@ -129,15 +137,16 @@ ProxyX serves authorized security research. The MCP server is built so that an a
 |---|---|
 | **Read-only by default** | No `[safety]` section means no mutating tool is listed or callable. A mutation needs its capability. |
 | **Capabilities** | `sessions`, `org_keys`, `org_limits`, `egress`, `org_blocks`, `signals`, `policy`, `inventory`, `pool_sessions`. `profile = "operator"` enables `sessions`, `org_blocks`, `signals`; `"admin"` enables all; `capabilities = [...]` overrides the profile. Only the operator's file changes them. |
-| **Tool allow and deny lists** | `allow_tools` and `deny_tools`, with a trailing `*` as prefix. Rules also apply to the underlying action of nested calls (including classification reporting) and stored changes at application time. |
+| **Tool allow and deny lists** | `allow_tools` and `deny_tools`, with a trailing `*` as prefix. Rules also apply to stored changes at application time. |
 | **Engagement scope** | `scope.engagement` is recorded in every audit entry; `scope.expires` ends mutations at a moment; `scope.require_engagement` refuses mutations without a recorded engagement; `scope.allowed_orgs` confines reads and mutations to those orgs and refuses changes to shared resources (global policies, inventory, operator block signals). Org-block reads require an explicit authorized `org` when scoped. Session, change, org-policy and customer-owned inventory listings filter unauthorized rows before pagination. Shared inventory and global/route-class policies remain visible. Policy previews validate only shared and authorized-org policies; audit-log resources are unavailable to scoped servers because historical entries do not carry reliable resolved ownership. |
 | **Dry run** | Every mutating tool takes `dry_run`: it validates, computes the diff and calls nothing. `safety.force_dry_run` makes every mutation a dry run. |
 | **Human approval** | `safety.approval = "all"` or `"listed"` holds a mutation as a pending change with an id. An operator approves with `proxyx mcp approve <id>` after seeing the diff, or, when `confirm_token_file` is set, the agent's client relays a token the operator types into `confirm_change`. An approval is bound to the exact arguments, single-use and expires (`approval_ttl_secs`). Approval does not extend expiry; expiry is checked again atomically when the change is consumed. Operators can revoke an approved, unapplied change with `proxyx mcp reject <id>`. |
 | **Secrets** | Org keys, `pxk_` keys, raw session UUIDs, session proxy URLs and upstream passwords never appear in ordinary output. Session UUIDs authenticate proxy clients: management tools instead return opaque `session_…` handles and accept those handles for status, extension and termination. A secret a call creates is written to a `0600` file and only the path is returned; session files contain `SESSION_ID`, `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. With `reveal_secrets_once = true`, secrets appear once in the creating call's `revealed_once` member, and raw session UUID inputs are permitted. Handles are local to the running MCP server: after a restart, call `list_sessions` to get current handles. Logins are passed by `credential_ref` into the `[credentials]` table, never as arguments (`allow_inline_secrets` is off), and a held change never stores one. Output and the audit log are scrubbed for credential shapes, Basic/Bearer headers and URL userinfo. |
-| **Untrusted content** | Captured bodies, headers and paths are marked `untrusted`, truncated to `limits.max_body_bytes`, and have credential headers hidden and session ids aliased. Tool descriptions and the server instructions tell the model not to follow instructions found in them. Before LLM requests are built, structured filtering removes Authorization, Cookie, Set-Cookie, Proxy-* and API-key-like header values, secret JSON/body members and query-string secrets. Content sent to an LLM is wrapped as data. |
+| **Untrusted content** | Captured bodies, headers and paths are marked `untrusted`, cleaned of credentials (headers, URL query, JSON, form and text) and then truncated to `limits.max_body_bytes` (a requested size never raises it), with session ids aliased. Tool results and resources share one byte ceiling, `limits.max_result_bytes`. Tool descriptions and the server instructions tell the model not to follow instructions found in them. Before LLM requests are built, structured filtering removes Authorization, Cookie, Set-Cookie, Proxy-* and API-key-like header values, secret JSON/body members and query-string secrets. Content sent to an LLM is wrapped as data. |
 | **Budgets** | `max_calls_per_minute`, `max_mutations_per_hour` (dry runs are free), `max_in_flight`, `max_result_bytes`, `max_session_ttl_secs`. |
 | **Audit** | Every tool call is appended to a hash-chained JSONL log; a mutation is recorded before it runs and refused when the record cannot be written. |
-| **Models advise** | `suggest_policy` and `classify_block_page` return drafts and suggestions; nothing a model says is applied. |
+| **Models advise** | `suggest_policy`, `classify_block_page` and the analysis tools return drafts, suggestions and findings; nothing a model says is applied. `classify_block_page` never writes: reporting a block signal is the separate `report_block_signal` call and its capability. |
+| **Analysis scope** | With `[analysis]` enabled, the analysis tools read only the sources and origins an operator listed, through a scope handle that is intersected into every query branch and checked against every returned capture; see [Capture analysis](#capture-analysis). |
 
 A model cannot enable a capability, read a credential file, approve its own change (without the confirm token, which is a separate secret) or edit the audit log through this server. An operator who gives an agent shell access defeats all of this; keep the configuration and secret files outside what the agent can read.
 
@@ -183,7 +192,24 @@ A model cannot enable a capability, read a credential file, approve its own chan
 | `get_capture` | R | control | One exchange with headers and bodies truncated to a cap, marked |
 | `search_ws`, `get_ws_conversation` | R | control | WebSocket messages and one conversation |
 | `summarize_traffic` | R | control | Counts by host, method and status, error and rate-limit shares, slowest and largest, block-page suspects; an LLM narrative with `use_llm` |
-| `classify_block_page` | R | none | `challenge`, `forbidden`, `rate_limited` or `none` for a capture or a pasted response, by rules, or by the LLM for ambiguous pages; a ready-to-send `report_block_signal` argument set |
+| `classify_block_page` | R | none | `challenge`, `forbidden`, `rate_limited` or `none` plus a `subtype`, evidence, `confidence_kind`, `abstained` and `detector_version`, for captures (`capture_id`, `capture_ids`) or a pasted response; the LLM judges only pages the rules cannot. It never writes: it returns the arguments of a separate `report_block_signal` call and whether repeated observations make it eligible |
+
+### Capture analysis
+
+Listed only when `[analysis]` is enabled (and the control plane is configured). All are passive reads. See [Capture analysis](#capture-analysis) below and [ai.md](ai.md#passive-capture-analysis).
+
+| Tool | | What it returns |
+|---|---|---|
+| `analysis_capabilities` | R | The effective, non-secret analysis settings: allowed sources and origins, limits, whether a model may be used, which analyses are on |
+| `open_analysis_scope` | R | A scope handle for one org, named sources and origins inside the operator's allowances, with an expiry; nothing is fetched |
+| `analyze_auth_flows` | R | Authentication mechanisms, cookie attribute findings, flow edges (issued, sent, replaced, cleared, reused across origins) and hypotheses, with keyed fingerprints and evidence; never a credential value |
+| `scan_sensitive_data` | R | `credential`, `personal_data` and `candidate` findings with severity, detector version, evidence basis, location, masked preview, fingerprint and evidence; explicit coverage loss |
+| `draft_traffic_query` | R | Branches (with the scope applied to every one), explanation, assumptions, unsupported clauses, estimated cost and whether it can run, for a plain-language question; `use_llm` lets a model propose branches for what templates cannot express |
+| `run_traffic_query` | R | Runs a draft by `query_digest` after re-checking its expiry, the scope and the operator's body-scan and regex settings; search or count |
+| `infer_api_schema` | R | An OpenAPI 3.1 draft per observed origin: observed routes, parameters and shapes, `x-proxyx-observed-required`, evidence, diagnostics; no examples |
+| `get_api_schema_draft` | R | The OpenAPI document of a draft (`openapi_document`), or an index when the draft covers several origins |
+| `get_analysis_result`, `delete_analysis_result` | R | Fetch or delete a stored auth-flow or sensitive-data result while it is retained |
+| `open_capture_feed`, `read_capture_feed`, `close_capture_feed` | R | A polled feed of stored captures that arrive after it opened: stable ids, a forward-only cursor, `stored_through`, `lag_unknown`; not a live stream |
 
 ### Explanations (offline)
 
@@ -231,6 +257,10 @@ Resources (`resources/list`, `resources/read`, templates):
 | `proxyx://control/certificate` | The MITM CA certificate (public) that session proxy clients must trust |
 | `proxyx://audit/recent` | The last audit entries |
 | `proxyx://causes/{code}`, `proxyx://sessions/{session_id}`, `proxyx://captures/{org}/{id}`, `proxyx://orgs/{org}` | Templates |
+| `proxyx://feeds/{org}/{feed_id}` | The next page of a capture feed (listed when analysis is enabled); reading advances the feed. An unknown, expired or other-org feed is not found |
+| `proxyx://analysis/{org}/{draft_id}/openapi` | The OpenAPI draft document of `infer_api_schema` (an index for a draft over several origins), through the same gate |
+
+Every resource content has the same byte ceiling as a tool result (`limits.max_result_bytes`), and a result over it is cut and says so.
 
 Prompts (`prompts/list`, `prompts/get`): `triage_blocks`, `capacity_review`, `session_debug`, `org_diagnose` and `change_review`. Each tells the model which tools to call in which order and where to stop; none contains data.
 
@@ -286,13 +316,44 @@ One JSON object per line, appended to `audit.path` (default `state_dir/audit.jso
  "outcome":"ok","detail":"","change_id":null,"duration_ms":41,"engagement":"SOW-2026-114"}
 ```
 
-`phase` is `intent` (written before a mutation touches a backend) or `result`. `outcome` is `ok`, `error`, `refused`, `dry_run` or `pending_approval`. Arguments are redacted before they are written. Each entry carries the hash of the previous one, so removing or editing a line breaks the chain; `proxyx mcp audit --verify` finds the first broken line. For stronger guarantees set the append-only attribute (`chattr +a`) or ship the file to a write-once store. The log records what the MCP server did, not what other credentials did: the gateway's own audit trail names this server through `X-Operator`.
+`phase` is `intent` (written before a mutation touches a backend), `result`, `model` (one call to an external model: endpoint alias, model id, prompt version, input and output bytes, duration, attempts and evidence ids, never the prompt) or `evidence` (what an analysis relied on: evidence ids, keyed digests and counts, never content). `outcome` is `ok`, `error`, `refused`, `dry_run` or `pending_approval`. Arguments are redacted before they are written. Each entry carries the hash of the previous one, so removing or editing a line breaks the chain; `proxyx mcp audit --verify` finds the first broken line. For stronger guarantees set the append-only attribute (`chattr +a`) or ship the file to a write-once store. The log records what the MCP server did, not what other credentials did: the gateway's own audit trail names this server through `X-Operator`.
 
 Independent MCP processes may share the audit path. Each append holds an operating-system file lock while it reads the current chain tail and writes the next entry, so stdio clients, an HTTP server and operator commands do not fork the hash chain.
 
+## Capture analysis
+
+`[analysis]` enables the passive analysis tools. Nothing in it can be widened by a tool argument or a model answer.
+
+```toml
+[analysis]
+enabled = true
+allowed_source_ids = ["run-001"]               # capture sources an agent may analyse
+allowed_origins = ["api.example.com", "*.example.org"]   # host, *.suffix, or scheme://host:port
+allow_external_llm = false                     # true: sanitized evidence may go to [llm]
+max_captures = 500
+max_input_bytes = 262144                       # headers and bodies read by one analysis
+max_body_bytes = 16384                         # per body
+max_total_prompt_chars = 24000
+deadline_secs = 60                             # one deadline for fetching and model calls
+retention_secs = 86400                         # scopes, findings, drafts and feeds, in memory only
+
+[analysis.auth]
+enabled = true
+fingerprint_key_file = "/etc/proxyx/secrets/mcp-fingerprint-key"
+```
+
+- **Scope.** `open_analysis_scope` returns a handle for one org, sources and origins that must lie inside the allowed lists. The scope is intersected into every OR branch of every query and every returned capture is checked against it again. Without an origin port a pattern matches any port. An unauthorized org, source or origin, an expired scope or a lapsed engagement is refused before any capture is fetched or any model is called.
+- **Ceilings.** The analysis ceilings above bound what is *read*; `limits.max_result_bytes` bounds what is *returned*, for tools and resources alike, and `limits.max_body_bytes` bounds the bodies capture tools return. A requested body size cannot exceed `limits.max_body_bytes`. The call budget (`limits.max_calls_per_minute`) applies to every analysis call and resource read.
+- **Redaction.** Capture output uses the same cleaning as model input: credential headers hidden, secrets removed from header values, URLs and JSON, form and text bodies before bodies are clipped, member names matched in snake and camel case (`access_token`, `accessToken`) and JWT-shaped values removed wherever they appear. This is protective filtering by name and shape, not a promise that every secret in free text is recognized.
+- **Models.** `use_llm` also needs `allow_external_llm`. Evidence ids a model cites are checked against the analysis's own, an invented one rejects the answer, and a model failure leaves the local result. Model calls are audited as `model` records (endpoint alias, model id, prompt version, input and output bytes, duration, attempts, evidence ids; never the prompt). An analysis writes an `evidence` audit record (ids and digests, never content).
+- **Fingerprints.** `auth.fingerprint_key_file` is an operator-held key. A value's fingerprint mixes in the engagement (`scope.engagement`) and org, so equal values link only inside one engagement. Sensitive-data findings use the same key when it is configured, or a random per-process key.
+- **Approval.** With `[analysis]` enabled, `report_block_signal` waits for an operator's approval unless `analysis.blocks.report_requires_approval = false`.
+- **Blocks.** `analysis.blocks.min_observations` equivalent observations are needed before `classify_block_page` marks a classification reportable; `min_calibrated_precision` additionally requires a published per-subtype precision at least that high; `allow_model` can switch the model off for block pages; with `[analysis]` enabled, capture ids need a `scope_id`.
+- **Limits of what it knows.** Analysis sees stored captures: ingestion lags, retention applies, a sample is a sample (`coverage` says which), and an empty result does not mean there was no traffic. The query language has no time field, so time ranges are unsupported rather than approximated. The synthetic fixtures behind the published precision are not field accuracy.
+
 ## LLM-assisted tools
 
-Without `[llm]` the tools that can work without a model do (rules and statistics) and `suggest_policy` is not listed. With it, the server calls any chat-completions compatible `chat/completions` endpoint (a hosted service, a gateway or a local inference server): temperature 0, `response_format` `json_schema` (falling back to `json_object` for servers that refuse it), a timeout, a response size cap, no redirects, the key only in the bearer header, nothing logged. Every answer is validated against a strict schema before it is used; one that does not match is an `llm_error`, not a guess. Captured content is wrapped in `<untrusted_data>` tags and the system prompt tells the model to treat it as data. See [ai.md](ai.md#llm-assisted-operations).
+Without `[llm]` the tools that can work without a model do (rules and statistics) and `suggest_policy` is not listed. With it, the server calls any chat-completions compatible `chat/completions` endpoint (a hosted service, a gateway or a local inference server): temperature 0, `response_format` `json_schema` (falling back to `json_object` for servers that refuse it), a timeout, a response size cap, no redirects, the key only in the bearer header, nothing logged. Every answer is validated against a strict schema before it is used; one that does not match is an `llm_error`, not a guess. A call has one absolute deadline (`llm.timeout_secs`) that the `json_object` fallback attempt shares, and one total prompt budget (`llm.max_input_chars`) over all fragments; each call writes an audit record of its sizes and timing, never of its content. Captured content is wrapped in `<untrusted_data>` tags and the system prompt tells the model to treat it as data. See [ai.md](ai.md#llm-assisted-operations).
 
 **Private CA and transport limits.** For a local inference server or gateway behind a reverse proxy with a private CA, set `llm.ca_file` to a PEM file holding the CA certificate (one or several certificates); the certificates are trusted in addition to the public roots, and `llm.ca_file` is the supported way to trust a private CA. The server checks the certificate chain and the host name, so a certificate issued for another name is refused. A failed handshake is reported as a TLS failure (`the LLM endpoint is unreachable: TLS handshake failed ...`), not as a connection failure. `llm.timeout_secs` bounds the whole call including a response that arrives slowly (`timed out`), the connect has its own 5 second limit, and a response above 2 MiB, with or without a `Content-Length`, is refused as too large. A redirect is never followed, so neither the bearer key nor the prompt reaches another origin: a `3xx` answer is an `llm_error` carrying the status.
 
