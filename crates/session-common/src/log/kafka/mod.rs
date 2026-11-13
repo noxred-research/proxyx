@@ -199,6 +199,10 @@ pub struct KafkaConfig {
     pub batch_bytes: usize,
 }
 
+impl crate::config::PartialSection for KafkaConfig {
+    const STANDALONE: &'static [&'static str] = &["sasl"];
+}
+
 impl KafkaConfig {
     /// Check settings that cannot be expressed in the types.
     pub fn validate(&self) -> Result<()> {

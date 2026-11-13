@@ -12,10 +12,13 @@ pub struct Migrators {
     pub postgres: Migrator,
     pub mariadb: Migrator,
     pub sqlite: Migrator,
-    /// PostgreSQL extensions the PostgreSQL migrations use. An extension exists
-    /// once per database, so when the connection is pinned to a schema they are
-    /// installed in `public`, where every product's schema can resolve them.
-    pub postgres_extensions: &'static [&'static str],
+    /// PostgreSQL migrations whose text changed after a release, as
+    /// `(version, SHA-384 of the released text in hex)`. sqlx refuses a
+    /// database whose recorded checksum differs from the embedded file, so
+    /// [`Pool::migrate`] first replaces a recorded checksum that equals the
+    /// released one with the checksum of the embedded file. Any other recorded
+    /// checksum is left alone and fails as before.
+    pub postgres_rewritten: &'static [(i64, &'static str)],
 }
 
 impl Migrators {
@@ -32,17 +35,19 @@ impl Migrators {
 /// Embed the three migration directories of a crate: `migrations/postgres`,
 /// `migrations/mariadb` and `migrations/sqlite`, relative to the crate root.
 /// The crate's `build.rs` must print `cargo:rerun-if-changed=migrations`.
+/// `rewritten = [(version, "sha384 hex"), ...]` fills
+/// [`Migrators::postgres_rewritten`].
 #[macro_export]
 macro_rules! migrators {
     () => {
-        $crate::migrators!(extensions = [])
+        $crate::migrators!(rewritten = [])
     };
-    (extensions = [$($extension:literal),* $(,)?]) => {
+    (rewritten = [$(($version:literal, $checksum:literal)),* $(,)?]) => {
         $crate::Migrators {
             postgres: ::sqlx::migrate!("./migrations/postgres"),
             mariadb: ::sqlx::migrate!("./migrations/mariadb"),
             sqlite: ::sqlx::migrate!("./migrations/sqlite"),
-            postgres_extensions: &[$($extension),*],
+            postgres_rewritten: &[$(($version, $checksum)),*],
         }
     };
 }
@@ -74,14 +79,8 @@ impl Pool {
                         "CREATE SCHEMA IF NOT EXISTS \"{schema}\""
                     )))
                     .await?;
-                    for extension in migrators.postgres_extensions {
-                        // names come from the crate's own `migrators!` call
-                        conn.execute(sqlx::AssertSqlSafe(format!(
-                            "CREATE EXTENSION IF NOT EXISTS \"{extension}\" SCHEMA public"
-                        )))
-                        .await?;
-                    }
                 }
+                adopt_rewritten(&mut conn, migrator, migrators.postgres_rewritten).await?;
                 let applied = migrator.run(&mut *conn).await;
                 let restored = conn
                     .execute("RESET statement_timeout; RESET lock_timeout")
@@ -189,6 +188,47 @@ impl Pool {
             .map(|m| format!("{}_{}", m.version, m.description))
             .collect())
     }
+}
+
+/// Record the checksum of the embedded text for every migration in `rewritten`
+/// whose recorded checksum is the one of the text released earlier. A no-op on
+/// a database that never applied the migration, and on one that already has the
+/// new text.
+async fn adopt_rewritten(
+    conn: &mut sqlx::PgConnection,
+    migrator: &Migrator,
+    rewritten: &[(i64, &str)],
+) -> Result<(), MigrateError> {
+    if rewritten.is_empty() {
+        return Ok(());
+    }
+    // The table of the first schema on the search path, which is the one
+    // sqlx reads: another schema may hold a table of the same name.
+    let table: Option<String> = sqlx::query_scalar(
+        "SELECT to_regclass(format('%I._sqlx_migrations', current_schema()))::text",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if table.is_none() {
+        return Ok(());
+    }
+    for (version, released) in rewritten {
+        let Some(migration) = migrator.iter().find(|m| m.version == *version) else {
+            return Err(MigrateError::Execute(sqlx::Error::Protocol(format!(
+                "migration {version} is listed as rewritten but is not embedded"
+            ))));
+        };
+        sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = $1 \
+             WHERE version = $2 AND checksum = decode($3, 'hex')",
+        )
+        .bind(migration.checksum.as_ref())
+        .bind(version)
+        .bind(released)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
 }
 
 /// An exclusive lock on `<database file>.migrate-lock`, held until the

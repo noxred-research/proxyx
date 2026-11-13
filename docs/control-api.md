@@ -565,7 +565,7 @@ The API process runs the session reapers and view expiry every 60 s; the ingeste
 | `default_rate_limit_rpm`, `default_rate_limit_burst` | 0, 0 | applied when the org has no value or does not exist; 0 for both means no per-org settings are written into the session |
 | `proxy_public_host`, `proxy_public_host_socks5` | `localhost:8443`, `localhost:1080` | used to build `proxy_url` and `proxy_url_socks5` |
 | `ca.type` | `generate` | see [Certificate](#certificate) |
-| `broker_kind`, `kafka.*`, `rabbitmq.*`, `request_log_stream`, `request_log_max_stream_len`, `consumer_group` | `redis_stream`, none, none, `proxyx:request_log`, 1000000, `proxyx_control` | see [capture-pipeline.md](capture-pipeline.md#broker) |
+| `broker_kind`, `kafka.*`, `rabbitmq.*`, `request_log_stream`, `request_log_max_stream_len`, `consumer_group` | `redis_stream`, none, none, `<redis_key_prefix>:request_log`, 1000000, `proxyx_control` | see [capture-pipeline.md](capture-pipeline.md#broker) |
 | `session_lifecycle_writes` | `true` | whether this ingester marks sessions `closed` |
 | `correlation_id_header`, `parent_correlation_id_header`, `account_id_header`, `tool_call_id_header` | `X-ProxyX-Agent`, `X-ProxyX-Parent-Agent`, `X-ProxyX-Account`, `X-ProxyX-Tool` | request headers copied into columns |
 | `traffic_views_*`, `cloudfront_*`, `export_*` | see [Traffic views](#traffic-views) | |

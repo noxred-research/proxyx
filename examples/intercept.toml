@@ -47,4 +47,4 @@ default_rpm = 6000
 # ca_cert = "/etc/proxyx/secrets/rabbit-ca.pem"
 
 [request_log]
-stream_name = "proxyx:request_log"      # Redis Streams only
+# stream_name = "proxyx:request_log"    # Redis Streams only; default <redis_key_prefix>:request_log

@@ -75,7 +75,7 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     // Redis connection (fatal on failure)
     let (redis_client, redis_conn) =
         common::redis_connect::connect(config.redis_url.as_str()).await?;
-    tracing::info!(redis_url = %config.redis_url, "connected to Redis");
+    tracing::info!(redis_url = %common::redact::url(&config.redis_url), "connected to Redis");
 
     // State with Redis fallback
     let state = ProxyState::new(
@@ -107,9 +107,11 @@ pub async fn run(config_path: Option<&str>) -> Result<()> {
     common::log::warn_deprecated_broker_names();
     let log_producer: Box<dyn common::log::CaptureLogProducer> = match config.broker_kind {
         config::BrokerKind::RedisStream => {
+            let stream = config.request_log_stream();
+            tracing::info!(%stream, "capture log: Redis stream");
             Box::new(common::log::redis_stream::RedisStreamProducer::new(
                 redis_conn.clone(),
-                config.request_log.stream_name.clone(),
+                stream,
                 config.request_log.max_stream_len,
             ))
         }

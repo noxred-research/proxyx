@@ -18,9 +18,12 @@ const MAX_PUBLISH_ATTEMPTS: u32 = 5;
 /// Configuration for the request log writer.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequestLogConfig {
-    /// Redis stream name (default: `proxyx:request_log`).
-    #[serde(default = "default_stream_name")]
-    pub stream_name: String,
+    /// Redis stream name. Unset: `<redis_key_prefix>:request_log`, so
+    /// deployments with different prefixes on one Redis or Valkey never share
+    /// a stream. Must equal the control plane's `request_log_stream`; see
+    /// [`crate::config::Config::request_log_stream`].
+    #[serde(default)]
+    pub stream_name: Option<String>,
     /// Channel capacity for backpressure (default: 256). Also the largest
     /// number of captures the drain hands to the producer in one batch.
     #[serde(default = "default_channel_capacity")]
@@ -31,9 +34,6 @@ pub struct RequestLogConfig {
     pub max_stream_len: u64,
 }
 
-fn default_stream_name() -> String {
-    "proxyx:request_log".to_string()
-}
 fn default_channel_capacity() -> usize {
     256
 }
@@ -44,7 +44,7 @@ fn default_max_stream_len() -> u64 {
 impl Default for RequestLogConfig {
     fn default() -> Self {
         Self {
-            stream_name: default_stream_name(),
+            stream_name: None,
             channel_capacity: default_channel_capacity(),
             max_stream_len: default_max_stream_len(),
         }
@@ -280,7 +280,6 @@ impl RequestLogWriter {
         let drain = tokio::spawn(drain_task(
             receiver,
             producer.clone(),
-            config.stream_name,
             config.channel_capacity,
             progress.clone(),
         ));
@@ -420,11 +419,10 @@ fn record_buffer_depth(sender: &mpsc::Sender<DrainItem>) {
 async fn drain_task(
     mut receiver: mpsc::Receiver<DrainItem>,
     producer: Arc<dyn CaptureLogProducer>,
-    stream_name: String,
     batch_capacity: usize,
     progress: Arc<Progress>,
 ) {
-    tracing::info!(%stream_name, "request log writer started");
+    tracing::info!("request log writer started");
 
     let mut items = Vec::with_capacity(batch_capacity);
     loop {

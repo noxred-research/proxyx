@@ -90,13 +90,19 @@ fn parse_sentinel_url(url: &str) -> Result<SentinelUrl> {
     } else if let Some(rest) = url.strip_prefix("redis+sentinel://") {
         (false, rest)
     } else {
-        bail!("not a sentinel URL: {url}");
+        bail!("not a sentinel URL: {}", crate::redact::url(url));
     };
-    let (authority, master_name) = rest
-        .split_once('/')
-        .with_context(|| format!("sentinel URL missing master name: {url}"))?;
+    let (authority, master_name) = rest.split_once('/').with_context(|| {
+        format!(
+            "sentinel URL missing master name: {}",
+            crate::redact::url(url)
+        )
+    })?;
     if master_name.is_empty() {
-        bail!("sentinel URL missing master name: {url}");
+        bail!(
+            "sentinel URL missing master name: {}",
+            crate::redact::url(url)
+        );
     }
     // Credentials are the composition-generated alphanumeric auth token;
     // no percent-decoding needed.
@@ -111,7 +117,7 @@ fn parse_sentinel_url(url: &str) -> Result<SentinelUrl> {
         .split(',')
         .map(|pair| {
             if pair.is_empty() {
-                bail!("sentinel URL has empty host: {url}");
+                bail!("sentinel URL has empty host: {}", crate::redact::url(url));
             }
             Ok(if pair.contains(':') {
                 pair.to_string()
@@ -243,6 +249,24 @@ mod tests {
     use std::time::Instant;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    /// A malformed Sentinel URL is reported without its password.
+    #[test]
+    fn sentinel_url_errors_do_not_echo_the_password() {
+        for url in [
+            "redis://:s3cret@h1:26379/master",
+            "redis+sentinel://:s3cret@h1:26379",
+            "redis+sentinel://:s3cret@h1:26379/",
+            "redis+sentinel://:s3cret@,h2/master",
+        ] {
+            let error = parse_sentinel_url(url)
+                .err()
+                .unwrap_or_else(|| panic!("{url} must be refused"));
+            let text = format!("{error:#}");
+            assert!(!text.contains("s3cret"), "{text}");
+            assert!(text.contains("***"), "{text}");
+        }
+    }
 
     /// A peer that accepts and then says nothing, like a Redis whose packets
     /// are dropped after the handshake: connecting must fail at the timeout

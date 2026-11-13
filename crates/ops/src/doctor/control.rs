@@ -110,7 +110,7 @@ pub(crate) async fn checks(kind: Kind, config: Option<&Path>, ctx: &Ctx) -> Vec<
             out.push(
                 redis_stream(
                     &cfg.redis_url,
-                    &cfg.request_log_stream,
+                    &cfg.request_log_stream(),
                     cfg.request_log_max_stream_len,
                     ctx.timeout,
                 )

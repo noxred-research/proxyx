@@ -105,7 +105,7 @@ pub async fn build_report(config_path: Option<&str>, args: &DoctorArgs) -> Repor
         BrokerKind::RedisStream => report.push(
             redis_stream(
                 &config.redis_url,
-                &config.request_log.stream_name,
+                &config.request_log_stream(),
                 config.request_log.max_stream_len,
                 args.timeout,
             )

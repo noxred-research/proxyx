@@ -99,7 +99,7 @@ pub(crate) const TUNNEL_TTL: Duration = Duration::from_secs(15);
 /// tunnel, so it sets Redis memory at open rate x this time.
 const SESSION_TTL: Duration = Duration::from_secs(600);
 const MAX_CACHED_UNITS: u64 = 50_000;
-const CREDENTIALS_TTL: Duration = Duration::from_secs(60);
+const STANDALONE_TTL: Duration = Duration::from_secs(60);
 
 fn cache<V: Clone + Send + Sync + 'static>(ttl: Duration) -> Cache<String, V> {
     Cache::builder()
@@ -243,7 +243,7 @@ impl Gateway {
             pacing,
             rotating_checks: cache(ROTATING_RECHECK),
             static_checks: cache(STATIC_RECHECK),
-            credentials: cache(CREDENTIALS_TTL),
+            credentials: cache(STANDALONE_TTL),
         })
     }
 

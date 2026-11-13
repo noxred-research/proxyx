@@ -180,6 +180,10 @@ pub struct RabbitMqConfig {
     pub tls: Option<TlsConfig>,
 }
 
+impl crate::config::PartialSection for RabbitMqConfig {
+    const STANDALONE: &'static [&'static str] = &["username", "password"];
+}
+
 impl RabbitMqConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {

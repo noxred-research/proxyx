@@ -591,17 +591,23 @@ fn push_cursor_binds(binds: &mut Vec<String>, ts: OffsetDateTime, session_offset
 ///
 /// Always targets the base `http_captures` table (full row fidelity,
 /// bodies included). No cursor applied — exports the full filtered set.
+///
+/// `id` is selected as its canonical text (`toString(id) AS id`): ClickHouse
+/// 25.8 cannot write a `UUID` column to Parquet (`Code: 50 ... Internal type
+/// 'UUID' ... is not supported for conversion into Parquet data format`),
+/// and the string is the same on every server version. The filter runs in a
+/// subquery because the alias `id` would otherwise shadow the column in the
+/// `WHERE` clause (`Code: 386 ... no supertype`).
 pub(crate) fn build_export_select(query: &TrafficQuery, table: &str) -> (String, Vec<String>) {
     let (where_clause, binds) = build_where(query, &CursorBoundaries::default());
     let sql = format!(
-        "SELECT id, org_id, timestamp, session_offset, \
+        "SELECT toString(id) AS id, org_id, timestamp, session_offset, \
                 method, path, host, scheme, session_id, proxy_id, \
                 request_headers, request_body, request_size, \
                 status_code, response_headers, response_body, response_size, \
                 duration_ms, ratelimit_wait_ms, source, source_id, \
                 correlation_id, parent_correlation_id, account_id, tool_call_id, inserted_at \
-         FROM {table} \
-         WHERE {where_clause}",
+         FROM (SELECT * FROM {table} WHERE {where_clause})",
     );
     (sql, binds)
 }
@@ -931,6 +937,33 @@ mod tests {
 
     fn lower(query: &TrafficQuery) -> (String, Vec<String>) {
         build_where(query, &CursorBoundaries::default())
+    }
+
+    /// The export writes `id` as text (ClickHouse 25.8 cannot write a UUID to
+    /// Parquet) and filters before the alias exists.
+    #[test]
+    fn export_select_writes_id_as_text_and_filters_in_a_subquery() {
+        let q = TrafficQuery {
+            org_id: Some("org-1".into()),
+            branches: NonEmpty(vec![QueryBranch::default()]),
+            cursor: None,
+            end_cursor: None,
+            limit: None,
+            order: SortOrder::Asc,
+            order_by: SortField::Timestamp,
+            request_body_max_fetch_size: None,
+            response_body_max_fetch_size: None,
+        };
+        let (sql, binds) = build_export_select(&q, "http_captures");
+        assert!(
+            sql.starts_with("SELECT toString(id) AS id, org_id,"),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with("FROM (SELECT * FROM http_captures WHERE org_id = ?)"),
+            "{sql}"
+        );
+        assert_eq!(binds, vec!["org-1"]);
     }
 
     #[test]

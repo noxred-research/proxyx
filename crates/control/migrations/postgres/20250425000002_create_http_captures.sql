@@ -1,8 +1,17 @@
 -- Range-partitioned http_captures table.
 -- Matches the backend's final schema after reindex + compression migrations.
 -- Partition management is handled by pg_partman (configured separately).
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+--
+-- CHECKSUM NOTE: this file was rewritten after release 0.1.0 to stop creating
+-- the pg_trgm extension and the two trigram indexes. The extension exists once
+-- per database, so a shared database can keep it in any schema, and the
+-- indexes failed to build when it was not on the search path
+-- (`operator class "gin_trgm_ops" does not exist`). The table is dropped by
+-- 20260701000001 and nothing ever queried the indexes. Databases that applied
+-- the old text keep their checksum row repaired by `Pool::migrate` (the old
+-- checksum is pinned in `migrators!(rewritten = ...)` in crates/control/src/db);
+-- any other checksum still fails with VersionMismatch. The extension, where
+-- ProxyX created it, is left in place: it may be used by neighbours.
 
 CREATE TABLE IF NOT EXISTS http_captures (
     id                  UUID NOT NULL,
@@ -50,11 +59,3 @@ CREATE INDEX ix_http_captures_sid_seq
 -- Unscoped: time-sorted browsing with no filters.
 CREATE INDEX ix_http_captures_ts
     ON http_captures (timestamp DESC);
-
--- Substring search on request path (ILIKE '%/api/v2%').
-CREATE INDEX ix_http_captures_path_trgm
-    ON http_captures USING gin (path gin_trgm_ops);
-
--- Substring search on host/subdomain (ILIKE '%staging.example%').
-CREATE INDEX ix_http_captures_host_trgm
-    ON http_captures USING gin (host gin_trgm_ops);
