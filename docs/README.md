@@ -28,6 +28,7 @@ Start with the [README](../README.md) for what ProxyX is and a quick start, then
 
 | Page | Contents |
 |---|---|
+| [backends.md](backends.md) | Support matrix of every backend family (relational, object store, Redis and Valkey, ClickHouse, OpenSearch and Elasticsearch, Kafka and RabbitMQ), why each exists and how to share instances |
 | [databases.md](databases.md) | PostgreSQL, MariaDB and SQLite: URLs, choosing a backend, migrations, differences and limits |
 | [operations.md](operations.md) | Deploy order, migrations, health and readiness, drain, scaling, backups, rotation |
 | [doctor.md](doctor.md) | `proxyx doctor` (role self-check: configuration, dependencies, CA, secrets, ports) and `proxyx assess pool` (pool health findings): usage, check tables, thresholds, exit codes, JSON |

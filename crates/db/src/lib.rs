@@ -25,7 +25,7 @@ pub mod sql;
 pub mod testing;
 mod types;
 
-pub use backend::{Backend, UnsupportedScheme};
+pub use backend::{Backend, UnsupportedScheme, url_with_schema};
 pub use migrate::Migrators;
 pub use pool::{Pool, PoolSettings};
 pub use types::Ts;

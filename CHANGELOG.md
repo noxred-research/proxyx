@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- **[Backends guide](docs/backends.md)**: a support matrix of every backend family ProxyX uses (relational, object store, Redis and Valkey, ClickHouse, OpenSearch and Elasticsearch, Kafka and RabbitMQ), the reason for each, and how to share one set of instances with other products.
+- `database_schema` (`PROXYX_POOL_DATABASE_SCHEMA`, `PROXYX_CONTROL_DATABASE_SCHEMA`): a PostgreSQL schema per plane, so several products or both ProxyX planes share one database with separate tables and migration history. `migrate` creates the schema. Refused for MariaDB and SQLite.
+- Object store profiles for traffic view exports: `traffic_views_s3_profile` (`standard`, `edge`, `self-hosted`, `compatible`), `traffic_views_s3_path_style`, `traffic_views_s3_credentials_file` and `traffic_views_prefix`, with combinations that cannot work refused at load time.
+- `[capture_store.opensearch].kind`: ProxyX detects OpenSearch or Elasticsearch and the version from `GET /` at migration and ingester start, refuses an unsupported version, and with `kind` set refuses the other engine.
+- `proxyx migrate control --target clickhouse` creates `clickhouse.database` when it is set, so each product on a shared ClickHouse gets its own database.
+- Integration tests against real services in throwaway containers (`ci/backends-up.sh`, the `backends` CI job): an S3-API store with ClickHouse, Redis and Valkey (prefix and ACL isolation), ClickHouse namespaces, OpenSearch and Elasticsearch, Kafka, RabbitMQ and shared PostgreSQL schemas.
 - **Passive capture analysis** in the MCP server (`[analysis]`, off by default; see [ai.md](docs/ai.md#passive-capture-analysis)): a scope-aware, evidence-bearing boundary shared by all analysis tools.
   - `open_analysis_scope`, `analysis_capabilities`, `get_analysis_result`, `delete_analysis_result`: server-held scope handles inside operator-listed sources and origins, intersected into every query branch and checked against every returned capture; keyed per-engagement fingerprints instead of credential values; evidence references with coverage, truncation and lag; bounded retention.
   - `analyze_auth_flows`: authentication mechanisms, cookie attributes, and issue, send, replace, clear and reuse edges; JWT structure is decoded without verification.
@@ -21,6 +27,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Traffic view export keys now start with `traffic_views_prefix` (`proxyx/` by default): new exports are `proxyx/traffic-views/<org>/<view>.parquet`. Exports finished before the upgrade keep the key stored on their row; an export still running during the upgrade is written again under the new key.
+- The benchmark harness no longer runs `FLUSHDB`: it refuses a Redis database that is not empty.
 - **`classify_block_page` no longer reports.** The `report` and `dry_run` arguments are removed: classification is a pure read that returns the arguments of a separate `report_block_signal` call. With `[analysis]` enabled, `report_block_signal` waits for an operator's approval unless `analysis.blocks.report_requires_approval = false`.
 - A model call has one absolute deadline: the `json_object` fallback attempt shares `llm.timeout_secs` with the first attempt, and all prompt fragments share one budget (`llm.max_input_chars`).
 

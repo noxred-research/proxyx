@@ -6,6 +6,10 @@ fn default_traffic_views_s3_region() -> String {
     "us-east-1".to_string()
 }
 
+fn default_traffic_views_prefix() -> String {
+    "proxyx/".to_string()
+}
+
 fn default_traffic_views_ttl_secs() -> u64 {
     86_400 // 24 h
 }
@@ -64,6 +68,22 @@ pub enum TrafficViewsBackend {
     /// Azure Blob Storage. ClickHouse writes via `azureBlobStorage()` using
     /// its own workload identity; downloads are user-delegation SAS URLs.
     Azure,
+}
+
+/// What kind of S3-API object store `traffic_views_s3_*` talks to. It decides
+/// which settings are required and refused, so a combination that cannot work
+/// fails at load time instead of at the first export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum S3Profile {
+    /// The original S3 service: no endpoint, bucket in the host name.
+    Standard,
+    /// An edge object store with an S3 API: endpoint required.
+    Edge,
+    /// A self-hosted store such as MinIO: endpoint required.
+    SelfHosted,
+    /// Any other S3-API store: endpoint required.
+    Compatible,
 }
 
 /// How control-plane API callers authenticate; see [`ControlConfig::auth_mode`].
@@ -201,6 +221,13 @@ pub struct ControlConfig {
     /// PostgreSQL connection URL for org data and migrations.
     #[serde(default)]
     pub database_url: String,
+
+    /// PostgreSQL schema that holds the control plane's tables and migration
+    /// history, so several products can share one database. Unset keeps the
+    /// connection's default schema. Created by `proxyx migrate control`.
+    /// PostgreSQL only. Env: `PROXYX_CONTROL_DATABASE_SCHEMA`.
+    #[serde(default)]
+    pub database_schema: Option<String>,
 
     /// API server bind address
     #[serde(default = "default_api_addr")]
@@ -360,6 +387,37 @@ pub struct ControlConfig {
     #[serde(default)]
     pub traffic_views_s3_endpoint: Option<String>,
 
+    /// Kind of S3-API store: `standard` (the original service), `edge`,
+    /// `self-hosted` (MinIO) or `compatible`. Unset: `standard` without an
+    /// endpoint, `compatible` with one. Every profile except `standard`
+    /// needs `traffic_views_s3_endpoint`.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_PROFILE`.
+    #[serde(default)]
+    pub traffic_views_s3_profile: Option<S3Profile>,
+
+    /// Address the bucket in the URL path (`endpoint/bucket/key`, true) or in
+    /// the host (`bucket.endpoint/key`, false). Unset: path style for every
+    /// profile with an endpoint. `standard` always uses the host.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_PATH_STYLE`.
+    #[serde(default)]
+    pub traffic_views_s3_path_style: Option<bool>,
+
+    /// File with the store's credentials as `access_key_id = ...`,
+    /// `secret_access_key = ...` and optionally `session_token = ...` lines.
+    /// Unset: the AWS environment and profile chain. Never put keys in the
+    /// configuration itself.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_CREDENTIALS_FILE`.
+    #[serde(default)]
+    pub traffic_views_s3_credentials_file: Option<PathBuf>,
+
+    /// Key prefix of every export object (empty, or ending in `/`), so
+    /// products can share one bucket. Exports are written to
+    /// `<prefix>traffic-views/<org>/<view>.parquet`. Jobs that finished
+    /// earlier keep the key stored on their row.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_PREFIX`.
+    #[serde(default = "default_traffic_views_prefix")]
+    pub traffic_views_prefix: String,
+
     // ── Parquet export query settings ─────────────────────────────────────
     // These control ClickHouse memory usage during INSERT INTO s3() exports.
     // Defaults are tuned for tables with wide body columns (multi-MB rows).
@@ -450,7 +508,91 @@ impl ControlConfig {
     }
 
     pub fn load(config_path: Option<&str>) -> anyhow::Result<Self> {
-        common::config::load("control", config_path)
+        let mut config: Self = common::config::load("control", config_path)?;
+        config.apply_database_schema()?;
+        config.validate_traffic_views()?;
+        Ok(config)
+    }
+
+    /// The effective S3 profile of the traffic view exports.
+    pub fn traffic_views_s3_profile(&self) -> S3Profile {
+        self.traffic_views_s3_profile
+            .unwrap_or(if self.traffic_views_s3_endpoint.is_some() {
+                S3Profile::Compatible
+            } else {
+                S3Profile::Standard
+            })
+    }
+
+    /// Whether export objects are addressed with the bucket in the path.
+    pub fn traffic_views_path_style(&self) -> bool {
+        self.traffic_views_s3_profile() != S3Profile::Standard
+            && self.traffic_views_s3_path_style.unwrap_or(true)
+    }
+
+    /// Refuse traffic view settings that cannot work together, at load time.
+    pub fn validate_traffic_views(&self) -> anyhow::Result<()> {
+        let prefix = &self.traffic_views_prefix;
+        anyhow::ensure!(
+            prefix.is_empty() || (prefix.ends_with('/') && !prefix.starts_with('/')),
+            "traffic_views_prefix {prefix:?} must be empty or end with `/` and not start with it"
+        );
+        anyhow::ensure!(
+            prefix.len() <= 200
+                && !prefix.contains("//")
+                && !prefix
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '*' | '?' | '{' | '}' | '%' | '\\'))
+                && prefix
+                    .split('/')
+                    .all(|segment| segment != "." && segment != ".."),
+            "traffic_views_prefix {prefix:?} must be at most 200 characters with no control or glob characters, backslash, percent sign, empty segment or dot segment"
+        );
+        if self.traffic_views_backend != TrafficViewsBackend::S3 {
+            anyhow::ensure!(
+                self.traffic_views_s3_endpoint.is_none()
+                    && self.traffic_views_s3_profile.is_none()
+                    && self.traffic_views_s3_path_style.is_none()
+                    && self.traffic_views_s3_credentials_file.is_none(),
+                "traffic_views_s3_* settings apply to traffic_views_backend = \"s3\" only"
+            );
+            return Ok(());
+        }
+        let profile = self.traffic_views_s3_profile();
+        match profile {
+            S3Profile::Standard => {
+                anyhow::ensure!(
+                    self.traffic_views_s3_endpoint.is_none(),
+                    "traffic_views_s3_profile = \"standard\" is the original S3 service and takes no \
+                     traffic_views_s3_endpoint: use `edge`, `self-hosted` or `compatible`"
+                );
+                anyhow::ensure!(
+                    self.traffic_views_s3_path_style.is_none(),
+                    "traffic_views_s3_path_style does not apply to the `standard` profile, which always \
+                     addresses the bucket by host name"
+                );
+            }
+            _ => anyhow::ensure!(
+                self.traffic_views_s3_endpoint.is_some(),
+                "traffic_views_s3_profile = \"{}\" needs traffic_views_s3_endpoint",
+                match profile {
+                    S3Profile::Edge => "edge",
+                    S3Profile::SelfHosted => "self-hosted",
+                    _ => "compatible",
+                }
+            ),
+        }
+        Ok(())
+    }
+
+    /// Pin `database_url` to `database_schema` (PostgreSQL), or refuse the
+    /// combination at load time.
+    pub fn apply_database_schema(&mut self) -> anyhow::Result<()> {
+        if let Some(schema) = self.database_schema.as_deref() {
+            self.database_url = proxyx_db::url_with_schema(&self.database_url, schema)
+                .map_err(|reason| anyhow::anyhow!("database_schema: {reason}"))?;
+        }
+        Ok(())
     }
 }
 

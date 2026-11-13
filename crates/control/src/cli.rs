@@ -509,6 +509,7 @@ async fn migrate_stores(config: &ControlConfig, target: MigrateTarget, check: bo
     } else {
         match store_schema {
             Some(CaptureBackend::ClickHouse) => {
+                runtime::ensure_clickhouse_database(config.clickhouse_config()?).await?;
                 let ch = runtime::clickhouse_client(config.clickhouse_config()?);
                 migrations::run_clickhouse(&ch).await?;
             }

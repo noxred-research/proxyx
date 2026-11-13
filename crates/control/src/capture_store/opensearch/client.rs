@@ -12,7 +12,7 @@ use base64::Engine as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;
 
-use super::OpenSearchConfig;
+use super::{OpenSearchConfig, SearchKind};
 
 /// Status and parsed body of one response.
 pub(crate) struct OsResponse {
@@ -201,6 +201,25 @@ impl OsClient {
         self.send(reqwest::Method::POST, path, None, None).await
     }
 
+    /// Which engine and version answers, and whether ProxyX supports it.
+    /// Uses only `GET /`, which both engines answer the same way.
+    pub(crate) async fn detect(&self, expected: Option<SearchKind>) -> Result<Engine> {
+        let response = self.get("/").await?;
+        response.ensure_success("GET /")?;
+        let engine = Engine::from_info(&response.body)?;
+        if let Some(expected) = expected
+            && expected != engine.kind
+        {
+            bail!(
+                "capture_store.opensearch.kind is {} but the server at the URL is {} {}",
+                expected.as_str(),
+                engine.kind.as_str(),
+                engine.version
+            );
+        }
+        Ok(engine)
+    }
+
     /// Reachability and credentials: `GET /` must succeed.
     pub(crate) async fn ping(&self) -> Result<()> {
         let response = self.get("/").await?;
@@ -208,6 +227,86 @@ impl OsClient {
     }
 }
 
+/// The engine behind the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Engine {
+    pub kind: SearchKind,
+    /// `2.19.1`, `8.15.3`.
+    pub version: String,
+}
+
+impl Engine {
+    /// Read the body of `GET /`: OpenSearch names itself in
+    /// `version.distribution`, Elasticsearch does not. Supported are
+    /// OpenSearch 2 and later and Elasticsearch 8 and later.
+    pub(crate) fn from_info(info: &Value) -> Result<Self> {
+        let version = info["version"]["number"].as_str().context(
+            "GET / answered without a version.number: this is not OpenSearch or Elasticsearch",
+        )?;
+        let major: u32 = version
+            .split('.')
+            .next()
+            .and_then(|major| major.parse().ok())
+            .with_context(|| format!("unreadable server version {version:?}"))?;
+        let kind = match info["version"]["distribution"].as_str() {
+            Some("opensearch") => SearchKind::OpenSearch,
+            None if info["tagline"]
+                .as_str()
+                .is_some_and(|t| t.contains("for Search")) =>
+            {
+                SearchKind::Elasticsearch
+            }
+            other => bail!("unrecognized search engine (distribution {other:?})"),
+        };
+        let supported = match kind {
+            SearchKind::OpenSearch => major >= 2,
+            SearchKind::Elasticsearch => major >= 8,
+        };
+        if !supported {
+            bail!(
+                "{} {version} is not supported: use OpenSearch 2 or later, or Elasticsearch 8 or later",
+                kind.as_str()
+            );
+        }
+        Ok(Self {
+            kind,
+            version: version.to_owned(),
+        })
+    }
+}
+
 fn path_without_query(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_engine_and_its_version_are_read_from_the_root_document() {
+        let opensearch = json!({"version": {"distribution": "opensearch", "number": "2.19.1"}, "tagline": "The OpenSearch Project: https://opensearch.org/"});
+        let elastic = json!({"version": {"number": "8.15.3"}, "tagline": "You Know, for Search"});
+        assert_eq!(
+            Engine::from_info(&opensearch).unwrap(),
+            Engine {
+                kind: SearchKind::OpenSearch,
+                version: "2.19.1".into()
+            }
+        );
+        assert_eq!(
+            Engine::from_info(&elastic).unwrap().kind,
+            SearchKind::Elasticsearch
+        );
+        for bad in [
+            json!({"version": {"distribution": "opensearch", "number": "1.3.0"}}),
+            json!({"version": {"number": "7.17.0"}, "tagline": "You Know, for Search"}),
+            json!({"version": {"number": "8.0.0"}}),
+            json!({"hello": "world"}),
+            json!({"version": {"distribution": "other", "number": "9.0.0"}}),
+        ] {
+            assert!(Engine::from_info(&bad).is_err(), "{bad}");
+        }
+    }
 }

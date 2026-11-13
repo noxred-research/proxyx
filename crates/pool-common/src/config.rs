@@ -55,6 +55,12 @@ pub struct Settings {
     /// `mariadb://` (MariaDB 10.6+), `sqlite://PATH?mode=rwc` (one node only,
     /// see `docs/databases.md`). Env: `PROXYX_POOL_DATABASE_URL`.
     pub database_url: Secret,
+    /// PostgreSQL schema that holds ProxyX's tables and migration history, so
+    /// several products can share one database. Unset keeps the connection's
+    /// default schema (`public`). Created by `proxyx migrate pool`. PostgreSQL
+    /// only: MariaDB takes its database from the URL, SQLite is one file per
+    /// product. Env: `PROXYX_POOL_DATABASE_SCHEMA`.
+    pub database_schema: Option<String>,
     /// Private ProxyX Redis URL (hot state: leases, ready sets, cooldowns).
     /// Env: `PROXYX_POOL_REDIS_URL`.
     pub redis_url: Secret,
@@ -198,6 +204,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             database_url: Secret::new("postgres://proxyx@localhost/proxyx"),
+            database_schema: None,
             redis_url: Secret::new("redis://localhost:6379"),
             connect_listen: ([0, 0, 0, 0], 8080).into(),
             socks_listen: ([0, 0, 0, 0], 1080).into(),
@@ -253,11 +260,23 @@ impl Settings {
         for path in default.into_iter().chain(explicit) {
             reject_unknown_keys(path)?;
         }
-        let settings: Self = layered(default_file, explicit)
+        let mut settings: Self = layered(default_file, explicit)
             .extract()
             .context("failed to load configuration")?;
+        settings.apply_database_schema()?;
         settings.validate()?;
         Ok(settings)
+    }
+
+    /// Pin the database URL to `database_schema` (PostgreSQL), or refuse the
+    /// combination at load time.
+    fn apply_database_schema(&mut self) -> anyhow::Result<()> {
+        if let Some(schema) = self.database_schema.as_deref() {
+            let url = proxyx_db::url_with_schema(self.database_url.expose(), schema)
+                .map_err(|reason| anyhow::anyhow!("database_schema: {reason}"))?;
+            self.database_url = Secret::new(url);
+        }
+        Ok(())
     }
 
     /// Fail at startup on values that would otherwise surface at first use.

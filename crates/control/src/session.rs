@@ -927,4 +927,104 @@ mod tests {
             }
         }
     }
+
+    /// Two prefixes in one Redis instance are two namespaces, and an ACL user
+    /// limited to one prefix can neither read nor write the other. Needs
+    /// `PROXYX_TEST_REDIS_URL` (Valkey or Redis); skips without it.
+    #[tokio::test]
+    async fn key_prefixes_separate_products_on_one_redis_and_an_acl_can_fence_them() {
+        let Ok(base) = std::env::var("PROXYX_TEST_REDIS_URL") else {
+            eprintln!("SKIP: PROXYX_TEST_REDIS_URL is not set");
+            return;
+        };
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let (a, b) = (format!("pxa{suffix}"), format!("pxb{suffix}"));
+        let (_client, mut redis) = common::redis_connect::connect(&base).await.unwrap();
+
+        replicate_ratelimit(&mut redis, "acme", 50, 600, &a)
+            .await
+            .unwrap();
+        let mine = read_ratelimit_state(&mut redis, "acme", &a).await.unwrap();
+        assert!(mine.exists && (mine.burst, mine.rpm) == (50, 600));
+        let theirs = read_ratelimit_state(&mut redis, "acme", &b).await.unwrap();
+        assert!(
+            !theirs.exists,
+            "another prefix does not see the org's limits"
+        );
+
+        // every key the product wrote lives under its prefix, found with SCAN
+        let mut cursor = 0_u64;
+        let mut found = Vec::new();
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(format!("{a}:*"))
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut redis)
+                .await
+                .unwrap();
+            found.extend(keys);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(found, vec![format!("{a}:ratelimit:acme:config")]);
+
+        // an ACL user confined to prefix `a` works inside it and is refused outside it
+        let user = format!("pxu{suffix}");
+        redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg("on")
+            .arg(">acl-test-password")
+            .arg(format!("~{a}:*"))
+            .arg("+@all")
+            .arg("-@dangerous")
+            .query_async::<()>(&mut redis)
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse(&base).unwrap();
+        let mut fenced = url.clone();
+        fenced.set_username(&user).unwrap();
+        fenced.set_password(Some("acl-test-password")).unwrap();
+        let (_c, mut limited) = common::redis_connect::connect(fenced.as_str())
+            .await
+            .unwrap();
+        replicate_ratelimit(&mut limited, "beta", 7, 70, &a)
+            .await
+            .unwrap();
+        assert!(
+            read_ratelimit_state(&mut limited, "beta", &a)
+                .await
+                .unwrap()
+                .exists
+        );
+        assert!(
+            replicate_ratelimit(&mut limited, "beta", 7, 70, &b)
+                .await
+                .is_err()
+        );
+        assert!(
+            read_ratelimit_state(&mut limited, "acme", &b)
+                .await
+                .is_err()
+        );
+
+        for org in ["acme", "beta"] {
+            redis::cmd("DEL")
+                .arg(format!("{a}:ratelimit:{org}:config"))
+                .query_async::<()>(&mut redis)
+                .await
+                .unwrap();
+        }
+        redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query_async::<()>(&mut redis)
+            .await
+            .unwrap();
+    }
 }

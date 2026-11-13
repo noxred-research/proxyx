@@ -71,11 +71,11 @@ pub(crate) fn compute_view_id(org_id: &str, branches: &[QueryBranch]) -> Uuid {
 /// collapse), `%` (the escape character) and an org id made only of dots are
 /// written as `%XX` in the key itself. The key is then an ordinary literal
 /// name for ClickHouse, the SDK and CloudFront alike, and distinct org ids
-/// keep distinct prefixes. Org ids without these characters keep the key they
-/// always had.
-pub(crate) fn s3_key(org_id: &str, view_id: Uuid) -> String {
+/// keep distinct prefixes. `prefix` (`traffic_views_prefix`, empty or ending in
+/// `/`) namespaces the objects when products share a bucket.
+pub(crate) fn s3_key(prefix: &str, org_id: &str, view_id: Uuid) -> String {
     let dots_only = org_id.bytes().all(|byte| byte == b'.');
-    let mut key = String::from("traffic-views/");
+    let mut key = format!("{prefix}traffic-views/");
     for character in org_id.chars() {
         if dots_only
             || character.is_control()
@@ -170,7 +170,7 @@ pub(crate) async fn create_view(
     query: TrafficQuery,
 ) -> Result<ViewJobResult> {
     let view_id = compute_view_id(org_id, &query.branches.0);
-    let key = s3_key(org_id, view_id);
+    let key = s3_key(store.prefix(), org_id, view_id);
 
     // Upsert: insert or reclaim failed rows. The row keeps the attempt id of
     // a job in progress; the new id only lands on a created or reclaimed row.
@@ -362,7 +362,7 @@ pub(crate) async fn poll_view_status(
 
     // Query not in system.processes — check query_log for outcome.
     let outcome = exporter.outcome(qid).await?;
-    let key = s3_key(org_id, view_id);
+    let key = s3_key(store.prefix(), org_id, view_id);
 
     match outcome {
         Some(ExportOutcome::Finished) => {
@@ -522,39 +522,52 @@ mod tests {
     }
 
     #[test]
+    fn export_keys_carry_the_namespace_prefix() {
+        let view = uuid::uuid!("00000000-0000-5000-8000-000000000001");
+        assert_eq!(
+            s3_key("proxyx/", "acme", view),
+            format!("proxyx/traffic-views/acme/{view}.parquet")
+        );
+        assert_eq!(
+            s3_key("", "acme", view),
+            format!("traffic-views/acme/{view}.parquet")
+        );
+    }
+
+    #[test]
     fn export_key_keeps_ordinary_org_ids_and_escapes_unsafe_characters() {
         let view = uuid::uuid!("00000000-0000-5000-8000-000000000001");
         assert_eq!(
-            s3_key("acme-1.example_org:x@y é", view),
+            s3_key("", "acme-1.example_org:x@y é", view),
             format!("traffic-views/acme-1.example_org:x@y é/{view}.parquet")
         );
         assert_eq!(
-            s3_key("e2ectl' *?#\"org", view),
+            s3_key("", "e2ectl' *?#\"org", view),
             format!("traffic-views/e2ectl' %2A%3F#\"org/{view}.parquet")
         );
         assert_eq!(
-            s3_key("a{1,2}%2A", view),
+            s3_key("", "a{1,2}%2A", view),
             format!("traffic-views/a%7B1,2%7D%252A/{view}.parquet")
         );
         assert_eq!(
-            s3_key("x/.././/y/", view),
+            s3_key("", "x/.././/y/", view),
             format!("traffic-views/x%2F..%2F.%2F%2Fy%2F/{view}.parquet")
         );
         assert_eq!(
-            s3_key("..", view),
+            s3_key("", "..", view),
             format!("traffic-views/%2E%2E/{view}.parquet")
         );
         for org in ["*", "%2A", "a*", "a%2A", "{", "?", "..", ".", "a//b", "/a/"] {
-            let key = s3_key(org, view);
+            let key = s3_key("", org, view);
             let prefix = key.strip_prefix("traffic-views/").unwrap();
             assert!(
                 !prefix.contains(['*', '?', '{', '}']) && prefix.matches('/').count() == 1,
                 "{org:?} -> {key}"
             );
         }
-        assert_ne!(s3_key("*", view), s3_key("%2A", view));
+        assert_ne!(s3_key("", "*", view), s3_key("", "%2A", view));
         assert_eq!(
-            s3_key("a\tb\nc\u{7f}", view),
+            s3_key("", "a\tb\nc\u{7f}", view),
             format!("traffic-views/a%09b%0Ac%7F/{view}.parquet")
         );
     }
