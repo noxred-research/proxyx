@@ -207,8 +207,11 @@ jobs:
           POSTGRES_PASSWORD: proxyx
           POSTGRES_DB: proxyx_test
         ports: ["5432:5432"]
+        # Database files in tmpfs: test data is disposable, and per-commit fsyncs
+        # on the shared runner disk otherwise dominate the run time.
         options: >-
           --health-cmd "pg_isready -U proxyx" --health-interval 5s --health-timeout 5s --health-retries 10
+          --tmpfs /var/lib/postgresql:rw,size=4g
     env:
       PROXYX_TEST_DATABASE_URL: postgres://proxyx:proxyx@127.0.0.1:5432/proxyx_test
       PROXYX_TEST_REDIS_URL: redis://127.0.0.1:6379
