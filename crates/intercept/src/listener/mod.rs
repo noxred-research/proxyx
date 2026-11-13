@@ -202,7 +202,7 @@ mod routing_tests {
             assert_eq!(http.decision.insecure_upstream_tls, insecure_upstream_tls);
             let socks = ctx
                 .state
-                .authenticate_socks_and_route(session_id, LOGICAL_HOST, LOGICAL_PORT)
+                .authenticate_socks_and_route(session_id, None, LOGICAL_HOST, LOGICAL_PORT)
                 .await
                 .unwrap();
             assert_eq!(socks.decision.insecure_upstream_tls, insecure_upstream_tls);
@@ -350,6 +350,17 @@ mod routing_tests {
     }
 
     async fn forward_client(ctx: Arc<ProxyContext>, session_id: Uuid, logical_port: u16) -> String {
+        forward_client_as(ctx, &session_id.to_string(), logical_port, "").await
+    }
+
+    /// Like `forward_client`, with an explicit proxy username and extra request headers
+    /// (each line ending in CRLF).
+    async fn forward_client_as(
+        ctx: Arc<ProxyContext>,
+        username: &str,
+        logical_port: u16,
+        extra_headers: &str,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -357,11 +368,11 @@ mod routing_tests {
             connect::handle_client(stream, peer, ctx).await.unwrap();
         });
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{session_id}:x"));
+        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{username}:x"));
         stream
             .write_all(
                 format!(
-                    "GET http://{LOGICAL_HOST}:{logical_port}/doc HTTP/1.1\r\nHost: {LOGICAL_HOST}\r\nProxy-Authorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+                    "GET http://{LOGICAL_HOST}:{logical_port}/doc HTTP/1.1\r\nHost: {LOGICAL_HOST}\r\nProxy-Authorization: Basic {auth}\r\n{extra_headers}Connection: close\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -510,6 +521,140 @@ target",
         assert_eq!(capture.host, LOGICAL_HOST);
         assert_eq!(capture.port, 80);
         upstream.await.unwrap();
+        let _ = std::fs::remove_dir_all(ca_dir);
+    }
+
+    /// Serve one plaintext exchange for the sticky-key tests and return the private upstream URL.
+    async fn plain_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_headers(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    #[tokio::test]
+    async fn a_sticky_key_in_the_username_tags_the_capture_and_replaces_a_client_forged_header() {
+        let (destination, upstream) = plain_upstream().await;
+        let session_id = Uuid::new_v4();
+        let session = local_session(
+            session_id,
+            parse_upstream_override(&format!("{LOGICAL_HOST}:80"), &destination).unwrap(),
+        );
+        let (ctx, mut captures, ca_dir) = test_context(vec![session]).await;
+
+        let response = forward_client_as(
+            ctx,
+            &format!("{session_id}-sid-Browser_Sess-7"),
+            80,
+            &format!("{}: forged\r\n", common::sticky::HEADER),
+        )
+        .await;
+        assert!(response.contains("ok"), "{response}");
+        let capture = captured_request(&mut captures).await;
+        let tagged: Vec<_> = capture
+            .request_headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(common::sticky::HEADER))
+            .map(|h| h.value.as_str())
+            .collect();
+        assert_eq!(tagged, ["Browser_Sess-7"]);
+        upstream.await.unwrap();
+        let _ = std::fs::remove_dir_all(ca_dir);
+    }
+
+    #[tokio::test]
+    async fn a_client_sent_sticky_header_is_not_captured_without_a_credential_key() {
+        let (destination, upstream) = plain_upstream().await;
+        let session_id = Uuid::new_v4();
+        let session = local_session(
+            session_id,
+            parse_upstream_override(&format!("{LOGICAL_HOST}:80"), &destination).unwrap(),
+        );
+        let (ctx, mut captures, ca_dir) = test_context(vec![session]).await;
+
+        let response = forward_client_as(
+            ctx,
+            &session_id.to_string(),
+            80,
+            &format!("{}: forged\r\n", common::sticky::HEADER),
+        )
+        .await;
+        assert!(response.contains("ok"), "{response}");
+        let capture = captured_request(&mut captures).await;
+        assert!(
+            !capture
+                .request_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(common::sticky::HEADER))
+        );
+        upstream.await.unwrap();
+        let _ = std::fs::remove_dir_all(ca_dir);
+    }
+
+    #[tokio::test]
+    async fn the_sticky_key_grants_no_authority_and_a_bad_key_is_refused() {
+        let session_id = Uuid::new_v4();
+        let route =
+            parse_upstream_override("lab.example.test:443", "http://127.0.0.1:8000").unwrap();
+        let (ctx, _captures, ca_dir) = test_context(vec![local_session(session_id, route)]).await;
+        let basic = |username: String| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:x"))
+            )
+        };
+
+        let bare = ctx
+            .state
+            .authenticate_and_route(
+                Some(&basic(session_id.to_string())),
+                LOGICAL_HOST,
+                LOGICAL_PORT,
+            )
+            .await
+            .unwrap();
+        let keyed = ctx
+            .state
+            .authenticate_and_route(
+                Some(&basic(format!("{session_id}-sid-k1"))),
+                LOGICAL_HOST,
+                LOGICAL_PORT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(keyed.session_id, bare.session_id);
+        assert_eq!(keyed.decision.org_id, bare.decision.org_id);
+        assert_eq!(keyed.decision.mitm, bare.decision.mitm);
+        assert_eq!(keyed.decision.sticky_key.as_deref(), Some("k1"));
+        assert_eq!(bare.decision.sticky_key, None);
+        let socks = ctx
+            .state
+            .authenticate_socks_and_route(session_id, Some("k2".into()), LOGICAL_HOST, LOGICAL_PORT)
+            .await
+            .unwrap();
+        assert_eq!(socks.decision.sticky_key.as_deref(), Some("k2"));
+
+        for bad in [
+            format!("{session_id}-sid-"),
+            format!("{session_id}-sid-a b"),
+            format!("{session_id}-sid-{}", "k".repeat(65)),
+            format!("{}-sid-k1", Uuid::new_v4()),
+        ] {
+            assert!(
+                ctx.state
+                    .authenticate_and_route(Some(&basic(bad.clone())), LOGICAL_HOST, LOGICAL_PORT)
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
+        }
         let _ = std::fs::remove_dir_all(ca_dir);
     }
 

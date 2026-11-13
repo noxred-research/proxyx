@@ -118,6 +118,39 @@ pub fn analysis_capabilities(ctx: &Ctx) -> ToolResult {
     }))
 }
 
+/// `correlation_ids` of `open_analysis_scope`: opaque client keys (the sticky-key charset and
+/// length), sorted and deduplicated. They only narrow a scope.
+fn correlation_ids_of(args: &Args) -> Result<Vec<String>, ToolError> {
+    let Some(list) = args.get("correlation_ids") else {
+        return Ok(Vec::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or_else(|| ToolError::invalid("`correlation_ids` must be a list of strings"))?;
+    if list.len() > 32 {
+        return Err(ToolError::invalid(
+            "`correlation_ids` takes at most 32 values",
+        ));
+    }
+    let mut out = Vec::new();
+    for value in list {
+        let key = value.as_str().unwrap_or("");
+        let valid = (1..=64).contains(&key.len())
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid {
+            return Err(ToolError::invalid(
+                "each correlation id must be 1 to 64 characters of [A-Za-z0-9_-]",
+            ));
+        }
+        out.push(key.to_owned());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 pub fn open_analysis_scope(ctx: &Ctx, args: &Args) -> ToolResult {
     analysis::ensure_enabled(ctx, None)?;
     ctx.gate.check_engagement()?;
@@ -169,6 +202,7 @@ pub fn open_analysis_scope(ctx: &Ctx, args: &Args) -> ToolResult {
         }
         _ => allowed,
     };
+    let correlation_ids = correlation_ids_of(args)?;
     let mut ttl = i64::try_from(config.retention_secs).unwrap_or(i64::MAX);
     if let Some(asked) = args.u64("ttl_secs") {
         ttl = ttl.min(i64::try_from(asked).unwrap_or(i64::MAX));
@@ -189,6 +223,7 @@ pub fn open_analysis_scope(ctx: &Ctx, args: &Args) -> ToolResult {
     let engagement = ctx.cfg.scope.engagement.clone();
     let digest = analysis::digest_of(&json!({
         "org": org, "engagement": engagement, "sources": source_ids, "origins": origin_text,
+        "correlation_ids": correlation_ids,
     }));
     let scope = Scope {
         id: format!("scope_{}", uuid::Uuid::new_v4().simple()),
@@ -196,6 +231,7 @@ pub fn open_analysis_scope(ctx: &Ctx, args: &Args) -> ToolResult {
         engagement,
         source_ids,
         origins,
+        correlation_ids,
         expires_at,
         digest,
     };

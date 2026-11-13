@@ -484,6 +484,9 @@ pub fn capture(id: &str, status: u64, host: &str, body: &str) -> Value {
 
 pub struct ControlState {
     pub captures: Vec<Value>,
+    /// WebSocket messages served by search and by conversation reads; `None` keeps the one
+    /// fixed message the conversation route answers with and an empty search.
+    pub ws: Option<Vec<Value>>,
     pub sessions_created: u32,
     /// Answer `400` to a search that carries a cursor, like a store that lost the position.
     pub reject_cursors: bool,
@@ -537,6 +540,7 @@ pub async fn fake_control() -> (Fake, Control) {
                 &format!("<html>Just a moment... {}</html>", "x".repeat(6000)),
             ),
         ],
+        ws: None,
         sessions_created: 0,
         reject_cursors: false,
     }));
@@ -552,11 +556,24 @@ pub async fn fake_control() -> (Fake, Control) {
         .route("/rpc/ws/count", post(ctl_count))
         .route("/rpc/sequence", get(ctl_sequence))
         .route("/rpc/orgs/{org}/requests/{id}", get(ctl_capture))
-        .route("/rpc/ws/search", post(|| async { Json(json!({"items": [], "next_cursor": null})) }))
+        .route(
+            "/rpc/ws/search",
+            post(|State(s): State<Control>| async move {
+                let items = s.lock().expect("control").ws.clone().unwrap_or_default();
+                Json(json!({"items": items, "next_cursor": null}))
+            }),
+        )
         .route(
             "/rpc/orgs/{org}/captures/{parent}/ws-messages",
-            get(|| async {
-                Json(json!({"items": [{"id": "m1", "direction": "c2s", "payload": "hello", "session_id": SESSION_ID}], "next_cursor": null}))
+            get(|State(s): State<Control>, AxPath((_org, parent)): AxPath<(String, String)>| async move {
+                let items = match s.lock().expect("control").ws.clone() {
+                    None => vec![json!({"id": "m1", "direction": "c2s", "payload": "hello", "session_id": SESSION_ID})],
+                    Some(all) => all
+                        .into_iter()
+                        .filter(|m| m["parent_event_id"] == parent.as_str())
+                        .collect(),
+                };
+                Json(json!({"items": items, "next_cursor": null}))
             }),
         )
         .route("/rpc/orgs/{org}", get(|AxPath(org): AxPath<String>| async move {

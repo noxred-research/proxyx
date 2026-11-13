@@ -213,6 +213,18 @@ pub async fn summarize_traffic(ctx: &Ctx, args: &Args, info: &CallInfo) -> ToolR
         Some(scope) => scope.org.clone(),
         None => ctx.org(args)?,
     };
+    // without a model the statistics stay inside the operator's ceiling instead
+    let scope = match scope {
+        Some(scope) => Some(scope),
+        None => {
+            let ceiling = analysis::ceiling(ctx, &org)?;
+            if let Some(ceiling) = &ceiling {
+                branches =
+                    ceiling.constrain(&branches, false, ctx.cfg.analysis.query.max_branches)?;
+            }
+            ceiling
+        }
+    };
     let sample = args.u64("sample").unwrap_or(500).clamp(1, 5000);
     let body = json!({"org_id": org, "branches": branches, "limit": sample, "order": "desc"});
     let reply = control

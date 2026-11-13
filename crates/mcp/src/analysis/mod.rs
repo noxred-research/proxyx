@@ -214,6 +214,10 @@ pub struct Scope {
     pub engagement: Option<String>,
     pub source_ids: Vec<String>,
     pub origins: Vec<OriginPattern>,
+    /// When not empty, only captures whose `correlation_id` is one of these. A client-chosen
+    /// label (for example the sticky key of a session proxy credential), so it narrows a scope
+    /// and never widens it.
+    pub correlation_ids: Vec<String>,
     /// Unix seconds.
     pub expires_at: i64,
     /// A hash of the scope's content, for evidence and drafts.
@@ -234,7 +238,12 @@ impl Scope {
             return false;
         }
         let scheme = item["scheme"].as_str();
+        let correlation_ok = self.correlation_ids.is_empty()
+            || item["correlation_id"]
+                .as_str()
+                .is_some_and(|id| self.correlation_ids.iter().any(|allowed| allowed == id));
         source_ok
+            && correlation_ok
             && self
                 .origins
                 .iter()
@@ -248,6 +257,7 @@ impl Scope {
             "org": self.org,
             "source_ids": self.source_ids,
             "origins": self.origins.iter().map(OriginPattern::render).collect::<Vec<_>>(),
+            "correlation_ids": self.correlation_ids,
             "expires_at": self.expires_at,
             "scope_digest": self.digest,
         })
@@ -264,6 +274,19 @@ impl Scope {
         ws: bool,
         max_branches: usize,
     ) -> Result<Value, ToolError> {
+        if ws && !self.correlation_ids.is_empty() {
+            return Err(ToolError::new(
+                FailKind::Refused,
+                "WebSocket messages carry no correlation id, so a scope limited to correlation_ids cannot read them",
+            ));
+        }
+        let correlation_filter = match self.correlation_ids.as_slice() {
+            [] => None,
+            [one] => Some(json!({"op": "exact", "value": one})),
+            many => Some(
+                json!({"op": "any", "filters": many.iter().map(|id| json!({"op": "exact", "value": id})).collect::<Vec<_>>()}),
+            ),
+        };
         let list = branches.as_array().cloned().unwrap_or_default();
         let origin_filter = match self.origins.as_slice() {
             [one] => one.host_filter(),
@@ -305,6 +328,13 @@ impl Scope {
                 None => origin_filter.clone(),
             };
             branch.insert("host".to_owned(), host);
+            if let Some(allowed) = &correlation_filter {
+                let correlation = match branch.remove("correlation_id") {
+                    Some(user) => json!({"op": "all", "filters": [user, allowed.clone()]}),
+                    None => allowed.clone(),
+                };
+                branch.insert("correlation_id".to_owned(), correlation);
+            }
             if ws {
                 // a WebSocket branch pins one source: one branch per allowed source
                 for source in sources {
@@ -789,6 +819,46 @@ pub fn resolve_scope(ctx: &Ctx, scope_id: &str) -> Result<Scope, ToolError> {
     ctx.gate.check_engagement()?;
     ctx.gate.check_org(&scope.org)?;
     Ok(scope)
+}
+
+/// The operator's ceiling as a scope: every allowed source and origin of `[analysis]` in `org`,
+/// with no expiry of its own. While capture analysis is enabled, the tools that return stored
+/// captures without a scope handle (`search_traffic`, `get_capture`, ...) are confined to it, so
+/// a source or origin the operator did not allow for analysis is unreachable through them too.
+///
+/// `None` when analysis is off, which leaves those tools as they were.
+///
+/// # Errors
+/// [`ToolError`] (not configured) when analysis is on but the operator listed no usable source
+/// or origin: a ceiling that allows nothing must not read as one that allows everything.
+pub fn ceiling(ctx: &Ctx, org: &str) -> Result<Option<Scope>, ToolError> {
+    let config = &ctx.cfg.analysis;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let origins: Vec<OriginPattern> = config
+        .allowed_origins
+        .iter()
+        .filter_map(|text| OriginPattern::parse(text).ok())
+        .collect();
+    if config.allowed_source_ids.is_empty() || origins.is_empty() {
+        return Err(ToolError::not_configured(
+            "capture analysis is enabled but analysis.allowed_source_ids or analysis.allowed_origins is empty, so no capture may be returned",
+        ));
+    }
+    let mut source_ids = config.allowed_source_ids.clone();
+    source_ids.sort();
+    source_ids.dedup();
+    Ok(Some(Scope {
+        id: "operator-ceiling".to_owned(),
+        org: org.to_owned(),
+        engagement: ctx.cfg.scope.engagement.clone(),
+        source_ids,
+        origins,
+        correlation_ids: Vec::new(),
+        expires_at: i64::MAX,
+        digest: String::new(),
+    }))
 }
 
 /// The org an analysis result belongs to, checked against the scope.
@@ -1426,6 +1496,7 @@ mod tests {
             engagement: Some("SOW-1".into()),
             source_ids: vec!["run-1".into(), "run-2".into()],
             origins: vec![OriginPattern::parse("api.example.com").expect("origin")],
+            correlation_ids: Vec::new(),
             expires_at: now() + 600,
             digest: "d".into(),
         }

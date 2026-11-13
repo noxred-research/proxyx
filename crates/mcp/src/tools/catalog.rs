@@ -899,6 +899,14 @@ fn analysis_tools() -> Vec<ToolDef> {
                             16,
                         ),
                     ),
+                    (
+                        "correlation_ids",
+                        array(
+                            "Only captures whose correlation_id is one of these: opaque client keys of 1 to 64 characters of [A-Za-z0-9_-], for example the sticky key a client put in its session proxy credential. Narrows the scope; never widens it. Not available for WebSocket messages.",
+                            string_max("A correlation id.", 64),
+                            32,
+                        ),
+                    ),
                     ("org", org_arg()),
                     (
                         "ttl_secs",

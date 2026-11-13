@@ -381,7 +381,10 @@ pub async fn handle_client(
                     let prefixed = PrefixedStream::new(prefix, stream);
                     run_mitm_intercept(
                         &ctx,
-                        &session_id,
+                        Client {
+                            session_id: &session_id,
+                            sticky_key: decision.sticky_key.clone(),
+                        },
                         scheme,
                         host,
                         req.port(),
@@ -404,7 +407,10 @@ pub async fn handle_client(
                 } else if overflow.is_empty() {
                     run_mitm_intercept(
                         &ctx,
-                        &session_id,
+                        Client {
+                            session_id: &session_id,
+                            sticky_key: decision.sticky_key.clone(),
+                        },
                         scheme,
                         host,
                         req.port(),
@@ -437,7 +443,10 @@ pub async fn handle_client(
                     let prefixed = PrefixedStream::new(overflow, stream);
                     run_mitm_intercept(
                         &ctx,
-                        &session_id,
+                        Client {
+                            session_id: &session_id,
+                            sticky_key: decision.sticky_key.clone(),
+                        },
                         scheme,
                         host,
                         req.port(),
@@ -487,7 +496,10 @@ pub async fn handle_client(
                 let prefixed = PrefixedStream::new(prefix, stream);
                 run_mitm_intercept(
                     &ctx,
-                    &session_id,
+                    Client {
+                        session_id: &session_id,
+                        sticky_key: decision.sticky_key.clone(),
+                    },
                     "http",
                     host,
                     port,
@@ -531,6 +543,16 @@ pub(crate) struct InterceptCaptures {
     pub ws_sink: WsCaptureSink,
 }
 
+/// Set the capture-only sticky-key header on a captured request. Any header of
+/// that name the client sent is dropped first, so the value only ever comes
+/// from the proxy credential. The header is not forwarded to the target.
+fn tag_sticky_key(headers: &mut Vec<(String, String)>, sticky_key: Option<&str>) {
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case(common::sticky::HEADER));
+    if let Some(key) = sticky_key {
+        headers.push((common::sticky::HEADER.to_string(), key.to_string()));
+    }
+}
+
 /// Build a [`PipelineEvent`] from a [`CapturedExchange`], consuming the
 /// exchange (fields are moved, not cloned).
 fn build_pipeline_event(
@@ -540,7 +562,10 @@ fn build_pipeline_event(
     scheme: &'static str,
     port: u16,
     session: &crate::state::LocalSession,
+    sticky_key: Option<&str>,
 ) -> PipelineEvent {
+    let mut request_headers = ex.request_headers;
+    tag_sticky_key(&mut request_headers, sticky_key);
     PipelineEvent {
         event_id: ex.event_id,
         session_id,
@@ -551,7 +576,7 @@ fn build_pipeline_event(
         host: ex.host,
         port,
         path: ex.path,
-        request_headers: ex.request_headers,
+        request_headers,
         request_body: ex.request_body,
         request_body_size: ex.request_body_size,
         request_body_truncated: ex.request_body_truncated,
@@ -573,11 +598,17 @@ fn build_pipeline_event(
     }
 }
 
+/// Who a tunnel belongs to: the session, and the opaque sticky key of its credential, if any.
+pub(crate) struct Client<'a> {
+    pub session_id: &'a uuid::Uuid,
+    pub sticky_key: Option<Arc<str>>,
+}
+
 /// Spawn a publisher task, run the MITM interception, wait for the publisher
 /// to drain. Shared between CONNECT and HTTP paths.
 pub(crate) async fn run_mitm_intercept<F, Fut>(
     ctx: &Arc<ProxyContext>,
-    session_id: &uuid::Uuid,
+    client: Client<'_>,
     scheme: &'static str,
     host: &str,
     port: u16,
@@ -587,6 +618,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
     F: FnOnce(InterceptCaptures) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
 {
+    let session_id = client.session_id;
     // Two bounded channels — HTTP exchanges and WS messages. Both apply
     // backpressure to the proxy when the publisher / broker stall.
     let (ex_tx, mut ex_rx) =
@@ -655,6 +687,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
     let sid = *session_id;
     let publisher_session = session.clone();
     let publisher_proxy_id = proxy_id.clone();
+    let publisher_sticky_key = client.sticky_key;
     let publisher_pipeline = pipeline.clone();
     let publish_task = tokio::spawn(async move {
         loop {
@@ -678,6 +711,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
                             scheme,
                             port,
                             &publisher_session,
+                            publisher_sticky_key.as_deref(),
                         );
                         let send_start = tokio::time::Instant::now();
                         publisher_pipeline.send(event).await;
@@ -727,6 +761,7 @@ pub(crate) async fn run_mitm_intercept<F, Fut>(
                                 scheme,
                                 port,
                                 &publisher_session,
+                                publisher_sticky_key.as_deref(),
                             );
                             publisher_pipeline.send(event).await;
                         }

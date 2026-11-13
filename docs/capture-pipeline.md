@@ -183,6 +183,8 @@ Sessions whose lookup fails at intercept time (the session vanished between auth
    | `account_id` | `X-ProxyX-Account` | `account_id_header` |
    | `tool_call_id` | `X-ProxyX-Tool` | `tool_call_id_header` |
 
+   When the exchange carries no `correlation_id_header` header, `correlation_id` is filled from the capture-only `X-ProxyX-Sticky-Key` header that the proxy sets from the sticky key of the proxy credential (`<session-uuid>-sid-<key>`, see [session-proxy.md](session-proxy.md#sticky-key)). An explicit correlation header the client sent wins. The sticky key is client-chosen and grants no authority.
+
    The value is read from the capture's `request_headers`, which holds what the client sent (after the proxy removes `Proxy-Authorization` and `Proxy-Connection`, and truncates values to 512 bytes). Headers added by the session's `inject_headers` are not part of that list, so the client itself must send these headers for the columns to be filled. Setting a key to an empty string matches no header and leaves the column `NULL`. The headers stay in `request_headers` as well.
 5. **Closing sessions.** See [below](#session-close).
 

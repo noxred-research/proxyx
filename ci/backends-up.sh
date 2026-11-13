@@ -10,7 +10,7 @@ set -euo pipefail
 SUFFIX="${BACKENDS_SUFFIX:-${GITHUB_RUN_ID:-$$}}"
 BASE="${BACKENDS_PORTS:-19000}"
 S3=$((BASE)) CH=$((BASE + 1)) OS=$((BASE + 2)) ES=$((BASE + 3)) KAFKA=$((BASE + 4)) KCTL=$((BASE + 5))
-AMQP=$((BASE + 6)) MGMT=$((BASE + 7)) REDIS=$((BASE + 8)) CHTCP=$((BASE + 9)) CHMYSQL=$((BASE + 10)) CHINTER=$((BASE + 11))
+AMQP=$((BASE + 6)) MGMT=$((BASE + 7)) REDIS=$((BASE + 8)) CHTCP=$((BASE + 9)) CHMYSQL=$((BASE + 10)) CHINTER=$((BASE + 11)) MINIO=$((BASE + 12))
 MQ_USER=guest MQ_PASS=guest # the broker image's built-in test account, reachable from 127.0.0.1 only
 S3_ACCESS=proxyxci
 S3_SECRET="proxyxci-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -31,6 +31,11 @@ wait_for() { # name, command...
 run s3 --user 0 -p "127.0.0.1:$S3:9000" --tmpfs /data:rw,size=1g --tmpfs /logs:rw,size=256m \
   -e RUSTFS_ACCESS_KEY="$S3_ACCESS" -e RUSTFS_SECRET_KEY="$S3_SECRET" -e RUSTFS_ADDRESS=0.0.0.0:9000 \
   rustfs/rustfs@sha256:b81d16a90ee25bd9511280127ca1471788c6e874cf0f0da759645f46b2dc1d74 /data
+# the other verified S3-API server for the `self-hosted` profile (the S3 suite runs against both)
+run minio --user 0 -p "127.0.0.1:$MINIO:9000" --tmpfs /data:rw,size=1g \
+  -e MINIO_ROOT_USER="$S3_ACCESS" -e MINIO_ROOT_PASSWORD="$S3_SECRET" \
+  docker.io/bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c \
+  minio server /data --address :9000
 # ClickHouse on the host network, so that it reaches the object store on 127.0.0.1
 run clickhouse --network host --tmpfs /var/lib/clickhouse:rw,size=2g \
   clickhouse/clickhouse-server@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77 \
@@ -59,6 +64,7 @@ run redis -p "127.0.0.1:$REDIS:6379" \
   redis@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3 redis-server --save '' --appendonly no
 
 wait_for s3 curl -s -o /dev/null "http://127.0.0.1:$S3/"
+wait_for minio curl -sf "http://127.0.0.1:$MINIO/minio/health/live"
 wait_for clickhouse curl -sf "http://127.0.0.1:$CH/ping"
 # a new server creates system.query_log at its first flush; the capture store tests read it
 wait_for clickhouse curl -sf "http://127.0.0.1:$CH/" --data-binary "SYSTEM FLUSH LOGS"
@@ -70,6 +76,7 @@ wait_for kafka docker exec "proxyx-ci-kafka-$SUFFIX" /opt/kafka/bin/kafka-topics
 
 cat <<VARS
 PROXYX_TEST_S3_ENDPOINT=http://127.0.0.1:$S3
+PROXYX_TEST_S3_MINIO_ENDPOINT=http://127.0.0.1:$MINIO
 PROXYX_TEST_S3_ACCESS_KEY=$S3_ACCESS
 PROXYX_TEST_S3_SECRET_KEY=$S3_SECRET
 PROXYX_TEST_CLICKHOUSE_URL=http://127.0.0.1:$CH

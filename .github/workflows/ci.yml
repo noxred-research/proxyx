@@ -241,7 +241,7 @@ jobs:
         run: cargo test --locked --workspace --no-fail-fast
 
   # The services of docs/backends.md, one throwaway container each with its data in tmpfs
-  # (ci/backends-up.sh): an S3-API store, ClickHouse, OpenSearch, Elasticsearch, Kafka, RabbitMQ
+  # (ci/backends-up.sh): two S3-API stores (RustFS and MinIO), ClickHouse, OpenSearch, Elasticsearch, Kafka, RabbitMQ
   # and Redis. Only the suites that need them run here; the unit job keeps PostgreSQL and Valkey.
   backends:
     runs-on: [self-hosted, noxred]
@@ -282,6 +282,9 @@ jobs:
             --test search_engines --test capture_store_opensearch --test capture_store_clickhouse \
             --test broker_kafka --test broker_rabbitmq --test view_export
           cargo test --locked -p proxyx-control --lib key_prefixes
+          # the same suite against the second self-hosted S3 server
+          PROXYX_TEST_S3_ENDPOINT="$PROXYX_TEST_S3_MINIO_ENDPOINT" \
+            cargo test --locked -p proxyx-control --test object_store
           cargo test --locked -p proxyx-store --test shared_redis --test shared_database
       - name: Remove the backend services
         if: always()

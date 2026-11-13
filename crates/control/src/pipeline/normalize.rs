@@ -100,7 +100,10 @@ impl NormalizedCapturedRequest {
             response_body,
             response_size: req.response_body_size,
             duration_ms: req.duration_ms,
-            correlation_id: extract_header(&req.request_headers, correlation_id_header),
+            // The proxy copies a credential-supplied sticky key into a capture-only
+            // header; it labels the capture when no explicit correlation header won.
+            correlation_id: extract_header(&req.request_headers, correlation_id_header)
+                .or_else(|| extract_header(&req.request_headers, Some(common::sticky::HEADER))),
             parent_correlation_id: extract_header(
                 &req.request_headers,
                 parent_correlation_id_header,
@@ -289,6 +292,42 @@ mod tests {
             );
             assert_eq!(normalized.response_headers, normalized.request_headers);
         }
+    }
+
+    #[test]
+    fn sticky_key_header_labels_a_capture_without_overriding_an_explicit_correlation_header() {
+        let header = |name: &str, value: &str| wire::Header {
+            name: name.into(),
+            value: value.into(),
+        };
+        let normalize = |headers: Vec<wire::Header>| {
+            let captured = wire::CapturedRequest {
+                request_headers: headers,
+                ..Default::default()
+            };
+            NormalizedCapturedRequest::from_captured(
+                &captured,
+                0,
+                Some("X-ProxyX-Agent"),
+                None,
+                None,
+                None,
+            )
+            .correlation_id
+        };
+        assert_eq!(
+            normalize(vec![header(common::sticky::HEADER, "sess_a1")]).as_deref(),
+            Some("sess_a1")
+        );
+        assert_eq!(
+            normalize(vec![
+                header("x-proxyx-agent", "agent-7"),
+                header(common::sticky::HEADER, "sess_a1"),
+            ])
+            .as_deref(),
+            Some("agent-7")
+        );
+        assert_eq!(normalize(vec![header("x-other", "v")]), None);
     }
 
     #[test]
