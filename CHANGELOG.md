@@ -34,6 +34,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The benchmark harness no longer runs `FLUSHDB`: it refuses a Redis database that is not empty.
 - **`classify_block_page` no longer reports.** The `report` and `dry_run` arguments are removed: classification is a pure read that returns the arguments of a separate `report_block_signal` call. With `[analysis]` enabled, `report_block_signal` waits for an operator's approval unless `analysis.blocks.report_requires_approval = false`.
 - A model call has one absolute deadline: the `json_object` fallback attempt shares `llm.timeout_secs` with the first attempt, and all prompt fragments share one budget (`llm.max_input_chars`).
+- CI runs only on self-hosted runners, and a `workflow-lint` check (`ci/check-self-hosted-only.py`) fails any job without the `self-hosted` label. Dependabot version updates are removed (`.github/dependabot.yml` is deleted, and the check refuses it): maintainers update dependencies and container base images by hand, and the `security` workflow keeps checking locked dependencies against current advisories.
 
 ### Fixed
 
