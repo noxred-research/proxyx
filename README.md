@@ -11,16 +11,16 @@ An open-source Rust proxy platform for pools, sessions and traffic capture.
 
 Lease pooled residential, ISP, datacenter and mobile IPs through one gateway, and route, inspect and record the traffic of authorized sessions, on infrastructure you control.
 
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE) [![CI](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml) [![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-informational)](CHANGELOG.md) [![Rust 1.99.0](https://img.shields.io/badge/rust-1.99.0-orange?logo=rust)](rust-toolchain.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md) [![Security policy](https://img.shields.io/badge/security-policy-informational?logo=github)](SECURITY.md)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE) [![CI](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/noxred-research/proxyx/actions/workflows/ci.yml) [![Version 0.2.0](https://img.shields.io/badge/version-0.2.0-informational)](CHANGELOG.md) [![Rust 1.99.0](https://img.shields.io/badge/rust-1.99.0-orange?logo=rust)](rust-toolchain.toml) [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md) [![Security policy](https://img.shields.io/badge/security-policy-informational?logo=github)](SECURITY.md)
 
-[What it is](#what-is-proxyx) · [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Roles](#roles) · [Configuration](#configuration) · [crawlx](#use-with-crawlx) · [Observability](#observability) · [Responsible use](#responsible-use-and-security) · [Docs](#documentation)
+[What it is](#what-is-proxyx) · [Features](#features) · [Architecture](#architecture) · [Quick start](#quick-start) · [Roles](#roles) · [Configuration](#configuration) · [Integrations](#integrations) · [Observability](#observability) · [Responsible use](#responsible-use-and-security) · [Docs](#documentation)
 
 </div>
 
 > [!IMPORTANT]
 > **Authorized use only.** ProxyX is built for operating proxy infrastructure you own or are permitted to operate, and for inspecting traffic whose owner has consented. It is not for evading a site's protections, for abusing third-party services, or for intercepting anyone else's traffic. See [Responsible use and security](#responsible-use-and-security).
 
-> **Status:** pre-1.0 (0.1.0). Interfaces, configuration keys and database schemas can still change between minor versions, and the [changelog](CHANGELOG.md) lists what changed. The distribution is this repository and tagged source releases; no prebuilt binaries or images are published, so build them from source or with the provided [Dockerfile](docker/Dockerfile).
+> **Status:** pre-1.0 (0.2.0). Interfaces, configuration keys and database schemas can still change between minor versions, and the [changelog](CHANGELOG.md) lists what changed. The distribution is this repository and tagged source releases; no prebuilt binaries, images or crates.io packages are published, so build them from source or with the provided [Dockerfile](docker/Dockerfile).
 
 ## What is ProxyX
 
@@ -45,10 +45,12 @@ A small in-memory rate-limit service completes the set. A background warmer and 
 | **Capture pipeline** | Protobuf envelopes on Redis Streams, Apache Kafka (or a Kafka-compatible broker) or RabbitMQ quorum queues, at-least-once delivery with per-source ordering and acks after the store write, a batching ClickHouse ingester with a circuit breaker |
 | **Capture stores** | ClickHouse by default, or OpenSearch / Elasticsearch 8 behind the same query API; the OpenSearch store writes idempotently (a capture is never stored twice) and has its own index templates, see [capture-stores.md](docs/capture-stores.md) |
 | **Databases** | PostgreSQL by default, or MariaDB 10.6+, or SQLite for a single host, selected by the scheme of `database_url` for the pool and the control plane; the same migrations and the same behavior on each, pinned by a cross-backend contract test, see [databases.md](docs/databases.md) |
+| **Shared backends** | Every storage family (SQL database, object store, Redis or Valkey, ClickHouse, OpenSearch / Elasticsearch, Kafka or RabbitMQ) can share one instance with other products without collisions: a PostgreSQL schema per plane (`database_schema`), a key prefix (`redis_key_prefix`), a ClickHouse database, an index prefix, an object prefix (`traffic_views_prefix`) and S3 profiles for RustFS, MinIO, edge and compatible stores; ProxyX never touches objects outside its own namespace. Support matrix and tests in [backends.md](docs/backends.md) |
 | **Control plane** | Session lifecycle with reference counting, org management, API keys, a typed query DSL over captures and WebSocket messages, GraphQL, Parquet exports with signed download URLs |
+| **Capture correlation** | A client that runs many sessions over one control-plane session appends a sticky key to the session username (`<session-uuid>-sid-<key>`); each captured exchange carries it as `correlation_id`, so captures can be attributed per session. See [session-proxy.md](docs/session-proxy.md#sticky-key) |
 | **Edge proxy** | `proxyx edge`: a database-less HTTP, CONNECT and SOCKS4/5 proxy over a host's own IP addresses with egress pools (round robin, random, least connections, sticky sessions), login options, ordered default-deny rules, bandwidth and connection limits, parent proxies with circuit breakers and health checks, and a `local` provider scheme so the pool gateway can lease the same addresses; see [edge-proxy.md](docs/edge-proxy.md) |
 | **Rate-limit service** | An in-memory token-bucket daemon with a binary TCP protocol, used by the session proxy as an alternative to Redis |
-| **AI/LLM-native** | An MCP server (`proxyx mcp`, stdio and streamable HTTP) lets AI agents monitor health, capacity, breakers and refusals, explain failures, search captured traffic, and, only when an operator enables capabilities, manage sessions, blocks, limits and policies through validated, approvable, audited changes; optional LLM tools for any chat-completions compatible endpoint for traffic summaries, block-page classification and policy drafts. See [docs/ai.md](docs/ai.md) |
+| **AI/LLM-native** | An MCP server (`proxyx mcp`, stdio and streamable HTTP) lets AI agents monitor health, capacity, breakers and refusals, explain failures, search captured traffic, and, only when an operator enables capabilities, manage sessions, blocks, limits and policies through validated, approvable, audited changes. Optional passive capture analysis (`[analysis]`, off by default) works inside operator-listed sources and origins: authentication flows, sensitive-data findings with masked previews, natural-language traffic queries, API schema drafts and cursor-based capture feeds, all with evidence references. Optional LLM tools for any chat-completions compatible endpoint cover traffic summaries, block-page classification and policy drafts. See [docs/ai.md](docs/ai.md) |
 | **Observability** | Prometheus metrics for every role, `/healthz` and `/readyz`, OpenTelemetry traces, optional Sentry, [runbooks](docs/runbooks/README.md) for every alert |
 
 ## Architecture
@@ -100,6 +102,7 @@ Initialization creates secret files with a private umask and retains existing cr
 ### From source
 
 ```
+git clone https://github.com/noxred-research/proxyx.git && cd proxyx
 cargo build --release          # target/release/proxyx and target/release/proxyx-intercept
 ```
 
@@ -197,7 +200,11 @@ One `proxyx` binary runs one role per process, and `proxyx-intercept` runs the s
 
 The pool, session proxy and control plane read TOML and their `PROXYX_POOL_*`, `PROXYX_INTERCEPT_*` or `PROXYX_CONTROL_*` environment variables; an explicit `--config FILE` takes precedence. The edge reads its required TOML file only. The limiter reads `PROXYX_LIMITER_*` environment variables and an optional listen address; it has no configuration file. [`docs/configuration.md`](docs/configuration.md) lists every key with its default and environment variable, and [`examples/`](examples/) has minimal working files. Provider adapters, policies and the static inventory are versioned TOML data under `data_dir`: see [providers](docs/providers.md) and [policies](docs/policies.md).
 
-## Use with crawlx
+## Integrations
+
+ProxyX is one of three open-source tools for authorized security research from [noxred-research](https://github.com/noxred-research). Each runs on its own, each keeps its own safety rules, and none relaxes another's. All three expose an MCP server, so one agent can operate them together.
+
+### crawlx
 
 [crawlx](https://github.com/noxred-research/crawlx) is a crawler for authorized security research, and ProxyX is an egress option for it. crawlx's `--proxy` flag takes an HTTP proxy URL, which the pool gateway is:
 
@@ -206,7 +213,13 @@ crawlx crawl https://app.example.org --mode static \
   --proxy "http://px-cc-fr-rot-sticky-sid-scan42:$KEY@proxyx-gateway:8080"
 ```
 
-The sticky key keeps a scan on one exit IP; a different `sid` gets another. Both tools keep their own safety rules and neither relaxes the other's: crawlx's scope, robots and egress policy still apply to every request it makes, and the gateway refuses private, loopback, link-local and metadata destinations. A client that sees the `X-ProxyX-Pool-Session` and `X-ProxyX-Exit-IP` headers of the CONNECT response can report a blocked target with `POST /v1/block-signals` (HTTP Basic, the org key as password) so the pool cools that IP for that target; see [gateway](docs/gateway.md#control-api). SOCKS5 replies carry no headers, so SOCKS5 clients cannot name a session.
+The sticky key keeps a scan on one exit IP; a different `sid` gets another. crawlx's scope, robots and egress policy still apply to every request it makes, and the gateway refuses private, loopback, link-local and metadata destinations. A client that sees the `X-ProxyX-Pool-Session` and `X-ProxyX-Exit-IP` headers of the CONNECT response can report a blocked target with `POST /v1/block-signals` (HTTP Basic, the org key as password) so the pool cools that IP for that target; see [gateway](docs/gateway.md#control-api). SOCKS5 replies carry no headers, so SOCKS5 clients cannot name a session.
+
+### BrowserX
+
+[BrowserX](https://github.com/noxred-research/browserx) ([browserx.dev](https://browserx.dev)) runs browser sessions for authorized security research. Its sessions can egress through the ProxyX pool gateway: BrowserX renders a sticky proxy username per session from a `{session}` template, for example `px-kind-rotating-cc-fr-sid-{session}`, so each browser session keeps its own exit IP, and the gateway's [username grammar](docs/gateway.md#username-grammar) applies unchanged.
+
+The session proxy has a matching option for capture work. A client that runs many sessions over one control-plane session can append its own key to the session username, `<session-uuid>-sid-<key>`. The key never selects a session or changes routing; each captured exchange carries it as `correlation_id`, and an MCP analysis scope (`open_analysis_scope` with `correlation_ids`) can narrow an agent to the captures of one key. The key format, its limits and what it does not do are in [session-proxy.md](docs/session-proxy.md#sticky-key).
 
 ## Observability
 
@@ -235,10 +248,11 @@ The gateway enforces a deny-first destination rule (private, loopback, link-loca
 | [gateway.md](docs/gateway.md) | Pool gateway protocols, authentication, username grammar, cause codes, control API |
 | [providers.md](docs/providers.md) | Adapter schema, inventory, customer upstreams, mobile boxes, verification |
 | [policies.md](docs/policies.md) | Policy document format and precedence |
-| [session-proxy.md](docs/session-proxy.md) | Sessions, routing, interception, CA, TLS profiles, rate limits |
+| [session-proxy.md](docs/session-proxy.md) | Sessions, routing, interception, CA, TLS profiles, rate limits, [sticky keys](docs/session-proxy.md#sticky-key) for capture correlation |
 | [control-api.md](docs/control-api.md) | REST and GraphQL APIs, query DSL, authentication, exports |
 | [capture-pipeline.md](docs/capture-pipeline.md) | Broker, ClickHouse schema, delivery semantics |
 | [capture-stores.md](docs/capture-stores.md) | ClickHouse versus OpenSearch / Elasticsearch: setup, schema, query differences, retention |
+| [backends.md](docs/backends.md) | Support matrix of every backend family, why each exists, how to share instances, how each is tested |
 | [databases.md](docs/databases.md) | PostgreSQL, MariaDB and SQLite: URLs, choosing, migrations, per-backend differences and limits |
 | [edge-proxy.md](docs/edge-proxy.md) | The self-hosted multi-IP forward proxy: listeners, egress pools, users, rules, limits, parents, logs |
 | [mcp.md](docs/mcp.md), [ai.md](docs/ai.md) | MCP server, tool catalog, approval and audit; AI/LLM-assisted operations and responsible use |
@@ -262,7 +276,7 @@ The Python [prober](prober/README.md) is an optional sidecar that measures candi
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks, coding standards and review flow, and follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks, coding standards and review flow, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). CI runs only on self-hosted runners: the `workflow-lint` check (`ci/check-self-hosted-only.py`) fails any job without the `self-hosted` label. Maintainers update dependencies and container base images by hand.
 
 ## Support the project
 

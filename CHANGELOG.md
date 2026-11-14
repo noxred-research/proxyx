@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
 ### Added
 
 - **[Backends guide](docs/backends.md)**: a support matrix of every backend family ProxyX uses (relational, object store, Redis and Valkey, ClickHouse, OpenSearch and Elasticsearch, Kafka and RabbitMQ), the reason for each, and how to share one set of instances with other products.
@@ -188,5 +190,6 @@ First public release.
 - TCP keepalive cannot be set on Redis sockets with the pinned client library; Redis calls are bounded by timeouts instead.
 - No binaries, container images or crates.io packages are published; build from source.
 
-[Unreleased]: https://github.com/noxred-research/proxyx/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/noxred-research/proxyx/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/noxred-research/proxyx/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/noxred-research/proxyx/releases/tag/v0.1.0
