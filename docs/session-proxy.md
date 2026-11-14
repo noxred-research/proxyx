@@ -56,6 +56,22 @@ socks5://<session-uuid>:password@proxy.example.com:1080
 | CONNECT / HTTP | `Proxy-Authorization: Basic base64(<uuid>:<anything>)` | `407` with `Proxy-Authenticate: Basic realm="proxy"` for a missing or malformed header, bad UUID, unknown or expired session. `503` when the session backend is unavailable. |
 | SOCKS5 | username of the RFC 1929 sub-negotiation (method `0x02` is required) | a malformed UUID receives RFC 1929 authentication failure (`0x01`); for a valid UUID, see [Errors](#errors): the handshake succeeds and any lookup or routing failure is reported in band |
 
+### Sticky key
+
+A client that runs many sessions of its own over one control-plane session can tell their captures apart by appending an opaque key of its own choosing to the username:
+
+```
+http://<session-uuid>-sid-<key>:password@proxy.example.com:8443
+socks5://<session-uuid>-sid-<key>:password@proxy.example.com:1080
+```
+
+`<key>` is 1 to 64 characters of `[A-Za-z0-9_-]`. A username with a malformed key (empty, too long, another character) is rejected like a malformed UUID: `407` on the CONNECT and HTTP listener, authentication failure on SOCKS5. The key is a label only:
+
+- The credential authenticates exactly as the bare session id does. The key selects no session, changes no routing, rate limit, capture rule or egress, and is never looked up or checked against anything. A client can invent any key without gaining anything, and a wrong key never turns an unknown session into a known one.
+- The proxy copies the key onto each captured exchange of that connection as the capture-only request header `X-ProxyX-Sticky-Key`. It is not forwarded to the target. A header of that name that the client itself sends is dropped from the captured copy, so the value comes only from the credential. The ingester stores it as `correlation_id` when no [correlation header](capture-pipeline.md#ingester) of the exchange set one; see there for the rule.
+- Because the client chooses it, the key is a correlation hint, not evidence of identity. Do not derive it from anything secret you would not put in a log; a hash of the client's own session id is a good choice.
+- WebSocket messages carry no correlation column, so they are not tagged.
+
 The proxy strips `Proxy-Authorization` and `Proxy-Connection` from every request it forwards and from every request it captures, so the session credential never reaches the origin or ClickHouse.
 
 ## Session lookup and caches

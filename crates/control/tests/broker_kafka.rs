@@ -62,12 +62,18 @@ impl Kafka {
     async fn with(config: KafkaConfig) -> Self {
         broker_admin::ensure_kafka_topic(&config).await.unwrap();
         // The topic is visible to the pure-Rust client a moment after the
-        // admin client created it.
-        for _ in 0..100 {
-            if KafkaProducer::new(&config, "probe").await.is_ok() {
-                break;
+        // admin client created it; on a loaded broker that can take a while.
+        // Wait for it, and fail here with the last error instead of later in
+        // an unrelated assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            match KafkaProducer::new(&config, "probe").await {
+                Ok(_) => break,
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    panic!("topic never became visible to the client: {error}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         Self {
             group: format!("pxt-{}", Uuid::new_v4().simple()),

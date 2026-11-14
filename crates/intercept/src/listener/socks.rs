@@ -445,9 +445,9 @@ pub(super) async fn handle_socks5(
         drop(password); // not used — session_id is in the username
 
         let username_str = String::from_utf8_lossy(&username);
-        let session_id: Uuid = match username_str.parse() {
-            Ok(id) => id,
-            Err(_) => {
+        let (session_id, sticky_key) = match common::sticky::parse_username(&username_str) {
+            Some(u) => (u.session_id, u.sticky_key.map(std::sync::Arc::<str>::from)),
+            None => {
                 // RFC 1929 requires a failure reply before closing, even when
                 // the username cannot represent a session credential.
                 stream.write_all(&[AUTH_VERSION, 0x01]).await?;
@@ -473,10 +473,10 @@ pub(super) async fn handle_socks5(
         }
 
         let (host, port) = read_target_address(&mut stream, req_header[3]).await?;
-        Ok((session_id, lookup, host, port))
+        Ok((session_id, sticky_key, lookup, host, port))
     };
 
-    let (session_id, lookup, host, port) =
+    let (session_id, sticky_key, lookup, host, port) =
         match timeout(ctx.network.socks_handshake_timeout(), handshake).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => return Err(e),
@@ -520,7 +520,7 @@ pub(super) async fn handle_socks5(
     // Routing decision (session is cached from the check above)
     let AuthResult { decision, .. } = match ctx
         .state
-        .authenticate_socks_and_route(session_id, &host, port)
+        .authenticate_socks_and_route(session_id, sticky_key, &host, port)
         .await
     {
         Ok(r) => r,
@@ -598,7 +598,10 @@ pub(super) async fn handle_socks5(
                 info!(%host, scheme = "http", "SOCKS5: performing MITM interception");
                 super::connect::run_mitm_intercept(
                     &ctx,
-                    &session_id,
+                    super::connect::Client {
+                        session_id: &session_id,
+                        sticky_key: decision.sticky_key.clone(),
+                    },
                     "http",
                     &host,
                     port,
@@ -623,7 +626,10 @@ pub(super) async fn handle_socks5(
                 info!(%host, scheme = "https", "SOCKS5: performing MITM interception");
                 super::connect::run_mitm_intercept(
                     &ctx,
-                    &session_id,
+                    super::connect::Client {
+                        session_id: &session_id,
+                        sticky_key: decision.sticky_key.clone(),
+                    },
                     "https",
                     &host,
                     port,

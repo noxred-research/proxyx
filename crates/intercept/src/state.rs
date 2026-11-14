@@ -60,6 +60,10 @@ pub struct RoutingDecision {
     pub insecure_upstream_tls: bool,
     pub rate_limit: Option<RateLimitSettings>,
     pub tls_profile: TlsProfile,
+    /// Opaque client-supplied correlation key from the credential's username
+    /// (`<session-id>-sid-<key>`). A label only: it never selects a session or
+    /// widens what the session may do.
+    pub sticky_key: Option<Arc<str>>,
 }
 
 pub struct AuthResult {
@@ -263,12 +267,14 @@ impl ProxyState {
             .strip_prefix("Basic ")
             .ok_or_else(|| anyhow!("expected Basic auth"))?;
         let decoded = base64_decode(encoded)?;
-        let (session_id_str, _password) = decoded
+        let (username, _password) = decoded
             .split_once(':')
             .ok_or_else(|| anyhow!("invalid Basic auth format"))?;
-        let session_id: Uuid = session_id_str
-            .parse()
-            .map_err(|_| anyhow!("invalid session_id"))?;
+        let common::sticky::Username {
+            session_id,
+            sticky_key,
+        } = common::sticky::parse_username(username)
+            .ok_or_else(|| anyhow!("invalid session_id"))?;
 
         let session = match self.get_session(&session_id).await {
             SessionLookup::Found(s) => s,
@@ -276,7 +282,7 @@ impl ProxyState {
             SessionLookup::BackendUnavailable => return Err(AuthError::BackendUnavailable),
         };
 
-        let decision = self.build_routing_decision(&session, host, port);
+        let decision = self.build_routing_decision(&session, host, port, sticky_key.map(Arc::from));
         Ok(AuthResult {
             session_id,
             decision,
@@ -286,6 +292,7 @@ impl ProxyState {
     pub async fn authenticate_socks_and_route(
         &self,
         session_id: Uuid,
+        sticky_key: Option<Arc<str>>,
         host: &str,
         port: u16,
     ) -> std::result::Result<AuthResult, AuthError> {
@@ -295,7 +302,7 @@ impl ProxyState {
             SessionLookup::BackendUnavailable => return Err(AuthError::BackendUnavailable),
         };
 
-        let decision = self.build_routing_decision(&session, host, port);
+        let decision = self.build_routing_decision(&session, host, port, sticky_key);
         Ok(AuthResult {
             session_id,
             decision,
@@ -307,6 +314,7 @@ impl ProxyState {
         session: &LocalSession,
         host: &str,
         port: u16,
+        sticky_key: Option<Arc<str>>,
     ) -> RoutingDecision {
         // ponytail: maps are normally two entries (:80/:443); scan to avoid a hot-path key allocation.
         let request_host = host.strip_suffix('.').unwrap_or(host);
@@ -356,6 +364,7 @@ impl ProxyState {
             insecure_upstream_tls: session.insecure_upstream_tls,
             rate_limit: session.rate_limit.clone(),
             tls_profile: TlsProfile::for_agent(session.agent.as_deref()),
+            sticky_key,
         }
     }
 

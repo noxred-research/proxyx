@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod redact;
 pub mod redis_connect;
 pub mod sentry;
+pub mod sticky;
 pub mod telemetry;
 pub mod types;
 
