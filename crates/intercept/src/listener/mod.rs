@@ -641,18 +641,21 @@ target",
             .unwrap();
         assert_eq!(socks.decision.sticky_key.as_deref(), Some("k2"));
 
-        for bad in [
+        for (case, bad) in [
             format!("{session_id}-sid-"),
             format!("{session_id}-sid-a b"),
             format!("{session_id}-sid-{}", "k".repeat(65)),
             format!("{}-sid-k1", Uuid::new_v4()),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
                 ctx.state
                     .authenticate_and_route(Some(&basic(bad.clone())), LOGICAL_HOST, LOGICAL_PORT)
                     .await
                     .is_err(),
-                "{bad}"
+                "malformed sticky credential case {case} was accepted"
             );
         }
         let _ = std::fs::remove_dir_all(ca_dir);
