@@ -441,12 +441,15 @@ pub struct Config {
     pub broker_kind: BrokerKind,
 
     /// Kafka broker configuration (required when `broker_kind = "kafka"`).
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub kafka: Option<common::log::kafka::KafkaConfig>,
 
     /// Deprecated name of `[kafka]`, accepted for one release.
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub redpanda: Option<common::log::kafka::KafkaConfig>,
 
     /// RabbitMQ configuration (required when `broker_kind = "rabbitmq"`).
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub rabbitmq: Option<common::log::rabbitmq::RabbitMqConfig>,
 }
 
@@ -479,6 +482,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The capture stream: `request_log.stream_name`, or
+    /// `<redis_key_prefix>:request_log`.
+    pub fn request_log_stream(&self) -> String {
+        self.request_log
+            .stream_name
+            .clone()
+            .unwrap_or_else(|| format!("{}:request_log", self.redis_key_prefix))
+    }
+
     /// The `[kafka]` section, or the deprecated `[redpanda]` one.
     pub fn kafka_config(&self) -> anyhow::Result<Option<&common::log::kafka::KafkaConfig>> {
         common::log::resolve_kafka_section(self.kafka.as_ref(), self.redpanda.as_ref())
@@ -538,6 +550,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(value: serde_json::Value) -> Result<Config, serde_json::Error> {
+        let mut value = value;
+        value["connect_addr"] = "127.0.0.1:8443".into();
+        serde_json::from_value(value)
+    }
+
+    /// The capture stream follows `redis_key_prefix` unless it is named.
+    #[test]
+    fn the_capture_stream_is_under_the_key_prefix_by_default() {
+        let stream = |value| parse(value).unwrap().request_log_stream();
+        assert_eq!(stream(serde_json::json!({})), "proxyx:request_log");
+        assert_eq!(
+            stream(serde_json::json!({ "redis_key_prefix": "proxyxb" })),
+            "proxyxb:request_log"
+        );
+        assert_eq!(
+            stream(serde_json::json!({
+                "redis_key_prefix": "proxyxb",
+                "request_log": { "stream_name": "legacy:log" }
+            })),
+            "legacy:log"
+        );
+    }
+
+    /// The credentials of a broker this process does not use do not fail the
+    /// load; any other incomplete section still does.
+    #[test]
+    fn credentials_of_an_unselected_broker_are_ignored() {
+        let config = parse(serde_json::json!({
+            "rabbitmq": { "username": "u", "password": "p" },
+            "kafka": { "sasl": { "username": "u", "password": "p" } }
+        }))
+        .unwrap();
+        assert!(config.rabbitmq.is_none() && config.kafka.is_none());
+        assert!(parse(serde_json::json!({ "rabbitmq": { "username": "u", "typo": 1 } })).is_err());
+    }
 
     #[test]
     fn upstream_tls_and_compressed_websocket_limits_default_secure() {

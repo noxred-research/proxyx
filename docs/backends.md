@@ -79,7 +79,7 @@ Run `proxyx migrate pool` and `proxyx migrate control --target all` once: they c
 
 ## Relational databases
 
-See [databases.md](databases.md) for URLs, versions and per-engine differences. For sharing, `database_schema` pins every connection of a PostgreSQL pool to one schema with `search_path`, creates the schema on migration and keeps the migration history in it. The `pg_trgm` extension that a control migration needs exists once per database and is installed in `public`, which stays on the search path behind the product's schema only so that the extension resolves; no ProxyX table is created there. `database_schema` must be a lowercase identifier, not `public`, not `pg_*`, and is refused for MariaDB and SQLite with a message that says where their namespace is.
+See [databases.md](databases.md) for URLs, versions and per-engine differences. For sharing, `database_schema` pins every connection of a PostgreSQL pool to one schema with `search_path`, creates the schema on migration and keeps the migration history in it. No control migration creates or drops an extension, a schema other than `database_schema`, or a cron job: ProxyX touches only objects in its own schema. (Releases up to 0.1.0 created `pg_trgm` and dropped `pg_partman` and `pg_cron` for the whole database; the two migrations were rewritten, and `migrate` repairs the recorded checksum of a database that applied the old text once, with no other change. An extension an old ProxyX installed stays; remove it by hand if nothing else uses it.) `public` stays on the search path behind the product's schema only so that extensions of the database resolve; no ProxyX table is created there. `database_schema` must be a lowercase identifier, not `public`, not `pg_*`, and is refused for MariaDB and SQLite with a message that says where their namespace is.
 
 ## Object storage
 
@@ -100,7 +100,7 @@ Server-side encryption is not a ProxyX setting: ProxyX never uploads an object i
 
 ## Redis and Valkey
 
-Valkey and Redis speak the same protocol and both are tested. The control plane and the session proxy build every key as `<redis_key_prefix>:...` (they must use the same prefix) and never run a server-wide delete. The pool does not prefix its keys; a shared instance gives it a database index of its own. The benchmark harness, which used to flush its Redis database, now refuses a database that is not empty. An ACL user restricted to `~<prefix>:*` works for the control plane and session proxy and is exercised by a test.
+Valkey and Redis speak the same protocol and both are tested. The control plane and the session proxy build every key as `<redis_key_prefix>:...` (they must use the same prefix) and never run a server-wide delete. The capture stream is `<redis_key_prefix>:request_log` unless `request_log_stream` and `request_log.stream_name` name it (releases up to 0.1.0 used `proxyx:request_log` whatever the prefix; see [capture-pipeline.md](capture-pipeline.md#broker) for the upgrade). Log lines and errors mask the password of every URL they name (`redis://px:***@host/0`). The pool does not prefix its keys; a shared instance gives it a database index of its own. The benchmark harness, which used to flush its Redis database, now refuses a database that is not empty. An ACL user restricted to `~<prefix>:*` works for the control plane and session proxy and is exercised by a test.
 
 ## ClickHouse
 
@@ -120,7 +120,8 @@ Every test below runs against a real service in a throwaway container and skips 
 
 | Test | Real services | What it shows |
 |---|---|---|
-| `control/tests/shared_database.rs`, `store/tests/shared_database.rs` | PostgreSQL | two schemas and a neighbour's schema in one database: separate tables, separate migration history, nothing in `public`, the neighbour untouched |
+| `control/tests/shared_database.rs`, `store/tests/shared_database.rs` | PostgreSQL | two schemas and a neighbour's schema in one database: separate tables, separate migration history, nothing in `public`, the neighbour untouched; a neighbour's `pg_trgm`, `partman` and `cron` objects survive the migrations; a database from release 0.1.0 has the checksums of the two rewritten migrations repaired and a tampered checksum is still refused |
+| `control/tests/view_export.rs` | an S3-API server and ClickHouse 25.8 | a traffic view export writes a Parquet object with every row and the capture id as text (25.8 cannot write a `UUID` column) |
 | `control/tests/object_store.rs` | an S3-API server and ClickHouse | ClickHouse writes Parquet to the store with a credentials file; two prefixes in one bucket see only their own objects; delete is idempotent; wrong credentials are refused; profile and prefix combinations are validated |
 | `control/src/session.rs` (`key_prefixes_...`) | Valkey and Redis | two prefixes on one server are separate; an ACL user fenced to one prefix is refused outside it |
 | `store/tests/shared_redis.rs` | Valkey or Redis | two database indexes hold separate pool state |

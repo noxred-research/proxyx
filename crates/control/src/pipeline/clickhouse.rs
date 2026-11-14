@@ -66,6 +66,10 @@ pub struct ClickHouseConfig {
     pub circuit_breaker_reset_secs: u64,
 }
 
+impl common::config::PartialSection for ClickHouseConfig {
+    const STANDALONE: &'static [&'static str] = &["user", "password", "local_single_node"];
+}
+
 impl ClickHouseConfig {
     pub(crate) fn batch(&self) -> BatchConfig {
         BatchConfig {

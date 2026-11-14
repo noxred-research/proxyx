@@ -23,6 +23,7 @@ From lowest to highest priority:
 A few rules apply to all components:
 
 - An explicit `--config` path must name an existing regular file. A missing file or directory is rejected rather than silently starting on defaults or environment values. Default discovery locations may remain absent.
+- Credentials of a backend that is not selected do not fail the load: a `[clickhouse]`, `[rabbitmq]`, `[kafka]` or `[capture_store.opensearch]` table of the control plane (and `[rabbitmq]`, `[kafka]` of the session proxy) that holds only credential keys (`user`/`password`, `username`/`password`, `sasl`, `username`/`password`/`api_key`, and `local_single_node` of `[clickhouse]`) counts as absent, so one environment file can serve deployments that use different backends. A table with any other key must still be complete, and a selected backend whose URL is missing is refused.
 - Durations of the pool gateway are plain seconds or `30s`, `5m`, `2h`. Durations of the session proxy and control plane are integer seconds or milliseconds as the key name says (`_secs`, `_ms`).
 - Secrets are never part of a pool configuration file. Provider logins, the admin token and scorer keys are files in `secrets_dir`; see [Pool gateway](#pool-gateway-and-warmer).
 - The pool gateway refuses a configuration **file** that contains an unknown key (a typo such as `max_connection`) and refuses values that would fail later (a zero timeout, a pending limit above `max_connections`). Unknown `PROXYX_POOL_*` environment variables are ignored, because orchestrators inject variables with that prefix.
@@ -39,6 +40,7 @@ A few rules apply to all components:
 
 - Any other scheme, or none, is refused at start: a typo never falls back to another database.
 - Percent-encode special characters in a user name or password (`@` as `%40`, `/` as `%2F`).
+- Logs and error messages mask the password of a URL they name (`redis://px:***@host:6379/0`, also for the ClickHouse and OpenSearch URLs and Sentinel URLs); the URL itself is never printed in full.
 - A SQLite URL names a file: `sqlite:///absolute/path.db?mode=rwc` (three slashes, then the absolute path) or `sqlite://relative.db?mode=rwc`. `mode=rwc` creates the file when it is missing. `sqlite::memory:` is refused. Start the roles that share the file on one host only; see [databases.md](databases.md#sqlite).
 - Connection options of the driver go in the query string (`?sslmode=require` for PostgreSQL, `?ssl-mode=required` for MariaDB). TLS to the database uses rustls.
 - The URL is a secret: it appears in no log line or error message (`proxyx doctor` prints `host:port/database` only).
@@ -164,7 +166,7 @@ Per-org request rate limits. See [session-proxy.md](session-proxy.md#rate-limiti
 
 | Key | Environment variable | Default | Meaning |
 |---|---|---|---|
-| `stream_name` | `PROXYX_INTERCEPT_REQUEST_LOG__STREAM_NAME` | `proxyx:request_log` | Redis stream that receives captures. Must equal the control plane's `request_log_stream`. |
+| `stream_name` | `PROXYX_INTERCEPT_REQUEST_LOG__STREAM_NAME` | `<redis_key_prefix>:request_log` | Redis stream that receives captures. Must equal the control plane's `request_log_stream`. Unset, it is under `redis_key_prefix` (`proxyx:request_log` with the default prefix). |
 | `channel_capacity` | `PROXYX_INTERCEPT_REQUEST_LOG__CHANNEL_CAPACITY` | `256` | Positive size of the in-process queue, and the largest batch handed to the producer. A full queue blocks the tunnel (backpressure); `0` is rejected at startup. |
 | `max_stream_len` | `PROXYX_INTERCEPT_REQUEST_LOG__MAX_STREAM_LEN` | `1000000` | Approximate `MAXLEN ~` of the Redis stream. `0` disables trimming. |
 
@@ -301,7 +303,7 @@ Required when `broker_kind = "rabbitmq"`; shared with the control plane. See [ca
 | `ingester_health_addr` | `PROXYX_CONTROL_INGESTER_HEALTH_ADDR` | `0.0.0.0:9001` | Ingester health and metrics listener. |
 | `redis_url` | `PROXYX_CONTROL_REDIS_URL` | `redis://127.0.0.1:6379` | Redis for sessions and the capture stream. Required by the API and the Redis-stream ingester; optional for a Kafka or RabbitMQ ingester. The same URL forms as the session proxy. |
 | `redis_key_prefix` | `PROXYX_CONTROL_REDIS_KEY_PREFIX` | `proxyx` | Prefix of keys, streams and channels. Must equal the session proxy's. |
-| `request_log_stream` | `PROXYX_CONTROL_REQUEST_LOG_STREAM` | `proxyx:request_log` | Capture stream name. |
+| `request_log_stream` | `PROXYX_CONTROL_REQUEST_LOG_STREAM` | `<redis_key_prefix>:request_log` | Capture stream name. Unset, it is under `redis_key_prefix` (`proxyx:request_log` with the default prefix). Must equal the session proxy's `request_log.stream_name`. |
 | `request_log_max_stream_len` | `PROXYX_CONTROL_REQUEST_LOG_MAX_STREAM_LEN` | `1000000` | Approximate stream cap used when the control plane publishes (`SessionEnd`). Match the session proxy's value. |
 | `consumer_group` | `PROXYX_CONTROL_CONSUMER_GROUP` | `proxyx_control` | Redis consumer group of the ingester. |
 | `broker_kind` | `PROXYX_CONTROL_BROKER_KIND` | `redis_stream` | `redis_stream`, `kafka` or `rabbitmq`; must match the session proxy. `redpanda` is a deprecated alias of `kafka`. |

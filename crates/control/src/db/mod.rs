@@ -73,8 +73,24 @@ pub use views::{ViewJobRow, ViewJobUpsert};
 
 /// The embedded migrations: `migrations/postgres`, `migrations/mariadb` and
 /// `migrations/sqlite`, the same versions in each.
+///
+/// Two PostgreSQL migrations were rewritten after release 0.1.0 so that they
+/// stay inside ProxyX's own schema and need no extension. The pinned values
+/// are the SHA-384 of the released text; databases that applied it have their
+/// checksum row updated before sqlx verifies it.
 fn migrators() -> Migrators {
-    proxyx_db::migrators!(extensions = ["pg_trgm"])
+    proxyx_db::migrators!(
+        rewritten = [
+            (
+                20250425000002,
+                "5d9dd3b8590c047ff4a5179db890bd31d1439593b561d8e66d4830733100d21299e517a0915b109ee1589a6380322ff1"
+            ),
+            (
+                20260703000001,
+                "9f337569854ae15f5172ef614265e74378c7e365440ad74ee38bb91b782c46c781a31f72db87f4e089765f8ecebe483b"
+            ),
+        ]
+    )
 }
 
 /// Pool of database connections: PostgreSQL, MariaDB or SQLite, by the scheme

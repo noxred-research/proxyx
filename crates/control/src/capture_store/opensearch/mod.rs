@@ -215,6 +215,10 @@ pub struct OpenSearchConfig {
     pub circuit_breaker_reset_secs: u64,
 }
 
+impl common::config::PartialSection for OpenSearchConfig {
+    const STANDALONE: &'static [&'static str] = &["username", "password", "api_key"];
+}
+
 impl OpenSearchConfig {
     /// A configuration for `url` with every other setting at its default.
     pub fn new(url: impl Into<String>) -> Self {

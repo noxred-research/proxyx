@@ -128,10 +128,6 @@ fn default_ingester_health_addr() -> SocketAddr {
     "0.0.0.0:9001".parse().unwrap()
 }
 
-fn default_request_log_stream() -> String {
-    "proxyx:request_log".to_string()
-}
-
 fn default_request_log_max_stream_len() -> u64 {
     1_000_000
 }
@@ -252,7 +248,7 @@ pub struct ControlConfig {
     /// ClickHouse connection and ingest settings. Required when
     /// `capture_store.backend = "clickhouse"` (the default); see
     /// [`ControlConfig::clickhouse_config`].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub clickhouse: Option<crate::pipeline::clickhouse::ClickHouseConfig>,
 
     /// Which store holds captures: `clickhouse` (default) or `opensearch`
@@ -260,9 +256,13 @@ pub struct ControlConfig {
     #[serde(default)]
     pub capture_store: crate::capture_store::CaptureStoreConfig,
 
-    /// Redis stream name for request logs
-    #[serde(default = "default_request_log_stream")]
-    pub request_log_stream: String,
+    /// Redis stream that carries the captures (`broker_kind = "redis_stream"`).
+    /// Unset: `<redis_key_prefix>:request_log`, so deployments with different
+    /// prefixes on one Redis or Valkey never share a stream. Must equal the
+    /// session proxy's `request_log.stream_name`; see
+    /// [`ControlConfig::request_log_stream`].
+    #[serde(default)]
+    pub request_log_stream: Option<String>,
 
     /// Approximate cap on the Redis stream length (`XADD ... MAXLEN ~ N`).
     /// 0 disables trimming. Default: 1_000_000. Should match the proxy's
@@ -344,12 +344,15 @@ pub struct ControlConfig {
     pub broker_kind: BrokerKind,
 
     /// Kafka configuration (required when `broker_kind = "kafka"`).
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub kafka: Option<common::log::kafka::KafkaConfig>,
 
     /// Deprecated name of `[kafka]`, accepted for one release.
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub redpanda: Option<common::log::kafka::KafkaConfig>,
 
     /// RabbitMQ configuration (required when `broker_kind = "rabbitmq"`).
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub rabbitmq: Option<common::log::rabbitmq::RabbitMqConfig>,
 
     /// Object store for traffic view Parquet exports.
@@ -406,7 +409,7 @@ pub struct ControlConfig {
     /// `secret_access_key = ...` and optionally `session_token = ...` lines.
     /// Unset: the AWS environment and profile chain. Never put keys in the
     /// configuration itself.
-    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_CREDENTIALS_FILE`.
+    /// Env: `PROXYX_CONTROL_TRAFFIC_VIEWS_S3_STANDALONE_FILE`.
     #[serde(default)]
     pub traffic_views_s3_credentials_file: Option<PathBuf>,
 
@@ -460,6 +463,13 @@ pub struct ControlConfig {
 }
 
 impl ControlConfig {
+    /// The capture stream: `request_log_stream`, or `<redis_key_prefix>:request_log`.
+    pub fn request_log_stream(&self) -> String {
+        self.request_log_stream
+            .clone()
+            .unwrap_or_else(|| format!("{}:request_log", self.redis_key_prefix))
+    }
+
     /// The `[kafka]` section, or the deprecated `[redpanda]` one.
     pub fn kafka_config(&self) -> anyhow::Result<Option<&common::log::kafka::KafkaConfig>> {
         common::log::resolve_kafka_section(self.kafka.as_ref(), self.redpanda.as_ref())
@@ -618,6 +628,62 @@ mod tests {
             "http://localhost:8123"
         );
         assert!(config.opensearch_config().is_err());
+    }
+
+    /// One environment file can serve several deployments: the credentials of
+    /// a backend a deployment does not select must not fail the load.
+    #[test]
+    fn credentials_of_an_unselected_backend_are_ignored() {
+        let config = load(
+            "[capture_store]\nbackend = \"opensearch\"\n\
+             [capture_store.opensearch]\nurl = \"http://os:9200\"\n\
+             [clickhouse]\nuser = \"u\"\npassword = \"p\"\nlocal_single_node = \"1\"\n\
+             [rabbitmq]\nusername = \"u\"\npassword = \"p\"\n\
+             [kafka.sasl]\nusername = \"u\"\npassword = \"p\"\n",
+        );
+        assert!(config.clickhouse.is_none());
+        assert!(config.rabbitmq.is_none());
+        assert!(config.kafka.is_none());
+        assert!(config.opensearch_config().is_ok());
+
+        let config = load(
+            "[clickhouse]\nurl = \"http://ch:8123\"\n\
+             [capture_store.opensearch]\nusername = \"u\"\napi_key = \"k\"\n",
+        );
+        assert!(config.capture_store.opensearch.is_none());
+        assert!(config.clickhouse_config().is_ok());
+    }
+
+    /// Only credentials are ignored: any other key of a table without its
+    /// required keys is still an error, and so is a table that has nothing.
+    #[test]
+    fn other_keys_of_an_incomplete_section_are_still_refused() {
+        for toml in [
+            "[clickhouse]\nuser = \"u\"\ntypo = 1\n",
+            "[clickhouse]\ndatabase = \"proxyx\"\n",
+            "[rabbitmq]\npassword = \"p\"\nexchange = \"x\"\n",
+            "[capture_store.opensearch]\nindex_prefix = \"x\"\n",
+            "[kafka]\ntopic = \"t\"\n",
+        ] {
+            let parsed: Result<ControlConfig, _> =
+                Figment::new().merge(Toml::string(toml)).extract();
+            assert!(parsed.is_err(), "{toml}");
+        }
+    }
+
+    /// The capture stream follows `redis_key_prefix` unless it is named.
+    #[test]
+    fn the_capture_stream_is_under_the_key_prefix_by_default() {
+        assert_eq!(load("").request_log_stream(), "proxyx:request_log");
+        assert_eq!(
+            load("redis_key_prefix = \"proxyxb\"").request_log_stream(),
+            "proxyxb:request_log"
+        );
+        assert_eq!(
+            load("redis_key_prefix = \"proxyxb\"\nrequest_log_stream = \"legacy:log\"")
+                .request_log_stream(),
+            "legacy:log"
+        );
     }
 
     #[test]

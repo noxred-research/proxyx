@@ -68,7 +68,7 @@ A session is a JSON `SessionConfig` stored by the control plane as a plain Redis
 | `{prefix}:session_invalidations` | pub/sub channel, payload = session UUID | control API | drop a session from every proxy's local cache |
 | `{prefix}:ratelimit:{org_id}` | hash `tokens`, `last_ms`, TTL 3600 s | proxy (Redis rate-limit backend) | token bucket state |
 | `{prefix}:ratelimit:{org_id}:config` | hash `burst`, `rpm` | control API | per-org limits the Lua script reads |
-| `proxyx:request_log` (`request_log.stream_name`) | stream | proxy, control API | capture log when `broker_kind = "redis_stream"` |
+| `<redis_key_prefix>:request_log` (`request_log.stream_name`) | stream | proxy, control API | capture log when `broker_kind = "redis_stream"` |
 
 `{prefix}` is `redis_key_prefix` (default `proxyx`). It isolates deployments that share one Redis. The stream name is configured separately and is not prefixed.
 
@@ -479,7 +479,7 @@ Sources, lowest priority first: `./intercept.toml` (or `/etc/proxyx/intercept.to
 | `redis_key_prefix` | `proxyx` | must equal the control plane's value |
 | `no_capture_hosts` | empty | list or comma-separated string |
 | `broker_kind` | `redis_stream` | `redis_stream`, `kafka` or `rabbitmq` (`redpanda` is a deprecated alias of `kafka`); must match the control plane |
-| `request_log.stream_name` | `proxyx:request_log` | Redis stream; must equal the control plane's `request_log_stream` |
+| `request_log.stream_name` | `<redis_key_prefix>:request_log` | Redis stream; must equal the control plane's `request_log_stream` |
 | `request_log.channel_capacity` | 256 | writer queue and batch size; must be greater than 0 |
 | `request_log.max_stream_len` | 1000000 | `XADD MAXLEN ~ N`; 0 disables trimming |
 | `kafka.*` | none | required when `broker_kind = "kafka"`; see [capture-pipeline.md](capture-pipeline.md#broker) |

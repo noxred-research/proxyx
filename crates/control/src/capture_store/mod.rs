@@ -69,8 +69,9 @@ pub struct CaptureStoreConfig {
     /// Env: `PROXYX_CONTROL_CAPTURE_STORE__BACKEND`.
     #[serde(default)]
     pub backend: CaptureBackend,
-    /// Required when `backend = "opensearch"`.
-    #[serde(default)]
+    /// Required when `backend = "opensearch"`. A table of credentials only
+    /// (from the environment) counts as absent.
+    #[serde(default, deserialize_with = "common::config::optional_section")]
     pub opensearch: Option<OpenSearchConfig>,
 }
 
@@ -198,7 +199,10 @@ pub async fn build_store(config: &ControlConfig) -> Result<Arc<dyn CaptureStore>
     match config.capture_store.backend {
         CaptureBackend::ClickHouse => {
             let ch = config.clickhouse_config()?;
-            tracing::info!(clickhouse_url = %ch.url, "ClickHouse capture store ready");
+            tracing::info!(
+                clickhouse_url = %common::redact::url(&ch.url),
+                "ClickHouse capture store ready"
+            );
             Ok(Arc::new(ClickHouseStore::new(
                 crate::runtime::clickhouse_client(ch),
             )))
@@ -206,7 +210,7 @@ pub async fn build_store(config: &ControlConfig) -> Result<Arc<dyn CaptureStore>
         CaptureBackend::OpenSearch => {
             let os = config.opensearch_config()?;
             let store = OpenSearchStore::new(os)?;
-            tracing::info!(url = %os.url, "OpenSearch capture store ready");
+            tracing::info!(url = %common::redact::url(&os.url), "OpenSearch capture store ready");
             Ok(Arc::new(store))
         }
     }

@@ -280,7 +280,7 @@ jobs:
           cargo test --locked -p proxyx-control \
             --test object_store --test shared_clickhouse --test shared_database \
             --test search_engines --test capture_store_opensearch --test capture_store_clickhouse \
-            --test broker_kafka --test broker_rabbitmq
+            --test broker_kafka --test broker_rabbitmq --test view_export
           cargo test --locked -p proxyx-control --lib key_prefixes
           cargo test --locked -p proxyx-store --test shared_redis --test shared_database
       - name: Remove the backend services

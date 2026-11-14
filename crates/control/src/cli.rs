@@ -204,14 +204,14 @@ async fn run_api(config: ControlConfig) -> Result<()> {
     let shutdown = CancellationToken::new();
 
     let (_, redis_conn) = common::redis_connect::connect(config.redis_url.as_str()).await?;
-    tracing::info!(redis_url = %config.redis_url, "connected to Redis");
+    tracing::info!(redis_url = %common::redact::url(&config.redis_url), "connected to Redis");
 
     let ca_cert_pem = ca::load_ca_cert_pem(&config.ca)?;
 
     let log_producer: Box<dyn common::log::CaptureLogProducer> = match config.broker_kind {
         BrokerKind::RedisStream => Box::new(common::log::redis_stream::RedisStreamProducer::new(
             redis_conn.clone(),
-            config.request_log_stream.clone(),
+            config.request_log_stream(),
             config.request_log_max_stream_len,
         )),
         BrokerKind::Kafka => Box::new(
@@ -337,7 +337,10 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
         BrokerKind::RedisStream => {
             let (redis_client, redis_conn) =
                 common::redis_connect::connect(config.redis_url.as_str()).await?;
-            tracing::info!(redis_url = %config.redis_url, "connected to Redis (stream consumer)");
+            tracing::info!(
+                redis_url = %common::redact::url(&config.redis_url),
+                "connected to Redis (stream consumer)"
+            );
             let consumer_id = format!(
                 "ingester-{}",
                 uuid::Uuid::new_v4()
@@ -350,7 +353,7 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
                 common::log::redis_stream::RedisStreamConsumer::new(
                     redis_client,
                     redis_conn,
-                    config.request_log_stream.clone(),
+                    config.request_log_stream(),
                     config.consumer_group.clone(),
                     consumer_id,
                 )
@@ -405,7 +408,7 @@ async fn run_ingester(config: ControlConfig) -> Result<()> {
     ));
 
     tracing::info!(
-        stream = %config.request_log_stream,
+        stream = %config.request_log_stream(),
         group = %config.consumer_group,
         health_addr = %config.ingester_health_addr,
         "ingester started"
