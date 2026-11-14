@@ -4904,7 +4904,7 @@ checksum = "263a3f48f01e7309e857138bd47f785585b4a005e8e56c6d2824ce91195999c3"
 
 [[package]]
 name = "proxyx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4933,7 +4933,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4965,7 +4965,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4987,7 +4987,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -5047,7 +5047,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-control-graphql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-graphql",
@@ -5058,7 +5058,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-control-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "proxyx-control-graphql",
@@ -5067,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "sqlx",
@@ -5080,7 +5080,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-diag"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "proxyx-db",
@@ -5098,7 +5098,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-dial"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -5115,7 +5115,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-edge"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5157,7 +5157,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5187,7 +5187,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-intercept"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5233,14 +5233,14 @@ dependencies = [
 
 [[package]]
 name = "proxyx-limiter-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proxyx-limiter-client",
 ]
 
 [[package]]
 name = "proxyx-limiter-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "proxyx-limiter-proto",
@@ -5250,15 +5250,15 @@ dependencies = [
 
 [[package]]
 name = "proxyx-limiter-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "proxyx-limiter-proto"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "proxyx-limiter-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "proxyx-limiter-client",
@@ -5270,7 +5270,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5296,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-ops"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5322,7 +5322,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proxyx-pool-common",
  "serde",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-pool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5357,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-pool-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-pool-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5414,7 +5414,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-provider"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "proxyx-dial",
@@ -5429,7 +5429,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-session-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5466,7 +5466,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "proxyx-db",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "proxyx-dial",
@@ -5506,7 +5506,7 @@ dependencies = [
 
 [[package]]
 name = "proxyx-warmer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

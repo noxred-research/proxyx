@@ -8,10 +8,10 @@ We take the security of ProxyX and of the people who run it seriously. This page
 
 | Version | Supported |
 | --- | --- |
-| 0.1.x | Yes |
-| Earlier than 0.1.0 | No |
+| 0.2.x | Yes |
+| Earlier than 0.2.0 | No |
 
-ProxyX is pre-1.0. Only the latest 0.1.x release receives security fixes. The distribution is the source repository and tagged source releases. No binaries, container images, hosted service or crates.io packages are published, so there are no other artifacts to patch. The [Dockerfile](docker/Dockerfile) and [Compose file](docker/docker-compose.yml) in this repository are for development: do not expose the Compose stack to a network you do not control.
+ProxyX is pre-1.0. Only the latest 0.2.x release receives security fixes. The distribution is the source repository and tagged source releases. No binaries, container images, hosted service or crates.io packages are published, so there are no other artifacts to patch. The [Dockerfile](docker/Dockerfile) and [Compose file](docker/docker-compose.yml) in this repository are for development: do not expose the Compose stack to a network you do not control.
 
 ### Automated security checks
 

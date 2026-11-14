@@ -1,6 +1,6 @@
 [project]
 name = "proxyx-prober"
-version = "0.1.0"
+version = "0.2.0"
 description = "ProxyX quality prober: real browser page loads through the gateway's probe listener"
 readme = "README.md"
 requires-python = ">=3.12"

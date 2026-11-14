@@ -16,7 +16,7 @@ body:
     attributes:
       label: proxyx version or commit
       description: Output of `proxyx --version` (or `proxyx-intercept --version`), or the commit you built.
-      placeholder: "0.1.0"
+      placeholder: "0.2.0"
     validations:
       required: true
   - type: dropdown
