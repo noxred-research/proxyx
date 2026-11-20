@@ -233,7 +233,7 @@ The session proxy has a matching option for capture work. A client that runs man
 ProxyX is infrastructure that can route traffic through third-party IP addresses and decrypt TLS. Use it only where you have the right to:
 
 - **Pool addresses and provider accounts.** Operate pools from providers whose terms allow your use, and bring your own accounts. The shipped adapters are examples of the adapter format, not endorsements or bundled services.
-- **Interception.** TLS interception is for traffic whose owner has consented: your own applications and test environments, and users who have been told and agreed. The proxy only intercepts hosts a session lists, never the hosts in `no_capture_hosts`, and clients must install the session's CA to be intercepted at all. Do not use it to read other people's traffic.
+- **Interception.** TLS interception is for traffic whose owner has consented: your own applications and test environments, and users who have been told and agreed. The proxy only intercepts hosts a session lists, never the hosts in `no_capture_hosts` (except a session's exact [upstream override](docs/session-proxy.md#upstream-overrides), which sends that traffic to a private target instead of the named host), and clients must install the session's CA to be intercepted at all. Do not use it to read other people's traffic.
 - **Captured data.** Captures contain request and response bodies and headers, including credentials a client sends. Store them as sensitive data, restrict access by org, and set retention to what you need.
 - **Targets.** Do not use ProxyX to evade a site's protections, to attack or overload third parties, or for anything unlawful where you operate.
 

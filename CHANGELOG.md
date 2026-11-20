@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- **Documentation: `no_capture_hosts` and upstream overrides.** The pages said `no_capture_hosts` wins over every session, but a connection that exactly matches a session's `upstream_overrides` key is always intercepted and logged, whatever `captured_hosts`, `excluded_hosts` and `no_capture_hosts` say (the traffic goes to the override's private target, never to the named host). The session proxy and control API pages, the configuration reference and the README now state the exception and link it to [session-proxy.md](docs/session-proxy.md#upstream-overrides). The behavior is unchanged.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added

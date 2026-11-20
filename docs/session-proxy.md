@@ -120,6 +120,8 @@ A host is captured when all of these hold:
 2. it does not match an entry of the session's `excluded_hosts`, and
 3. it does not match an entry of the proxy-wide `no_capture_hosts`.
 
+One exception: a connection whose `host:port` equals a key of the session's `upstream_overrides` is intercepted and logged whatever these three lists say (see [Upstream overrides](#upstream-overrides)).
+
 Pattern syntax (`host_matches`) is exact and case-sensitive. The host is lower-cased on the way in, so write patterns in lower case.
 
 | Pattern | Matches |
@@ -128,7 +130,7 @@ Pattern syntax (`host_matches`) is exact and case-sensitive. The host is lower-c
 | `*.example.com` | `example.com` and any subdomain at any depth, but not `notexample.com` |
 | `example.com` | exactly `example.com` |
 
-Ports are not part of the pattern. Non-captured CONNECT and SOCKS5 connections are tunneled blindly and nothing is logged. Non-captured absolute-form HTTP requests instead use a framed, sanitized single exchange and close the client connection. `no_capture_hosts` (a list in the file, or a comma-separated string in `PROXYX_INTERCEPT_NO_CAPTURE_HOSTS`) is an operator-level deny list that wins over any session, for example package registries you never want to record.
+Ports are not part of the pattern. Non-captured CONNECT and SOCKS5 connections are tunneled blindly and nothing is logged. Non-captured absolute-form HTTP requests instead use a framed, sanitized single exchange and close the client connection. `no_capture_hosts` (a list in the file, or a comma-separated string in `PROXYX_INTERCEPT_NO_CAPTURE_HOSTS`) is an operator-level deny list that wins over a session's `captured_hosts` and `excluded_hosts`, for example package registries you never want to record. The only exception is an exact `host:port` match of the session's [`upstream_overrides`](#upstream-overrides): that traffic goes to the override's private target, not to the named host, and is always captured.
 
 ### Upstream overrides
 
@@ -145,7 +147,7 @@ Validation (`parse_upstream_override`, enforced by the control API at session cr
 
 When a connection's `host:port` equals an override key (host compared case-insensitively):
 
-- the connection is always intercepted, regardless of `captured_hosts` and `no_capture_hosts`;
+- the connection is always intercepted and logged, regardless of `captured_hosts`, `excluded_hosts` and `no_capture_hosts`. The named host is never contacted, so this does not record traffic to a host on the deny list, only what the session's own client sends to the private target it chose;
 - the proxy terminates the client's TLS itself (with a certificate for the logical host) and speaks plain HTTP to the override target, so the target must not require TLS;
 - the egress proxy is bypassed;
 - the logical `Host` is preserved in the forwarded request.

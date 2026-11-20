@@ -161,7 +161,7 @@ Request:
 | Field | Required | Notes |
 |---|---|---|
 | `org_id`, `source`, `source_id` | yes | `org_id` and `source_id` must be non-empty. `source` labels the caller kind; `source_id` identifies the run and is what traffic queries filter on. |
-| `captured_hosts` | yes | host patterns to intercept; `[]` captures nothing (see [session-proxy.md](session-proxy.md#capture-patterns)) |
+| `captured_hosts` | yes | host patterns to intercept; `[]` captures nothing, except for connections that match an `upstream_overrides` key, which are always captured (see [session-proxy.md](session-proxy.md#capture-patterns)) |
 | `inject_headers` | yes | list of `[name, value]` pairs; `[]` for none |
 | `serialize` | yes | run one exchange at a time per session |
 | `ttl_secs` | yes | `0` uses `session_default_ttl_secs` (default 600) |
