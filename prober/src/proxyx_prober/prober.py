@@ -23,7 +23,7 @@ from typing import Literal
 
 from . import metrics
 from .client import ApiError, ProxyXApi
-from .contract import ProbeResults, ProbeTargets, RunResult
+from .contract import ProbeResults, ProbeTargets, RunResult, inbound_username
 from .measure import (
     BrowserUnavailable,
     DriverFactory,
@@ -268,7 +268,7 @@ class Prober:
         sid = job.sid or secrets.token_hex(8)
         login = ProxyLogin(
             server=self._settings.proxy_url,
-            username=f"px-prov-{job.provider}-cc-{job.country}-sid-{sid}",
+            username=inbound_username(job.provider, job.region, sid),
             password=probe_token,
         )
         started_at = datetime.now(UTC)
