@@ -4,15 +4,15 @@
 //!   recorded but unused for routing; Redis Streams is a single-partition
 //!   log so all messages are globally ordered. Future broker impls
 //!   (Redpanda) use the same key as a partition assignment.
-//! - Consumer: dedicated non-multiplexed `Connection` for blocking
-//!   `XREADGROUP` (a `MultiplexedConnection`/`ConnectionManager` cannot
-//!   issue `BLOCK` without starving other ops). `XAUTOCLAIM` runs on the
+//! - Consumer: a dedicated `MultiplexedConnection` for blocking
+//!   `XREADGROUP`. The connection is owned by the consumer alone and is
+//!   never cloned, so a `BLOCK` cannot starve other callers (the shared
+//!   `ConnectionManager` must not issue `BLOCK`). It has no response
+//!   timeout, so a 5 s `BLOCK` is not cut short. `XAUTOCLAIM` runs on the
 //!   shared connection manager.
 //! - `session_offset`: the `<ms>-<seq>` stream id packed into a single
 //!   monotonically increasing `u64` (see `parse_offset`), used as the
 //!   sub-millisecond tiebreaker in ClickHouse sort keys.
-
-#![allow(deprecated)] // redis::aio::Connection is the only API that supports BLOCK.
 
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ impl CaptureLogProducer for RedisStreamProducer {
 /// is single-owned and is recreated on I/O failure.
 pub struct RedisStreamConsumer {
     redis: ConnectionManager,
-    blocking_conn: Option<redis::aio::Connection>,
+    blocking_conn: Option<redis::aio::MultiplexedConnection>,
     client: redis::Client,
     stream_name: String,
     consumer_group: String,
@@ -156,7 +156,7 @@ impl RedisStreamConsumer {
         let conn = match self.blocking_conn.as_mut() {
             Some(c) => c,
             None => {
-                let c = self.client.get_async_connection().await?;
+                let c = self.client.get_multiplexed_async_connection().await?;
                 self.blocking_conn = Some(c);
                 self.blocking_conn.as_mut().unwrap()
             }
@@ -372,7 +372,59 @@ fn value_to_bytes(val: redis::Value) -> Option<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OFFSET_SEQ_BITS, parse_offset};
+    use super::{OFFSET_SEQ_BITS, RedisStreamConsumer, RedisStreamProducer, parse_offset};
+    use crate::log::{CaptureLogConsumer as _, CaptureLogProducer as _};
+    use bytes::Bytes;
+    use std::time::{Duration, Instant};
+
+    /// The dedicated blocking connection delivers a published entry, acks it,
+    /// and then waits out the whole `BLOCK 5000` on an empty stream without a
+    /// response timeout cutting it short or turning it into an error.
+    /// Needs `PROXYX_TEST_REDIS_URL` (Valkey or Redis); skips without it.
+    #[tokio::test]
+    async fn the_blocking_connection_reads_then_waits_out_block() {
+        let Ok(url) = std::env::var("PROXYX_TEST_REDIS_URL") else {
+            eprintln!("SKIP: PROXYX_TEST_REDIS_URL is not set");
+            return;
+        };
+        let (client, conn) = crate::redis_connect::connect(&url).await.unwrap();
+        let stream = format!("proxyx-test-stream-{}", uuid::Uuid::new_v4());
+        let producer = RedisStreamProducer::new(conn.clone(), stream.clone(), 100);
+        let mut consumer = RedisStreamConsumer::new(
+            client,
+            conn.clone(),
+            stream.clone(),
+            "g".to_owned(),
+            "c1".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        producer
+            .publish(b"k", Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let got = consumer.poll(10).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].payload.as_ref(), b"hello");
+        for m in got {
+            m.ack.ack().await.unwrap();
+        }
+
+        let started = Instant::now();
+        let empty = consumer.poll(10).await.unwrap();
+        assert!(empty.is_empty());
+        assert!(
+            started.elapsed() >= Duration::from_millis(4500),
+            "BLOCK 5000 returned after {:?}",
+            started.elapsed()
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(&stream)
+            .query_async(&mut conn.clone())
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn parse_offset_packs_ms_and_seq() {

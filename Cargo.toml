@@ -140,7 +140,7 @@ sqlx = { version = "0.9", features = [
     "migrate",
 ] }
 clickhouse = { version = "0.15", features = ["time", "uuid"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 lapin = { version = "4", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs", "rustls-native-certs"] }
 futures-util = "0.3"
 rskafka = { version = "0.6", features = ["transport-tls"] }
@@ -164,7 +164,6 @@ dashmap = "6"
 moka = { version = "0.12", features = ["future", "sync"] }
 parking_lot = "0.12"
 time = { version = "0.3", features = ["serde"] }
-chrono = { version = "0.4", default-features = false, features = ["now"] }
 base64 = "0.23"
 flate2 = "1"
 brotli = "9"
