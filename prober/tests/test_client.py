@@ -116,6 +116,74 @@ async def test_entries_beyond_the_api_and_gateway_limits_are_skipped(
     assert [rc.route_class for rc in targets.route_classes] == ["full"]
 
 
+def region_job(region: str, country: str = "fr", **overrides: str) -> dict:
+    return {
+        "job_id": "j1",
+        "route_class": "fr-web",
+        "provider": "isp_static_port",
+        "region": region,
+        "country": country,
+        "targets": ["https://www.example.fr/"],
+    } | overrides
+
+
+async def test_regions_the_username_cannot_request_are_skipped(tmp_path: Path) -> None:
+    url = "https://www.example.fr/"
+
+    def canary(region: str, country: str = "fr", **overrides: str) -> dict:
+        entry = {"region": region, "country": country, "targets": [url]}
+        return route_class(f"rc-{region}-{country}", [url], **overrides) | {
+            "regions": [entry]
+        }
+
+    body = {
+        "route_classes": [
+            canary("fr/paris"),
+            canary("fr"),
+            canary("fr/paris", "de"),  # country is not the region's country
+            canary("fr/Paris"),  # not a city slug
+            canary("fr/pa-ris"),  # `-` would split the option
+            canary("fr/" + "c" * 49),  # city longer than the gateway accepts
+            canary("fra"),  # not a country
+            canary("fr/"),
+            canary("fr/" + "c" * 48, provider="p" * 32),  # 121 bytes with a random sid
+        ],
+        "samples": [
+            region_job("fr/paris", job_id="ok"),
+            region_job("fr/paris", "de", job_id="wrong-country"),
+            region_job("fr/paris/xx", job_id="two-slashes"),
+        ],
+    }
+    client = client_for(tmp_path, lambda _: httpx.Response(200, json=body))
+
+    targets = await client.get_targets()
+
+    assert [rc.regions[0].region for rc in targets.route_classes] == [
+        "fr/paris",
+        "fr",
+        "fr/" + "c" * 48,
+    ]
+    assert [s.job_id for s in targets.samples] == ["ok"]
+
+
+@pytest.mark.parametrize(("sid_len", "kept"), [(23, True), (24, False)])
+async def test_username_over_the_gateway_limit_is_skipped(
+    tmp_path: Path, sid_len: int, kept: bool
+) -> None:
+    # px-prov-<32>-cc-fr-city-<48>-sid-<n> is 105 + n bytes; the gateway refuses
+    # more than 128 (MAX_USERNAME_LEN), which would read as a route failure.
+    job = region_job(
+        "fr/" + "c" * 48, provider="p" * 32, sid="s" * sid_len, job_id="long"
+    )
+    client = client_for(
+        tmp_path, lambda _: httpx.Response(200, json={"samples": [job]})
+    )
+
+    targets = await client.get_targets()
+
+    assert [s.job_id for s in targets.samples] == (["long"] if kept else [])
+
+
 def scripted(
     tmp_path: Path, *replies: int | Exception, attempts: int = 3
 ) -> tuple[ProxyXClient, list[int | Exception]]:

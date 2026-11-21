@@ -123,11 +123,45 @@ async def test_canary_posts_results_through_the_probe_listener(tmp_path: Path) -
     (login,) = browsers.logins
     assert login.server == settings.proxy_url
     assert login.password == f"{PROBE_TOKEN}-1"
+    # The username asks for the region the result is reported for: the city
+    # too, not only the country.
     match = re.fullmatch(
-        r"px-prov-isp_static_port-cc-fr-sid-([a-z0-9]{16})", login.username
+        r"px-prov-isp_static_port-cc-fr-city-paris-sid-([a-z0-9]{16})",
+        login.username,
     )
     assert match is not None
     assert posted.session == match.group(1)
+
+
+async def test_country_only_region_requests_no_city(tmp_path: Path) -> None:
+    country_only = RouteClass(
+        route_class="fr-web",
+        provider="isp_static_port",
+        regions=[RegionTargets(region="fr", country="fr", targets=[OK_URL])],
+    )
+    prober, api, browsers, _ = build(
+        settings_for(tmp_path), ProbeTargets(route_classes=[country_only])
+    )
+
+    await run_until(prober, lambda: bool(api.posted))
+
+    (posted,) = api.posted
+    assert (posted.region, posted.country) == ("fr", "fr")
+    (login,) = browsers.logins
+    assert re.fullmatch(
+        r"px-prov-isp_static_port-cc-fr-sid-[a-z0-9]{16}", login.username
+    )
+
+
+async def test_sample_requests_its_city_with_its_sticky_key(tmp_path: Path) -> None:
+    prober, api, browsers, _ = build(
+        settings_for(tmp_path), ProbeTargets(samples=[sample("job9", sid="cand_9")])
+    )
+
+    await run_until(prober, lambda: bool(api.posted))
+
+    (login,) = browsers.logins
+    assert login.username == "px-prov-isp_static_port-cc-fr-city-paris-sid-cand_9"
 
 
 async def test_each_browser_gets_its_own_short_lived_token(tmp_path: Path) -> None:
