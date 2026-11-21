@@ -307,11 +307,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Dependencies come from a hash-locked file (prober/requirements-test.txt); the prober
+      # itself runs from source through pytest's `pythonpath`, so nothing else is fetched.
       - name: Prober tests
         working-directory: prober
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install -e '.[test]'
+          .venv/bin/pip install --require-hashes --no-deps -r requirements-test.txt
           .venv/bin/python -m pytest -q tests
 
   # Skipped jobs count as passed for a required check, so the gated jobs themselves cannot be
