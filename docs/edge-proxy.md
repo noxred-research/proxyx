@@ -141,6 +141,22 @@ With `auth.login_options = true`, the login may carry options off its right end,
 
 An option the user may not use is `403 option_denied`. This is the same style as the `px-...-sid-...` grammar of the [pool gateway](gateway.md), so a client written for one works with the other.
 
+### Moving off legacy `{SHA}` hashes
+
+`{SHA}` is the unsalted SHA-1 htpasswd format. It is deprecated: it stays verify-only for compatibility with existing files (the comparison is constant time) and ProxyX never writes it, but it is fast to brute-force and identical passwords give identical hashes. Each time the edge loads its user set (at start and at every reload) it logs one warning for each user whose hash is `{SHA}`, naming the user and never the hash:
+
+```
+WARN password hash uses the deprecated unsalted SHA-1 `{SHA}` format; replace it with bcrypt or argon2 (htpasswd -nbB) user=alice
+```
+
+To migrate, set a new password for each named user with a modern format and swap the entry. A stored `{SHA}` hash cannot be converted, because the password is not recoverable from it:
+
+1. `htpasswd -nbB alice 'new-password'` prints `alice:$2y$05$...` (bcrypt). For argon2 use a tool that writes `$argon2id$` strings.
+2. Replace the user's line in `auth.users_file`, or the `password_hash` of the `[[user]]` table, with the new hash, and give the user the new password.
+3. Reload the edge (`SIGHUP`) or restart it, and check that the warning for that user is gone.
+
+Support for `{SHA}` is kept until a release whose [changelog](../CHANGELOG.md) announces its removal.
+
 ## Access rules and the destination check
 
 `[[rule]]` tables are checked in order and the first match decides; no match is a deny. A `when = { ... }` table holds conditions, all of which must hold; the values of one field are alternatives.
