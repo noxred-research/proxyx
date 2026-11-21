@@ -11,7 +11,7 @@ and decides whether to drain a route class.
    `(route class, region)` and the on-demand **samples** that the warmer queued.
 2. For each job it fetches a signed token from `POST /v1/probe/token`
    (`pt1.<expiry>.<mac>`, valid 30 minutes), launches a headless browser with
-   the probe listener as its proxy (username `px-prov-<provider>-cc-<country>-sid-<sid>`,
+   the probe listener as its proxy (username `px-prov-<provider>-cc-<country>[-city-<city>]-sid-<sid>`,
    password the token), and loads every target `PROXYX_PROBER_RUNS_PER_TARGET`
    times, each in a fresh browser context.
 3. Posts one result per job to `POST /v1/probe/results`: status, time to first
@@ -58,9 +58,12 @@ in `crates/gateway/src/lib.rs`. The metrics are listed under "Prober" in
 pip install -e .            # from this directory
 # wire-compat: the browser-automation library's own browser installer
 playwright install chromium # downloads the browser build the driver launches
-export PROXYX_PROBER_API_URL=http://localhost:8080
+export PROXYX_PROBER_API_URL=http://127.0.0.1:8081
 export PROXYX_PROBER_API_TOKEN_FILE=/run/secrets/prober-token
 export PROXYX_PROBER_PROXY_URL=http://localhost:8082
+# 8081 is the gateway's control API on a shared host: give the prober's own
+# metrics endpoint another port.
+export PROXYX_PROBER_METRICS_PORT=9102
 python -m proxyx_prober
 ```
 

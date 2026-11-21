@@ -1161,6 +1161,9 @@ canary), and the browser samples the warmer queued.
 Every provider is a route class (a provider with a `route_class` policy takes that policy's name). A
 provider id that contains `-` is skipped, because the prober builds usernames from it. Regions come from
 the probe org's effective policy; targets come from [`probe-targets.toml`](providers.md#probe-targets).
+The prober requests the whole region: `-cc-<country>` and, for a region with a city (`fr/paris`),
+`-city-<city>`. It skips an entry whose region is not a country or country and city, whose `country`
+is not the region's country, or whose username would exceed the 128-byte limit.
 
 ### `POST /v1/probe/results`
 
