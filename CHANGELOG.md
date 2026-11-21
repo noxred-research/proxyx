@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - CI: `cargo deny` ignores RUSTSEC-2026-0543 (the `chrono` crate is reported as unmaintained; there is no vulnerability). The session proxy needs `chrono` only to build the timestamp of an `rskafka` record, and `rskafka` depends on it itself. Without the entry the `lint` job fails on `main` and on every pull request; the entry in `deny.toml` says why it is safe and when to revisit it.
 - **Edge: legacy `{SHA}` password hashes are deprecated.** The edge still verifies unsalted SHA-1 `{SHA}` htpasswd hashes (verify-only, constant-time compare), but it now logs one warning each time it loads its user set, for each user that still has one. The warning names the user and never the hash. The migration path to bcrypt or argon2 is in [edge-proxy.md](docs/edge-proxy.md#moving-off-legacy-sha-hashes). Nothing is removed and no hash is rewritten.
+- CI: the `prober` job installs its test dependencies from `prober/requirements-test.txt` with `pip install --require-hashes --no-deps`, so every package is pinned to a version and a sha256 (OpenSSF Scorecard `PinnedDependencies`). The prober runs from source through pytest's `pythonpath` and is no longer installed as a package in that job. The file header gives the command that regenerates it.
 
 ## [0.2.0] - 2026-11-14
 
