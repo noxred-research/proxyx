@@ -182,6 +182,15 @@ pub fn is_supported(hash: &str) -> bool {
     parse(hash).is_ok()
 }
 
+/// True when `hash` is the legacy `{SHA}` format (unsalted, fast SHA-1).
+///
+/// The format stays verifiable for compatibility with existing htpasswd files, but it is
+/// deprecated: callers warn about it at load time so the operator replaces it with bcrypt or
+/// argon2.
+pub fn is_legacy_sha1(hash: &str) -> bool {
+    hash.starts_with("{SHA}")
+}
+
 /// Constant-time verify of `password` against `hash`.
 ///
 /// Returns `Ok(false)` for a wrong password, `Err(Unsupported)` for an unknown format and

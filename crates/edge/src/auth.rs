@@ -223,6 +223,20 @@ impl Users {
                 }),
             );
         }
+        // Verify-only compatibility: name each user still on the unsalted SHA-1 format, never
+        // the hash.
+        let mut legacy: Vec<&str> = by_name
+            .values()
+            .filter(|u| matches!(&u.cred, Credential::Hash(h) if password::is_legacy_sha1(h)))
+            .map(|u| u.name.as_str())
+            .collect();
+        legacy.sort_unstable();
+        for name in legacy {
+            tracing::warn!(
+                user = name,
+                "password hash uses the deprecated unsalted SHA-1 `{{SHA}}` format; replace it with bcrypt or argon2 (htpasswd -nbB)"
+            );
+        }
         if login_options {
             for name in by_name.keys() {
                 match split_login(name) {
@@ -601,6 +615,104 @@ mod tests {
         assert!(u.get("file_only").is_some());
         assert_eq!(u.groups(), vec!["staff"]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Collects formatted log lines so a test can read them back.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn legacy_sha1_hashes_warn_once_per_user_and_never_log_the_hash() {
+        use base64::Engine as _;
+        use sha1::Digest as _;
+        let sha1_hash = |input: &str| {
+            format!(
+                "{{SHA}}{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha1::Sha1::digest(input.as_bytes()))
+            )
+        };
+        let file_hash = sha1_hash("a");
+        let table_hash = sha1_hash("b");
+        let bcrypt = pwhash::bcrypt::hash_with(
+            pwhash::bcrypt::BcryptSetup {
+                cost: Some(4),
+                ..Default::default()
+            },
+            "pw",
+        )
+        .expect("hash");
+        let path =
+            std::env::temp_dir().join(format!("edge-auth-sha1-{}.htpasswd", std::process::id()));
+        std::fs::write(
+            &path,
+            format!("old_file:{file_hash}\nmodern_file:{bcrypt}\n"),
+        )
+        .expect("write");
+        let cfg = Config::parse(&format!(
+            "[[user]]\nname = \"old_table\"\npassword_hash = \"{table_hash}\"\n\
+             [[user]]\nname = \"modern_table\"\npassword = \"pw\"\n"
+        ))
+        .expect("parse");
+
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let built = tracing::subscriber::with_default(subscriber, || {
+            Users::build(&cfg.users, Some(&path), false)
+        });
+        let _ = std::fs::remove_file(&path);
+        let users = built.expect("users");
+        // The warning does not change loading: both legacy users are still accepted.
+        assert!(users.get("old_file").is_some() && users.get("old_table").is_some());
+
+        let log = String::from_utf8(buf.0.lock().clone()).expect("utf8 log");
+        let warnings: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 2, "one warning per legacy user: {log}");
+        assert!(
+            warnings
+                .iter()
+                .any(|l| l.contains("user=\"old_file\"") || l.contains("user=old_file")),
+            "{log}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|l| l.contains("user=\"old_table\"") || l.contains("user=old_table")),
+            "{log}"
+        );
+        assert!(
+            log.contains("deprecated") && log.contains("bcrypt"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("modern_"),
+            "only SHA-1 users are named: {log}"
+        );
+        for hash in [&file_hash, &table_hash, &bcrypt] {
+            assert!(!log.contains(hash.as_str()), "a hash reached the log");
+        }
     }
 
     #[test]

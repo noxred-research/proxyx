@@ -209,6 +209,17 @@ pub(crate) fn parse_host(text: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// An org key is only stored as a plain SHA-256, which is safe because the key itself is
+    /// 256 bits from the operating system's generator.
+    #[test]
+    fn a_random_token_carries_256_bits_of_entropy() {
+        let token = random_token("ak_");
+        let body = token.strip_prefix("ak_").expect("prefix");
+        let raw = URL_SAFE_NO_PAD.decode(body).expect("url-safe base64");
+        assert_eq!(raw.len(), 32, "{token}");
+        assert_ne!(token, random_token("ak_"), "two tokens must differ");
+    }
+
     #[test]
     fn an_id_is_a_short_plain_token() {
         for ok in ["a", "8f14e45f-ceea-467a-9575-1a3f1d4d9d0e", "s_1-2"] {
