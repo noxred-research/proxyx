@@ -47,8 +47,8 @@ const MAX_TARGETS: usize = 100;
 /// Longest page URL the prober accepts.
 const MAX_TARGET_LEN: usize = 2_048;
 
-/// The prober builds usernames from provider and country, and `-` separates
-/// options there.
+/// The prober builds usernames from provider, country and city, and `-`
+/// separates options there.
 fn option_safe(provider: &ProviderId) -> bool {
     !provider.as_str().contains('-')
 }
