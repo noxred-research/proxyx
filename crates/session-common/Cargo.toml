@@ -30,7 +30,6 @@ redis.workspace = true
 rskafka.workspace = true
 lapin.workspace = true
 futures-util.workspace = true
-chrono.workspace = true
 rustls.workspace = true
 parking_lot.workspace = true
 prometheus.workspace = true

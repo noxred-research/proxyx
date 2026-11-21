@@ -21,11 +21,15 @@ ignore = [
   # page size. SQLx 0.9 now resolves libsqlite3-sys 0.37, but the fix needs 0.39,
   # outside its supported range (<0.38). ProxyX opens only operator-owned files.
   { id = "RUSTSEC-2026-0459", reason = "needs local write access to the database directory; revisit with the next sqlx release" },
-  # chrono: reported as unmaintained, with no vulnerability. The session proxy needs it only
-  # to build the `DateTime<Utc>` timestamp of an `rskafka` record, and `rskafka` (the Kafka
-  # client) depends on it itself, so it cannot be dropped alone. Only the `now` feature is on.
-  { id = "RUSTSEC-2026-0543", reason = "unmaintained notice, not a vulnerability; required by rskafka's record type; revisit when rskafka moves off chrono" },
 ]
+# RUSTSEC-2026-0543 (chrono, unmaintained, no vulnerability) is deliberately NOT ignored. No
+# ProxyX crate depends on `chrono` directly any more: `rskafka` 0.6.0 pulls it in and re-exports it
+# for its record timestamp, and `unmaintained = "workspace"` only reports direct workspace
+# dependencies, so `cargo deny` passes (an ignore entry would only warn `advisory-not-detected`).
+# Scanners that read `Cargo.lock` (OpenSSF Scorecard, OSV) still report it. Upstream issue:
+# https://github.com/influxdata/rskafka/issues/311.
+# REVIEW BY 2026-12-31: bump rskafka once a release drops chrono. If a ProxyX crate ever depends on
+# chrono directly again, add the ignore here with a reason and the same expiry.
 
 [bans]
 multiple-versions = "warn"
