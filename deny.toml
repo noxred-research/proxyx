@@ -21,6 +21,10 @@ ignore = [
   # page size. SQLx 0.9 now resolves libsqlite3-sys 0.37, but the fix needs 0.39,
   # outside its supported range (<0.38). ProxyX opens only operator-owned files.
   { id = "RUSTSEC-2026-0459", reason = "needs local write access to the database directory; revisit with the next sqlx release" },
+  # chrono: reported as unmaintained, with no vulnerability. The session proxy needs it only
+  # to build the `DateTime<Utc>` timestamp of an `rskafka` record, and `rskafka` (the Kafka
+  # client) depends on it itself, so it cannot be dropped alone. Only the `now` feature is on.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained notice, not a vulnerability; required by rskafka's record type; revisit when rskafka moves off chrono" },
 ]
 
 [bans]

@@ -10,6 +10,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - **Prober canaries for a city were requested as the whole country.** The prober reported a result under `fr/paris` but its proxy username carried only `-cc-fr`, so the measurement came from any city of the country. The username now carries `-city-<city>` for a region with a city, and the prober skips (and logs) an entry whose region is not `cc` or `cc/city`, whose `country` is not the region's country, or whose username would exceed the gateway's 128 bytes. The quick start in `prober/README.md` pointed the control API at the CONNECT port (8080) and left the prober's metrics port at the gateway API's 8081; it now uses 8081 for the API and `PROXYX_PROBER_METRICS_PORT=9102`.
 
+### Changed
+
+- CI: `cargo deny` ignores RUSTSEC-2026-0543 (the `chrono` crate is reported as unmaintained; there is no vulnerability). The session proxy needs `chrono` only to build the timestamp of an `rskafka` record, and `rskafka` depends on it itself. Without the entry the `lint` job fails on `main` and on every pull request; the entry in `deny.toml` says why it is safe and when to revisit it.
+
 ## [0.2.0] - 2026-11-14
 
 ### Added
