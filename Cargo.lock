@@ -5317,7 +5317,7 @@ version = "0.2.0"
 name = "proxyx-limiter-server"
 version = "0.2.0"
 dependencies = [
- "parking_lot 0.12.5",
+ "parking_lot 0.13.0",
  "proxyx-limiter-client",
  "proxyx-limiter-core",
  "proxyx-limiter-proto",
