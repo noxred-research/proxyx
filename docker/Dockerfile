@@ -10,7 +10,7 @@
 # Base images are pinned by manifest-list digest; Dependabot proposes the digests (.github/dependabot.yml).
 # The builder tag matches rust-toolchain.toml: cargo installs the version that file names, so
 # change the file and the tag together.
-FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 # cmake, clang and perl build BoringSSL (the session proxy's upstream TLS stack);
 # librdkafka needs libssl-dev, libsasl2-dev and zlib; protoc is vendored by the workspace.
 RUN apt-get update \
