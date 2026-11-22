@@ -75,7 +75,7 @@ async fn an_org_is_not_stalled_by_the_rest_of_the_only_ip_and_the_broken_limit_i
     let broken = |limit| {
         h.metrics
             .lease_limit_broken_total
-            .with_label_values(&[limit, &setup.provider])
+            .with_label_values(&[limit, setup.provider.as_str()])
             .get()
     };
 

@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use common::Secret;
 use common::types::{ProviderId, UpstreamEndpoint, UpstreamScheme};
 use parking_lot::Mutex;
-use rand::Rng as _;
+use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
 
@@ -394,7 +394,7 @@ impl Selector {
             Strategy::RoundRobin | Strategy::Race => {
                 weighted(self.cursor.fetch_add(1, Ordering::Relaxed) % total)
             }
-            Strategy::Random => weighted(rand::thread_rng().gen_range(0..total)),
+            Strategy::Random => weighted(rand::rng().random_range(0..total)),
             Strategy::LeastConnections => *candidates.iter().min_by_key(|&&i| {
                 (
                     parents.list[i]
@@ -532,7 +532,7 @@ impl Parents {
         if total == 0 {
             return None;
         }
-        let mut pick = rand::thread_rng().gen_range(0..total);
+        let mut pick = rand::rng().random_range(0..total);
         for &i in &tier {
             let weight = u64::from(self.list[i].weight);
             if pick < weight {

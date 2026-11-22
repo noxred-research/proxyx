@@ -402,8 +402,8 @@ fn providers_of(vec: &dyn Collector) -> Vec<String> {
             metric
                 .get_label()
                 .iter()
-                .find(|label| label.get_name() == "provider")
-                .map(|label| label.get_value().to_owned())
+                .find(|label| label.name() == "provider")
+                .map(|label| label.value().to_owned())
         })
         .collect()
 }
@@ -590,10 +590,10 @@ mod tests {
                     .get_metric()
                     .iter()
                     .flat_map(|metric| metric.get_label())
-                    .map(|pair| pair.get_name().to_owned())
+                    .map(|pair| pair.name().to_owned())
                     .filter(|name| name != "service")
                     .collect();
-                (family.get_name().to_owned(), labels)
+                (family.name().to_owned(), labels)
             })
             .collect();
 

@@ -527,7 +527,10 @@ async fn via_parent(
     }
     metrics
         .parent_requests_total
-        .with_label_values(&[&parent.name, if result.is_ok() { "ok" } else { "failed" }])
+        .with_label_values(&[
+            parent.name.as_str(),
+            if result.is_ok() { "ok" } else { "failed" },
+        ])
         .inc();
     result
 }

@@ -21,7 +21,7 @@ use crate::db::Db;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use moka::future::Cache;
-use rand::RngCore as _;
+use rand::TryRng as _;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
@@ -138,7 +138,9 @@ impl KeyStore {
             ));
         }
         let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut secret)
+            .expect("the operating system RNG failed");
         let key = format!("{KEY_PREFIX}{}", URL_SAFE_NO_PAD.encode(secret));
         self.db
             .insert_key(hash(&key).as_slice(), kind.as_str(), org_id, name)

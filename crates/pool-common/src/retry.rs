@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Exponential backoff with full jitter: a random wait in `[0, min(cap, base * 2^attempt)]`.
 pub fn full_jitter(base: Duration, cap: Duration, attempt: u32) -> Duration {
@@ -14,12 +14,12 @@ pub fn full_jitter(base: Duration, cap: Duration, attempt: u32) -> Duration {
         .unwrap_or(cap)
         .min(cap);
     let millis = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
-    Duration::from_millis(rand::thread_rng().gen_range(0..=millis))
+    Duration::from_millis(rand::rng().random_range(0..=millis))
 }
 
 /// Add up to `share` (0.0 to 1.0) random extra time to an interval.
 pub fn jittered(interval: Duration, share: f64) -> Duration {
-    let extra = interval.mul_f64(share.clamp(0.0, 1.0) * rand::thread_rng().r#gen::<f64>());
+    let extra = interval.mul_f64(share.clamp(0.0, 1.0) * rand::rng().random::<f64>());
     interval + extra
 }
 

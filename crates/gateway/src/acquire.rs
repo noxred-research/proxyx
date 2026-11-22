@@ -69,7 +69,7 @@ use dial::{DialTimeouts, ProxyStream};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use policy::{EffectivePolicy, InboundOptions, LeaseRequest as Narrowed, OnEmpty};
 use provider::{Adapter, UnitSpec};
-use rand::Rng as _;
+use rand::RngExt as _;
 use store::loaded::Loaded;
 use store::{
     Admit, CostUsage, ExitIpClaim, Grant, InventoryRow, LeaseLimits, LeaseOutcome, LeaseRequest,
@@ -1823,9 +1823,9 @@ impl Gateway {
             }
             let alphabet = c.adapter.session_id_alphabet();
             let sid: String = {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 (0..id_len)
-                    .map(|_| char::from(alphabet[rng.gen_range(0..alphabet.len())]))
+                    .map(|_| char::from(alphabet[rng.random_range(0..alphabet.len())]))
                     .collect()
             };
             let session = c

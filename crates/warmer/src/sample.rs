@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use common::types::{IpState, Partition, Tier};
 use policy::EffectivePolicy;
-use rand::Rng as _;
+use rand::RngExt as _;
 use store::{SampleJob, Transition, Verdict, sid_sticky};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -53,8 +53,7 @@ impl Warmer {
         policy: &EffectivePolicy,
     ) {
         let targets = self.loaded().probe_targets.for_region(&partition.region);
-        if targets.is_empty() || rand::thread_rng().r#gen::<f64>() >= policy.criteria.browser_sample
-        {
+        if targets.is_empty() || rand::rng().random::<f64>() >= policy.criteria.browser_sample {
             return;
         }
         if let Err(error) = self.queue_sample(partition, subject, unit, &targets).await {

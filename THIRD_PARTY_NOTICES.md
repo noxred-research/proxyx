@@ -24,7 +24,7 @@ The following native components can be built from source by Cargo build scripts 
 
 | Component | Crate (version in `Cargo.lock`) | Used by | License |
 | --- | --- | --- | --- |
-| BoringSSL | `boring-sys` 5.4.0 | `proxyx-intercept` (upstream TLS with browser-grade fingerprints) | bundled BoringSSL is Apache-2.0; the Rust bindings are MIT; retain the bundled source notices |
+| BoringSSL | `boring-sys` 5.6.0 | `proxyx-intercept` (upstream TLS with browser-grade fingerprints) | bundled BoringSSL is Apache-2.0; the Rust bindings are MIT; retain the bundled source notices |
 | aws-lc and ring | `aws-lc-sys` 0.47.0, `ring` 0.17.14 | rustls cryptography | aws-lc's full license expression combines ISC, Apache-2.0, MIT, BSD-3-Clause and MIT-0; see its crate metadata and bundled notices. ring is Apache-2.0 AND ISC |
 | librdkafka | `rdkafka-sys` 4.10.0+2.12.1 | the control plane's Kafka consumer | BSD-2-Clause, with the licenses of its bundled sources in the crate |
 | jemalloc | `tikv-jemalloc-sys` 0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8 | allocator of both binaries | jemalloc is BSD-2-Clause; the crate is MIT OR Apache-2.0 |
