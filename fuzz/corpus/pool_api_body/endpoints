@@ -1,0 +1,2 @@
+
+{"gateway_host":"gw.example.com","http_port":8080,"count":3,"country":"fr","city":"paris","rotation":"sticky","ttl":"30m"}

@@ -1,0 +1,1 @@
+{"kind":"sample","provider":"static","region":"fr","job_id":"j-1","results":[{"outcome":"ok","status":200,"ttfb_ms":10.0,"load_ms":20.0}]}

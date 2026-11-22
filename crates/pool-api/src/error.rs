@@ -204,8 +204,17 @@ async fn read_json<S: Send + Sync, T: DeserializeOwned>(
         ));
     }
     let ApiBytes(body) = ApiBytes::from_request(req, state).await?;
-    shape(&body)?;
-    match Json::<T>::from_bytes(&body) {
+    parse_json(&body, shape)
+}
+
+/// `body` as the route's `T`, after the route's `shape` check: a bad body is a `400`
+/// `{"error": ...}`.
+pub(crate) fn parse_json<T: DeserializeOwned>(
+    body: &[u8],
+    shape: fn(&[u8]) -> Result<(), ApiError>,
+) -> Result<T, ApiError> {
+    shape(body)?;
+    match Json::<T>::from_bytes(body) {
         Ok(Json(value)) => Ok(value),
         Err(rejection) => Err(ApiError::bad_request(rejection.body_text())),
     }

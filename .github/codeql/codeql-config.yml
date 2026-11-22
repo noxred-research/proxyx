@@ -1,7 +1,8 @@
 # CodeQL scope: the code ProxyX ships.
 #
-# Not analyzed: integration tests, benches and fixtures. They are never built into a release
-# binary, and they deliberately hold test vectors, generated keys and loopback http:// URLs.
+# Not analyzed: integration tests, benches, fixtures and the fuzz targets. They are never built
+# into a release binary, and they deliberately hold test vectors, generated keys and loopback
+# http:// URLs.
 # Unit tests inside `#[cfg(test)]` modules of src files are still analyzed; dismiss their
 # findings as "used in tests" one by one.
 name: proxyx
@@ -11,3 +12,4 @@ paths-ignore:
   - "**/benches/**"
   - "**/fixtures/**"
   - "**/golden/**"
+  - "fuzz/**"

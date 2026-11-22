@@ -29,9 +29,23 @@ const MAX_BLOCK_TTL: Duration = Duration::from_secs(366 * 86_400);
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct KeyBody {
+pub(crate) struct KeyBody {
     #[serde(default)]
     label: String,
+}
+
+/// The body of a key request: no body is an empty label. The label is checked as the store
+/// will keep it.
+pub(crate) fn key_body(body: &[u8]) -> Result<KeyBody, ApiError> {
+    let key = if body.is_empty() {
+        KeyBody::default()
+    } else {
+        ensure_object(body)?;
+        serde_json::from_slice(body)
+            .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
+    };
+    ensure_text("label", &key.label, MAX_NAME_LEN)?;
+    Ok(key)
 }
 
 /// `POST /v1/orgs/{org}/keys`: create a key and return it. Only the sha256
@@ -44,20 +58,13 @@ pub(crate) async fn create_key(
     ApiBytes(body): ApiBytes,
 ) -> Result<impl IntoResponse, ApiError> {
     let org = parse_org(&org)?;
-    let body: KeyBody = if body.is_empty() {
-        KeyBody::default()
-    } else {
-        if !json_content_type(&headers) {
-            return Err(ApiError::new(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "expected request with `Content-Type: application/json`",
-            ));
-        }
-        ensure_object(&body)?;
-        serde_json::from_slice(&body)
-            .map_err(|e| ApiError::bad_request(format!("invalid body: {e}")))?
-    };
-    ensure_text("label", &body.label, MAX_NAME_LEN)?;
+    if !body.is_empty() && !json_content_type(&headers) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "expected request with `Content-Type: application/json`",
+        ));
+    }
+    let body = key_body(&body)?;
     let key = Secret::new(random_token("ak_"));
     state
         .db
@@ -94,6 +101,22 @@ pub(crate) struct BlockBody {
     ttl: Option<String>,
 }
 
+impl BlockBody {
+    /// The scope the block covers and when it ends, after every check that needs no store.
+    pub(crate) fn checked(&self) -> Result<(store::BlockScope, Option<OffsetDateTime>), ApiError> {
+        let scope = parse_scope(&self.scope, &self.value).map_err(ApiError::bad_request)?;
+        ensure_text("reason", &self.reason, MAX_REASON_LEN)?;
+        let ttl: Option<Duration> = self
+            .ttl
+            .as_deref()
+            .map(humantime_secs::parse)
+            .transpose()
+            .map_err(|e| ApiError::bad_request(format!("ttl: {e}")))?;
+        let expires_at = ttl.map(block_expiry).transpose()?;
+        Ok((scope, expires_at))
+    }
+}
+
 /// `POST /v1/org-blocks`: stop an org from using a scope. Open tunnels of
 /// the org inside the scope are asked to close.
 pub(crate) async fn create_block(
@@ -101,15 +124,7 @@ pub(crate) async fn create_block(
     Actor(actor): Actor,
     ApiJson(body): ApiJson<BlockBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let scope = parse_scope(&body.scope, &body.value).map_err(ApiError::bad_request)?;
-    ensure_text("reason", &body.reason, MAX_REASON_LEN)?;
-    let ttl: Option<Duration> = body
-        .ttl
-        .as_deref()
-        .map(humantime_secs::parse)
-        .transpose()
-        .map_err(|e| ApiError::bad_request(format!("ttl: {e}")))?;
-    let expires_at = ttl.map(block_expiry).transpose()?;
+    let (scope, expires_at) = body.checked()?;
 
     let block = state
         .db

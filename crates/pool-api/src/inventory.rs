@@ -71,6 +71,33 @@ pub(crate) struct PutBody {
     entries: Vec<InventoryEntry>,
 }
 
+impl PutBody {
+    /// Every check of a replacement that needs no store: the size, static subtypes only and
+    /// each entry.
+    pub(crate) fn checked(&self, adapter: Option<&Adapter>) -> Result<(), ApiError> {
+        if self.entries.len() > MAX_ENTRIES {
+            return Err(ApiError::bad_request(format!(
+                "at most {MAX_ENTRIES} entries per request"
+            )));
+        }
+        if let Some(e) = self
+            .entries
+            .iter()
+            .find(|e| e.subtype.kind() != Kind::Static)
+        {
+            return Err(ApiError::bad_request(format!(
+                "{}: a {} subtype is not a static inventory entry",
+                e.ip,
+                e.subtype.as_str()
+            )));
+        }
+        for e in &self.entries {
+            ensure_entry(e, adapter).map_err(|err| err.prefixed(&e.ip.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
 /// `PUT /v1/inventory/{provider}`: make the provider's inventory equal to
 /// `entries`. Known IPs keep their state; IPs left out are retired.
 pub(crate) async fn put(
@@ -80,27 +107,8 @@ pub(crate) async fn put(
     ApiJson(body): ApiJson<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
     let provider: ProviderId = parse_arg(&provider)?;
-    if body.entries.len() > MAX_ENTRIES {
-        return Err(ApiError::bad_request(format!(
-            "at most {MAX_ENTRIES} entries per request"
-        )));
-    }
-    if let Some(e) = body
-        .entries
-        .iter()
-        .find(|e| e.subtype.kind() != Kind::Static)
-    {
-        return Err(ApiError::bad_request(format!(
-            "{}: a {} subtype is not a static inventory entry",
-            e.ip,
-            e.subtype.as_str()
-        )));
-    }
     let loaded = state.loaded.borrow().clone();
-    let adapter = loaded.adapters.get(&provider);
-    for e in &body.entries {
-        ensure_entry(e, adapter).map_err(|err| err.prefixed(&e.ip.to_string()))?;
-    }
+    body.checked(loaded.adapters.get(&provider))?;
     let sync = state
         .db
         .replace_inventory(&provider, &body.entries, &actor)

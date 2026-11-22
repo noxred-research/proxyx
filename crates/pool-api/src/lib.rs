@@ -27,6 +27,8 @@
 
 mod auth;
 mod error;
+#[doc(hidden)]
+pub mod fuzzing;
 mod inventory;
 mod ops;
 mod orgs;

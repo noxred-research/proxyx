@@ -1,0 +1,1 @@
+{"gateway_host":"gw.example.com","http_port":8080,"ttl":"2h","rotation":"each"}

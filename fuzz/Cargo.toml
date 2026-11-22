@@ -1,0 +1,73 @@
+[package]
+name = "proxyx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "cargo-fuzz targets for ProxyX parsers; excluded from the main workspace"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: the root `Cargo.toml` excludes `fuzz/` so the fuzz profile, the libFuzzer
+# runtime and `-C instrument-coverage` never leak into the product build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proxyx-edge = { path = "../crates/edge" }
+proxyx-pool-api = { path = "../crates/pool-api" }
+base64 = "0.23"
+percent-encoding = "2"
+url = "2"
+
+[lib]
+name = "proxyx_fuzz"
+path = "src/lib.rs"
+
+# Every target is a `#![no_main]` libFuzzer entry under `--cfg fuzzing` (what `cargo fuzz`
+# passes) and a plain stdin-driven binary otherwise, so `cargo check --manifest-path
+# fuzz/Cargo.toml` works on stable and a crash input can be replayed without nightly.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[[bin]]
+name = "htpasswd_parse"
+path = "fuzz_targets/htpasswd_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "password_verify"
+path = "fuzz_targets/password_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "basic_header"
+path = "fuzz_targets/basic_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login_split"
+path = "fuzz_targets/login_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pool_api_body"
+path = "fuzz_targets/pool_api_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pool_api_endpoint"
+path = "fuzz_targets/pool_api_endpoint.rs"
+test = false
+doc = false
+bench = false

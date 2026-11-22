@@ -255,6 +255,23 @@ fn encode_userinfo(out: &mut String, secret: &str) {
     }
 }
 
+/// The first endpoint of a request as the handler renders it (a sticky one with a full-length
+/// session id): the username, the URL and the explicit credential, when the request has one.
+pub(crate) fn first_endpoint(
+    body: &EndpointsBody,
+) -> Result<(String, String, Option<String>), ApiError> {
+    let generator = Generator::new(body)?;
+    let username = generator.username(Some("00000000000000000000000000000000"));
+    let key = body.org_key.as_ref().map(|key| key.expose().to_owned());
+    let encoded = key.as_deref().map(|key| {
+        let mut encoded = String::with_capacity(key.len().saturating_mul(3));
+        encode_userinfo(&mut encoded, key);
+        encoded
+    });
+    let url = generator.url(&username, encoded.as_deref());
+    Ok((username, url, key))
+}
+
 pub(crate) async fn generate(
     State(state): State<Arc<ApiState>>,
     Path(org): Path<String>,
