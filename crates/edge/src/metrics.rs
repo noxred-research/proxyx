@@ -294,7 +294,7 @@ impl Metrics {
         .into_iter()
         .flatten()
         {
-            let (entries, key) = match family.get_name() {
+            let (entries, key) = match family.name() {
                 "proxyx_edge_connections_total"
                 | "proxyx_edge_connections_open"
                 | "proxyx_edge_requests_total" => (&mut snapshot.listeners, "listener"),
@@ -308,15 +308,15 @@ impl Metrics {
                     metric
                         .get_label()
                         .iter()
-                        .find(|label| label.get_name() == name)
-                        .map(|label| label.get_value())
+                        .find(|label| label.name() == name)
+                        .map(|label| label.value())
                 };
                 let Some(name) = label(key) else {
                     continue;
                 };
                 let activity = entries.entry(name.to_owned()).or_default();
                 let count = metric.get_counter().get_value() as u64;
-                match family.get_name() {
+                match family.name() {
                     "proxyx_edge_connections_total" => {
                         activity.total_connections =
                             activity.total_connections.saturating_add(count);
@@ -456,10 +456,10 @@ mod tests {
                     .get_metric()
                     .iter()
                     .flat_map(|metric| metric.get_label())
-                    .map(|p| p.get_name().to_owned())
+                    .map(|p| p.name().to_owned())
                     .filter(|name| name != "service")
                     .collect();
-                (f.get_name().to_owned(), labels)
+                (f.name().to_owned(), labels)
             })
             .collect();
         let defined = include_str!("metrics.rs")

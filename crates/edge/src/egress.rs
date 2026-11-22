@@ -17,7 +17,7 @@ use ipnet::IpNet;
 use nix::ifaddrs::getifaddrs;
 use nix::net::if_::InterfaceFlags;
 use parking_lot::Mutex;
-use rand::Rng as _;
+use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::breaker::{Breaker, BreakerState, HealthTracker, Transitions};
@@ -370,7 +370,7 @@ impl Pool {
                         d[12], d[13], d[14], d[15],
                     ])
                 }
-                Strategy::Random | Strategy::LeastConnections => rand::thread_rng().r#gen::<u128>(),
+                Strategy::Random | Strategy::LeastConnections => rand::rng().random::<u128>(),
             };
             at(usable(offset))
         };
@@ -379,7 +379,7 @@ impl Pool {
             if !avoid.contains(&chosen) || index.is_some() {
                 break;
             }
-            chosen = at(usable(rand::thread_rng().r#gen::<u128>()));
+            chosen = at(usable(rand::rng().random::<u128>()));
         }
         let addr = Arc::new(Addr {
             ip: chosen,
@@ -784,9 +784,7 @@ impl Pool {
                     let n = self.rr.fetch_add(1, Ordering::Relaxed) % count;
                     candidates.clone().nth(n)
                 }
-                Strategy::Random => candidates
-                    .clone()
-                    .nth(rand::thread_rng().gen_range(0..count)),
+                Strategy::Random => candidates.clone().nth(rand::rng().random_range(0..count)),
                 Strategy::LeastConnections => candidates
                     .clone()
                     .min_by_key(|a| a.open.load(Ordering::Relaxed)),
@@ -916,12 +914,12 @@ pub fn check_prefix(net: &IpNet) -> Result<(), String> {
             IpAddr::V6(b) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(b).wrapping_add(o))),
         }
     };
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let samples = [
         1u128.min(span),
         span.saturating_sub(1).max(1).min(span),
-        rng.r#gen::<u128>() & span,
-        rng.r#gen::<u128>() & span,
+        rng.random::<u128>() & span,
+        rng.random::<u128>() & span,
     ];
     for o in samples {
         let ip = at(o);

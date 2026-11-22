@@ -14,7 +14,7 @@ use common::session::UNIT_MARGIN;
 use common::types::{Partition, ProviderId, Tier};
 use policy::EffectivePolicy;
 use provider::Adapter;
-use rand::Rng as _;
+use rand::RngExt as _;
 use store::loaded::Loaded;
 use store::{Admit, ExitIpClaim, Phase, SessionJob, UnitRecord};
 use time::OffsetDateTime;
@@ -278,7 +278,7 @@ impl Warmer {
             let life = job.adapter.session_life();
             let age = policy.rotating.max_age_for(life);
             // 20% jitter, downwards: sessions of one batch do not all end together.
-            age.mul_f64(1.0 - 0.2 * rand::thread_rng().r#gen::<f64>())
+            age.mul_f64(1.0 - 0.2 * rand::rng().random::<f64>())
         };
         let ip = IpAddr::V4(exit.ip);
         match self

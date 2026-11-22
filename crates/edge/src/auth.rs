@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use common::Secret;
 use moka::sync::Cache;
-use rand::RngCore as _;
+use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::sync::Semaphore;
@@ -248,7 +248,7 @@ impl Users {
             }
         }
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         let dummy_hash = need_dummy
             .then(|| pwhash::bcrypt::hash("proxyx-edge-dummy").ok())
             .flatten();

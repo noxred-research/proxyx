@@ -7,8 +7,8 @@ use std::str::FromStr;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::types::OrgId;
-use rand::RngCore as _;
-use rand::rngs::OsRng;
+use rand::TryRng as _;
+use rand::rngs::SysRng;
 use serde_json::{Value, json};
 use store::{BlockScope, OrgBlock};
 use time::OffsetDateTime;
@@ -152,7 +152,9 @@ pub(crate) fn ensure_secret_name(field: &str, value: &str) -> Result<(), ApiErro
 /// `prefix` and 32 random bytes (256 bits) as URL-safe base64: an org key.
 pub(crate) fn random_token(prefix: &str) -> String {
     let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    SysRng
+        .try_fill_bytes(&mut raw)
+        .expect("the operating system RNG failed");
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(raw))
 }
 

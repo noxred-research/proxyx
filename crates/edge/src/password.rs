@@ -54,7 +54,7 @@ enum Parsed<'a> {
         hash: &'a str,
         digest: &'a str,
     },
-    Argon2(PasswordHash<'a>),
+    Argon2(Box<PasswordHash>),
     Sha1([u8; 20]),
 }
 
@@ -107,25 +107,19 @@ fn parse(hash: &str) -> Result<Parsed<'_>, PasswordError> {
         || hash.starts_with("$argon2i$")
         || hash.starts_with("$argon2d$")
     {
+        // password-hash 0.6 parses the salt while it parses the hash: it refuses a salt that
+        // is not base64 or decodes to fewer than the argon2 minimum of 8 bytes, so a hash like
+        // that fails here, at load time, and not at the first login.
         let parsed = PasswordHash::new(hash).map_err(|_| malformed("invalid argon2 hash"))?;
-        let Some(salt) = parsed.salt.filter(|_| parsed.hash.is_some()) else {
+        if parsed.salt.is_none() || parsed.hash.is_none() {
             return Err(malformed("argon2 hash lacks salt or digest"));
-        };
-        // verify refuses a salt that is not base64 or shorter than the argon2 minimum; a
-        // hash like that must fail here, at load time, and not at the first login.
-        let mut decoded = [0u8; argon2::password_hash::Salt::MAX_LENGTH];
-        let salt = salt
-            .decode_b64(&mut decoded)
-            .map_err(|_| malformed("invalid argon2 salt"))?;
-        if salt.len() < argon2::MIN_SALT_LEN {
-            return Err(malformed("argon2 salt is too short"));
         }
         argon2::Params::try_from(&parsed).map_err(|_| malformed("invalid argon2 parameters"))?;
         if let Some(version) = parsed.version {
             argon2::Version::try_from(version)
                 .map_err(|_| malformed("unsupported argon2 version"))?;
         }
-        return Ok(Parsed::Argon2(parsed));
+        return Ok(Parsed::Argon2(Box::new(parsed)));
     }
     Err(PasswordError::Unsupported)
 }
@@ -253,9 +247,9 @@ pub fn verify(hash: &str, password: &str) -> Result<bool, PasswordError> {
                 .map_err(|_| malformed("sha512-crypt hash rejected"))?;
             Ok(tail_eq(&out, digest, digest.len()))
         }
-        Parsed::Argon2(parsed) => match Argon2::default().verify_password(pw, &parsed) {
+        Parsed::Argon2(parsed) => match Argon2::default().verify_password(pw, &*parsed) {
             Ok(()) => Ok(true),
-            Err(argon2::password_hash::Error::Password) => Ok(false),
+            Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
             Err(_) => Err(malformed("argon2 hash rejected")),
         },
     }
@@ -668,13 +662,10 @@ mod tests {
     #[test]
     fn argon2_round_trip_with_crate() {
         use argon2::PasswordHasher;
-        use argon2::password_hash::SaltString;
-        use argon2::password_hash::rand_core::OsRng;
-        let salt = SaltString::generate(&mut OsRng);
         let params = argon2::Params::new(64, 2, 1, None).expect("params");
         let hasher = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let hash = hasher
-            .hash_password(UNICODE_PW.as_bytes(), &salt)
+            .hash_password(UNICODE_PW.as_bytes())
             .expect("hash")
             .to_string();
         assert!(is_supported(&hash));

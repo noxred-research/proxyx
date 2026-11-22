@@ -6,7 +6,7 @@ use common::Secret;
 use common::config::Settings;
 use common::types::{InventoryEntry, Region, UpstreamEndpoint};
 use provider::{Adapter, ProviderError, UnitSpec};
-use rand::Rng as _;
+use rand::RngExt as _;
 use store::CustomerLogin;
 
 /// Session id length when an adapter does not fix one.
@@ -16,9 +16,9 @@ const DEFAULT_SESSION_ID_LEN: usize = 16;
 pub(crate) fn new_session_id(adapter: &Adapter) -> String {
     let alphabet = adapter.session_id_alphabet();
     let len = adapter.session_id_len().unwrap_or(DEFAULT_SESSION_ID_LEN);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..len)
-        .map(|_| char::from(alphabet[rng.gen_range(0..alphabet.len())]))
+        .map(|_| char::from(alphabet[rng.random_range(0..alphabet.len())]))
         .collect()
 }
 

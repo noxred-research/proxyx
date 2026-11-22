@@ -1870,10 +1870,7 @@ mod integration_tests {
         // Client side: tungstenite over the duplex test_end.
         let mut client_ws = WebSocketStream::from_raw_socket(test_end, Role::Client, None).await;
 
-        client_ws
-            .send(Message::Text("hello".to_string()))
-            .await
-            .unwrap();
+        client_ws.send(Message::Text("hello".into())).await.unwrap();
         let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), client_ws.next())
             .await
             .expect("echo timed out")
@@ -1883,7 +1880,7 @@ mod integration_tests {
         assert_eq!(echoed.into_text().unwrap(), "hello");
 
         client_ws
-            .send(Message::Binary(vec![1, 2, 3, 4, 5]))
+            .send(Message::Binary(vec![1, 2, 3, 4, 5].into()))
             .await
             .unwrap();
         let echoed_bin = tokio::time::timeout(std::time::Duration::from_secs(5), client_ws.next())
@@ -1972,7 +1969,7 @@ mod integration_tests {
             let (sock, _) = listener.accept().await.unwrap();
             let mut ws = WebSocketStream::from_raw_socket(sock, Role::Server, None).await;
             // Push one s2c text frame immediately, before any client traffic.
-            ws.send(Message::Text("first".to_string())).await.unwrap();
+            ws.send(Message::Text("first".into())).await.unwrap();
             // Then echo whatever comes.
             while let Some(Ok(msg)) = ws.next().await {
                 if msg.is_text() {
@@ -2020,10 +2017,7 @@ mod integration_tests {
         assert_eq!(first.into_text().unwrap(), "first");
 
         // Round-trip a follow-up to confirm the proxy is still healthy.
-        client_ws
-            .send(Message::Text("ping".to_string()))
-            .await
-            .unwrap();
+        client_ws.send(Message::Text("ping".into())).await.unwrap();
         let pong = tokio::time::timeout(std::time::Duration::from_secs(5), client_ws.next())
             .await
             .expect("echo timed out")
@@ -2059,7 +2053,7 @@ mod integration_tests {
     /// End-to-end exercise of the `permessage-deflate` capture path through
     /// `proxy_websocket`.
     ///
-    /// `tokio-tungstenite` 0.24 doesn't expose a deflate feature, so this
+    /// `tokio-tungstenite` 0.29 doesn't expose a deflate feature, so this
     /// test crafts the s2c WS frame manually: raw deflate of "hello",
     /// trailer stripped per RFC 7692, RSV1=1. The proxy must inflate into
     /// the captured `WsPipelineEvent` and forward the wire bytes untouched.
