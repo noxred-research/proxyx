@@ -134,8 +134,8 @@ jobs:
     # embedded shell via shellcheck) and zizmor (script injection, excessive permissions,
     # unpinned or impostor actions, credential persistence, cache poisoning). Both tools are
     # pinned: actionlint by release checksum, zizmor by action SHA and exact version.
-    # A script also refuses any job that does not run on the self-hosted runners and any
-    # Dependabot configuration (ci/check-self-hosted-only.py).
+    # A script also refuses any job that does not run on the self-hosted runners
+    # (ci/check-self-hosted-only.py).
     runs-on: [self-hosted, noxred]
     timeout-minutes: 15
     needs: authorize
@@ -149,7 +149,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Self-hosted runners only, no Dependabot version updates
+      - name: Self-hosted runners only
         run: |
           python3 ci/check-self-hosted-only.py --self-test
           python3 ci/check-self-hosted-only.py

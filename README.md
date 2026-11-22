@@ -276,7 +276,7 @@ The Python [prober](prober/README.md) is an optional sidecar that measures candi
 
 ## Contributing
 
-Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks, coding standards and review flow, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). CI runs only on self-hosted runners: the `workflow-lint` check (`ci/check-self-hosted-only.py`) fails any job without the `self-hosted` label. Maintainers update dependencies and container base images by hand.
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the checks, coding standards and review flow, and follow the [Code of Conduct](CODE_OF_CONDUCT.md). CI runs only on self-hosted runners: the `workflow-lint` check (`ci/check-self-hosted-only.py`) fails any job without the `self-hosted` label. Dependabot proposes dependency and container base-image updates; a maintainer brings each one onto a branch of their own.
 
 ## Support the project
 
