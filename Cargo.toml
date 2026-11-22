@@ -79,7 +79,7 @@ sentry = { version = "0.49", default-features = false, features = [
     "rustls",
 ] }
 sentry-tracing = "0.49"
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 pprof = { version = "0.14", features = ["prost-codec"] }
 
 # Error handling
