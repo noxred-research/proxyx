@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 limiter-core = { path = "../limiter-core", package = "proxyx-limiter-core" }
 limiter-proto = { path = "../limiter-proto", package = "proxyx-limiter-proto" }
-parking_lot = "0.12"
+parking_lot = "0.13"
 socket2.workspace = true
 
 [dev-dependencies]
