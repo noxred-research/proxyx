@@ -15,21 +15,13 @@ private = { ignore = true }
 [advisories]
 yanked = "deny"
 unmaintained = "workspace"
-# Each ignore names why the advisory does not apply and when to revisit it.
-ignore = [
-  # libsqlite3-sys: the bundled SQLite misreads a crafted database plus a WAL file of another
-  # page size. SQLx 0.9 now resolves libsqlite3-sys 0.37, but the fix needs 0.39,
-  # outside its supported range (<0.38). ProxyX opens only operator-owned files.
-  { id = "RUSTSEC-2026-0459", reason = "needs local write access to the database directory; revisit with the next sqlx release" },
-]
-# RUSTSEC-2026-0543 (chrono, unmaintained, no vulnerability) is deliberately NOT ignored. No
-# ProxyX crate depends on `chrono` directly any more: `rskafka` 0.6.0 pulls it in and re-exports it
-# for its record timestamp, and `unmaintained = "workspace"` only reports direct workspace
-# dependencies, so `cargo deny` passes (an ignore entry would only warn `advisory-not-detected`).
-# Scanners that read `Cargo.lock` (OpenSSF Scorecard, OSV) still report it. Upstream issue:
-# https://github.com/influxdata/rskafka/issues/311.
-# REVIEW BY 2026-12-31: bump rskafka once a release drops chrono. If a ProxyX crate ever depends on
-# chrono directly again, add the ignore here with a reason and the same expiry.
+# An ignore names why the advisory does not apply and when to revisit it. There is none now.
+ignore = []
+# RUSTSEC-2026-0543 (chrono, unmaintained, no vulnerability) is not ignored and not present:
+# `rskafka` 0.6.0, the newest release, depends on `chrono`, so the workspace patches it with
+# `vendor/rskafka`, a copy that takes `std::time::SystemTime` instead. `Cargo.lock` has no
+# `chrono`. Upstream issue: https://github.com/influxdata/rskafka/issues/311. Drop the patch
+# once a release without `chrono` exists.
 
 [bans]
 multiple-versions = "warn"

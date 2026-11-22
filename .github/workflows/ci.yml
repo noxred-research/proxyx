@@ -292,6 +292,8 @@ jobs:
           PROXYX_TEST_S3_ENDPOINT="$PROXYX_TEST_S3_MINIO_ENDPOINT" \
             cargo test --locked -p proxyx-control --test object_store
           cargo test --locked -p proxyx-store --test shared_redis --test shared_database
+          # record and offset timestamps through the vendored Kafka client (vendor/rskafka)
+          cargo test --locked -p proxyx-session-common --test kafka_timestamps
       - name: Remove the backend services
         if: always()
         run: ci/backends-down.sh

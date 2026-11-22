@@ -6,7 +6,13 @@ This inventory was compiled from the repository tree and each item's own metadat
 
 ## Rust dependencies
 
-ProxyX vendors no third-party source code. All Rust dependencies are fetched from crates.io at build time and pinned in [`Cargo.lock`](Cargo.lock); the workspace crates are `publish = false`.
+ProxyX vendors one third-party crate, `rskafka` (see below). All other Rust dependencies are fetched from crates.io at build time and pinned in [`Cargo.lock`](Cargo.lock); the workspace crates are `publish = false`.
+
+| Directory | Crate | Version | License (from `Cargo.toml`) | Upstream | License files present |
+| --- | --- | --- | --- | --- | --- |
+| `vendor/rskafka/` | `rskafka` | 0.6.0 | `MIT OR Apache-2.0` | <https://github.com/influxdata/rskafka> | `LICENSE-MIT` and `LICENSE-APACHE` |
+
+`rskafka` replaces its crates.io counterpart through `[patch.crates-io]` in `Cargo.toml` and is excluded from the workspace member list. The local changes remove its `chrono` dependency (the crate is reported as unmaintained, RUSTSEC-2026-0543): record and offset timestamps are `std::time::SystemTime`, with public millisecond conversion helpers; a record's `timestamp_delta` in a produce request is floor(ms) minus floor(first ms), which differs from upstream's truncated difference by at most 1 ms for sub-millisecond inputs; `dead_code` is allowed; the crate documentation replaces the README include; four comments are reworded. The header of `vendor/rskafka/Cargo.toml` lists every change. The upstream manifest is kept as `vendor/rskafka/Cargo.toml.upstream`; the upstream tests, benchmarks and CI files are not vendored. Copyright (c) 2020 InfluxData.
 
 The set of licenses a dependency may carry is enforced in CI by `cargo deny` using [`deny.toml`](deny.toml). The allowed licenses are Apache-2.0 (also with the LLVM exception), MIT, MIT-0, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Unicode-DFS-2016, Zlib, MPL-2.0, CC0-1.0, OpenSSL, BSL-1.0 and CDLA-Permissive-2.0. A dependency under any other license fails the build.
 
@@ -22,7 +28,7 @@ The following native components can be built from source by Cargo build scripts 
 | aws-lc and ring | `aws-lc-sys` 0.47.0, `ring` 0.17.14 | rustls cryptography | aws-lc's full license expression combines ISC, Apache-2.0, MIT, BSD-3-Clause and MIT-0; see its crate metadata and bundled notices. ring is Apache-2.0 AND ISC |
 | librdkafka | `rdkafka-sys` 4.10.0+2.12.1 | the control plane's Kafka consumer | BSD-2-Clause, with the licenses of its bundled sources in the crate |
 | jemalloc | `tikv-jemalloc-sys` 0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8 | allocator of both binaries | jemalloc is BSD-2-Clause; the crate is MIT OR Apache-2.0 |
-| SQLite | `libsqlite3-sys` 0.37.0 | SQLx SQLite backend | SQLite is public domain; the Rust bindings are MIT |
+| SQLite | `libsqlite3-sys` 0.40.0 | SQLx SQLite backend | SQLite is public domain; the Rust bindings are MIT |
 | LZ4 | `lz4-sys` 1.11.1+lz4-1.10.0 | capture and broker compression | bundled LZ4 library is BSD-2-Clause; the bindings are MIT |
 | Zstandard | `zstd-sys` 2.1.2+zstd.1.5.7 | capture and broker compression | BSD-3-Clause |
 | zlib | `libz-sys` 1.1.33 | librdkafka compression | bundled zlib is Zlib; the bindings are MIT OR Apache-2.0 |
