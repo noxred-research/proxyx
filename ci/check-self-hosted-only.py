@@ -11,9 +11,10 @@ Checks, all of which must pass (exit status 0):
 2. A job that calls a reusable workflow (job-level `uses:`) calls one of this repository
    (`./.github/workflows/...`), which this gate checks as well. A call of another repository's
    workflow is refused, because the callee decides where it runs.
-3. Neither `.github/dependabot.yml` nor `.github/dependabot.yaml` exists. Dependabot version
-   updates run on GitHub-hosted runners; dependency and base-image updates are done by
-   maintainers.
+
+A Dependabot configuration (`.github/dependabot.yml`) is allowed: the update jobs are run by GitHub
+and no workflow of this repository is involved. Dependabot pull requests do not run CI (the
+`authorize` job admits code owners only); a maintainer brings each update onto a branch of their own.
 
 The parser is line based and needs no YAML library: it reads the job keys at the job's own
 indentation, which is enough for the forms above. Comments are ignored.
@@ -136,12 +137,6 @@ def check_workflow(text: str, label: str) -> list[str]:
 def check_tree(root: Path) -> list[str]:
     findings: list[str] = []
     github = root / ".github"
-    for name in ("dependabot.yml", "dependabot.yaml"):
-        if (github / name).exists():
-            findings.append(
-                f".github/{name}:1: Dependabot version updates run on GitHub-hosted runners; "
-                "delete the file and update dependencies by hand"
-            )
     workflows = sorted((github / "workflows").glob("*.y*ml")) if (github / "workflows").is_dir() else []
     for path in workflows:
         if path.suffix not in (".yml", ".yaml"):
