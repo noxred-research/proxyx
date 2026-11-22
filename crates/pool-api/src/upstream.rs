@@ -235,6 +235,19 @@ pub(crate) struct SetBody {
     password: Option<Secret>,
 }
 
+impl SetBody {
+    /// The checks of an upstream that need no adapter, no lookup and no store: the port, the
+    /// host and the login.
+    pub(crate) fn checked(&self) -> Result<(), ApiError> {
+        if self.port == 0 {
+            return Err(ApiError::bad_request("port must be 1 to 65535"));
+        }
+        plain_host(&self.host)?;
+        login_of(self.username.clone(), self.password.clone())?;
+        Ok(())
+    }
+}
+
 /// `PUT /v1/orgs/{org}/upstream`: set the org's upstream. It starts as
 /// `candidate` and is not leased until `validate` passes.
 pub(crate) async fn set(
@@ -352,6 +365,16 @@ pub(crate) struct RotateBody {
     password: Secret,
     /// Unset: the stored username stays.
     username: Option<Secret>,
+}
+
+impl RotateBody {
+    /// The login the request would store, checked as `rotate_secret` checks it.
+    pub(crate) fn checked(&self) -> Result<(), ApiError> {
+        ensure_login(
+            self.username.as_ref().unwrap_or(&self.password),
+            &self.password,
+        )
+    }
 }
 
 /// `POST /v1/orgs/{org}/upstream/rotate-secret`: replace the stored login
@@ -575,6 +598,8 @@ mod tests {
             "8.8.8.8",
             "[2001:4860:4860::8888]",
             "A.b-c.d_e",
+            "1234.example.com",
+            "0x7f.example.com",
         ] {
             assert!(plain_host(ok).is_ok(), "{ok}");
         }
@@ -597,6 +622,14 @@ mod tests {
             "pro xy",
             "proxy\r\nHost: x",
             &"a".repeat(64),
+            // a last label that is a number is read as an IPv4 number or refused by a URL
+            // parser, never as a DNS name
+            "127.1",
+            "0x7f.1",
+            "gw.example.0x0c",
+            "gw.example.123",
+            "gw.example.0x",
+            "gw.example.0X",
         ] {
             assert!(plain_host(bad).is_err(), "{bad:?} accepted");
         }

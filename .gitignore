@@ -54,3 +54,10 @@ __pycache__/
 .DS_Store
 perf.data*
 flamegraph.svg
+
+# cargo-fuzz workspace: build output, crash artifacts and coverage; the seed
+# corpora under fuzz/corpus/ are committed
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/Cargo.lock

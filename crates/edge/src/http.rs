@@ -133,7 +133,9 @@ fn parse_basic(h: &[Header]) -> Option<(String, String)> {
     parse_basic_value(header_str(h, "proxy-authorization")?)
 }
 
-pub(crate) fn parse_basic_value(value: &str) -> Option<(String, String)> {
+/// The user and the password of a `Proxy-Authorization` value (`Basic base64(user:password)`);
+/// `None` for another scheme, bad base64, text that is not UTF-8 or a missing `:`.
+pub fn parse_basic_value(value: &str) -> Option<(String, String)> {
     let v = value.trim();
     let (scheme, enc) = v.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {

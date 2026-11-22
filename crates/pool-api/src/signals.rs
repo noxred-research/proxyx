@@ -37,24 +37,29 @@ pub(crate) struct Event {
     time: i64,
 }
 
+/// The host of every event, after the batch size check. A bad event refuses the whole batch
+/// before any is applied, so the session proxy's retry of it does not count the earlier
+/// events twice.
+pub(crate) fn batch_hosts(events: &[Event]) -> Result<Vec<String>, ApiError> {
+    if events.len() > MAX_EVENTS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_EVENTS} events per batch"
+        )));
+    }
+    events
+        .iter()
+        .map(|e| parse_host(&e.target))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| ApiError::bad_request("an event has an invalid target"))
+}
+
 /// `POST /v1/block-signals`: HTTP Basic, the password is the org key.
 pub(crate) async fn block_signals(
     State(state): State<Arc<ApiState>>,
     OrgAuth(org): OrgAuth,
     ApiJsonList(events): ApiJsonList<Vec<Event>>,
 ) -> Result<Json<Value>, ApiError> {
-    if events.len() > MAX_EVENTS {
-        return Err(ApiError::bad_request(format!(
-            "at most {MAX_EVENTS} events per batch"
-        )));
-    }
-    // A bad event refuses the whole batch before any is applied, so the session proxy's
-    // retry of it does not count the earlier events twice.
-    let hosts = events
-        .iter()
-        .map(|e| parse_host(&e.target))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| ApiError::bad_request("an event has an invalid target"))?;
+    let hosts = batch_hosts(&events)?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let loaded = state.loaded.borrow().clone();
     // What names a batch for its retry: its events in order.
@@ -143,6 +148,16 @@ pub(crate) struct OperatorReport {
     session: Option<String>,
 }
 
+impl OperatorReport {
+    /// The host of the reported target; none: the IP is blocked everywhere.
+    pub(crate) fn host(&self) -> Result<Option<String>, ApiError> {
+        self.target
+            .as_deref()
+            .map(|t| parse_host(t).ok_or_else(|| ApiError::bad_request("invalid target")))
+            .transpose()
+    }
+}
+
 fn default_type() -> SignalType {
     SignalType::Forbidden
 }
@@ -158,11 +173,7 @@ pub(crate) async fn operator_block(
     let ip: IpAddr = ip
         .parse()
         .map_err(|_| ApiError::bad_request("the path is not an ip address"))?;
-    let host = report
-        .target
-        .as_deref()
-        .map(|t| parse_host(t).ok_or_else(|| ApiError::bad_request("invalid target")))
-        .transpose()?;
+    let host = report.host()?;
     let subject = match state.db.inventory_row(ip).await? {
         Some(row) => Subject {
             partition: row.partition(),

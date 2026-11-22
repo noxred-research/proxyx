@@ -316,6 +316,55 @@ jobs:
           .venv/bin/pip install --require-hashes --no-deps -r requirements-test.txt
           .venv/bin/python -m pytest -q tests
 
+  fuzz-short:
+    # cargo-fuzz smoke: every target 60 s from its committed corpus on pull requests, 10 min
+    # per target nightly. The targets also build on stable as stdin binaries (`cargo check
+    # --manifest-path fuzz/Cargo.toml`), which the lint job does not cover. A crash input is
+    # printed (base64) in the log of the failing step; save it under `fuzz/corpus/<target>/`
+    # with a regression test once the bug is fixed.
+    runs-on: [self-hosted, noxred]
+    timeout-minutes: ${{ github.event_name == 'schedule' && 180 || 60 }}
+    needs: authorize
+    if: needs.authorize.outputs.ok == 'true'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Native build dependencies (BoringSSL, librdkafka, protobuf)
+        run: ci/install-build-deps.sh
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10
+        with:
+          toolchain: stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target
+        env:
+          SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '600' || '60' }}
+          # The nightly compiler warns about code the pinned toolchain accepts; `-D warnings`
+          # belongs to the stable lint job, not to a sanitizer build.
+          RUSTFLAGS: ""
+        run: |
+          cd fuzz
+          for target in htpasswd_parse password_verify basic_header login_split pool_api_body pool_api_endpoint; do
+            cargo +nightly fuzz run "$target" "corpus/$target" -- -max_total_time="$SECONDS_PER_TARGET" -max_len=65536 -timeout=20
+          done
+      - name: Crash inputs
+        if: failure()
+        run: |
+          for f in fuzz/artifacts/*/*; do
+            [ -f "$f" ] || continue
+            echo "== $f"
+            base64 "$f"
+          done
+
   # Skipped jobs count as passed for a required check, so the gated jobs themselves cannot be
   # required: this job always runs and fails unless the gate admitted the event and every
   # merge-blocking job succeeded.
@@ -330,6 +379,7 @@ jobs:
       - unit
       - backends
       - prober
+      - fuzz-short
     if: always()
     permissions: {}
     steps:

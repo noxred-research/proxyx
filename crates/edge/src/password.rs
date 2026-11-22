@@ -108,10 +108,23 @@ fn parse(hash: &str) -> Result<Parsed<'_>, PasswordError> {
         || hash.starts_with("$argon2d$")
     {
         let parsed = PasswordHash::new(hash).map_err(|_| malformed("invalid argon2 hash"))?;
-        if parsed.hash.is_none() || parsed.salt.is_none() {
+        let Some(salt) = parsed.salt.filter(|_| parsed.hash.is_some()) else {
             return Err(malformed("argon2 hash lacks salt or digest"));
+        };
+        // verify refuses a salt that is not base64 or shorter than the argon2 minimum; a
+        // hash like that must fail here, at load time, and not at the first login.
+        let mut decoded = [0u8; argon2::password_hash::Salt::MAX_LENGTH];
+        let salt = salt
+            .decode_b64(&mut decoded)
+            .map_err(|_| malformed("invalid argon2 salt"))?;
+        if salt.len() < argon2::MIN_SALT_LEN {
+            return Err(malformed("argon2 salt is too short"));
         }
         argon2::Params::try_from(&parsed).map_err(|_| malformed("invalid argon2 parameters"))?;
+        if let Some(version) = parsed.version {
+            argon2::Version::try_from(version)
+                .map_err(|_| malformed("unsupported argon2 version"))?;
+        }
         return Ok(Parsed::Argon2(parsed));
     }
     Err(PasswordError::Unsupported)
@@ -726,6 +739,10 @@ mod tests {
             "$argon2id$v=19$m=64,t=2,p=1",
             "$argon2id$v=19$m=64,t=2,p=1$c29tZXNhbHQ",
             "$argon2id$v=19$m=0,t=0,p=0$c29tZXNhbHQxMjM0NTY3OA$o9++TK5QP+5YLuLn3BKOuPYkAtiyr//yLuowjqqS2p4",
+            // a salt of 4 bytes: the argon2 minimum is 8
+            "$argon2id$v=19$m=64,t=2,p=1$c2FsdA$o9++TK5QP+5YLuLn3BKOuPYkAtiyr//yLuowjqqS2p4",
+            // version 37 does not exist: 16 (0x10) and 19 (0x13) are the two argon2 knows
+            "$argon2id$v=37$m=64,t=2,p=1$c29tZXNhbHQxMjM0NTY3OA$o9++TK5QP+5YLuLn3BKOuPYkAtiyr//yLuowjqqS2p4",
         ];
         for hash in broken {
             assert!(!is_supported(hash), "{hash}");

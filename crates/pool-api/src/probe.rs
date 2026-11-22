@@ -164,6 +164,24 @@ pub(crate) struct Results {
     results: Vec<Run>,
 }
 
+impl Results {
+    /// The job a result answers: the run count is bounded, and a sample names a plain job id.
+    pub(crate) fn job_id(&self) -> Result<Option<String>, ApiError> {
+        if self.results.is_empty() || self.results.len() > MAX_RUNS {
+            return Err(ApiError::bad_request(format!(
+                "send between 1 and {MAX_RUNS} runs"
+            )));
+        }
+        match (self.kind, self.job_id.as_deref()) {
+            (Kind::Sample, Some(id)) if plain_id(id) => Ok(Some(id.to_owned())),
+            (Kind::Sample, _) => Err(ApiError::bad_request(format!(
+                "a sample result needs a job_id of 1 to {MAX_ID_LEN} of [A-Za-z0-9_-]"
+            ))),
+            (Kind::Canary, _) => Ok(None),
+        }
+    }
+}
+
 /// Judge a result against the criteria: a run is good when it loaded and
 /// stayed within the time limits; the verdict passes when the share of good
 /// runs reaches `min_success`. It is `slow` when it fails only for speed: no
@@ -229,20 +247,7 @@ pub(crate) async fn results(
     State(state): State<Arc<ApiState>>,
     ApiJson(body): ApiJson<Results>,
 ) -> Result<Json<Value>, ApiError> {
-    if body.results.is_empty() || body.results.len() > MAX_RUNS {
-        return Err(ApiError::bad_request(format!(
-            "send between 1 and {MAX_RUNS} runs"
-        )));
-    }
-    let job_id = match (body.kind, body.job_id) {
-        (Kind::Sample, Some(id)) if plain_id(&id) => Some(id),
-        (Kind::Sample, _) => {
-            return Err(ApiError::bad_request(format!(
-                "a sample result needs a job_id of 1 to {MAX_ID_LEN} of [A-Za-z0-9_-]"
-            )));
-        }
-        (Kind::Canary, _) => None,
-    };
+    let job_id = body.job_id()?;
     let partition = Partition {
         provider: body.provider,
         region: body.region,

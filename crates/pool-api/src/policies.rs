@@ -46,6 +46,18 @@ pub(crate) struct PutBody {
     policies: Vec<PolicyDoc>,
 }
 
+impl PutBody {
+    /// The documents of the request, between 1 and [`MAX_POLICIES`] of them.
+    pub(crate) fn docs(self) -> Result<Vec<PolicyDoc>, ApiError> {
+        if self.policies.is_empty() || self.policies.len() > MAX_POLICIES {
+            return Err(ApiError::bad_request(format!(
+                "send between 1 and {MAX_POLICIES} policies"
+            )));
+        }
+        Ok(self.policies)
+    }
+}
+
 /// `PUT /v1/policies`: store each document as a new version when it differs
 /// from the current one. A git file that changes later wins over a document
 /// written here.
@@ -54,12 +66,8 @@ pub(crate) async fn put(
     Actor(actor): Actor,
     ApiJson(body): ApiJson<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if body.policies.is_empty() || body.policies.len() > MAX_POLICIES {
-        return Err(ApiError::bad_request(format!(
-            "send between 1 and {MAX_POLICIES} policies"
-        )));
-    }
-    let put = validated_put(&state, body.policies, &actor).await?;
+    let docs = body.docs()?;
+    let put = validated_put(&state, docs, &actor).await?;
     Ok(Json(put_json(&put)))
 }
 
@@ -138,6 +146,14 @@ pub(crate) async fn put_org(
     ApiJson(body): ApiJson<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let org = parse_org(&org)?;
+    let doc = org_doc(&org, body)?;
+    let put = validated_put(&state, vec![doc], &actor).await?;
+    Ok(Json(put_json(&put)))
+}
+
+/// The one document of an org's cache-policy body: scope `org`, `match` the org and `name`
+/// `org-<org>` unless the body says otherwise.
+pub(crate) fn org_doc(org: &OrgId, body: Value) -> Result<PolicyDoc, ApiError> {
     let Value::Object(mut fields) = body else {
         return Err(ApiError::bad_request("the body must be a policy object"));
     };
@@ -146,10 +162,8 @@ pub(crate) async fn put_org(
     fields
         .entry("name")
         .or_insert_with(|| json!(format!("org-{org}")));
-    let doc: PolicyDoc = serde_json::from_value(Value::Object(fields))
-        .map_err(|e| ApiError::bad_request(format!("invalid policy: {e}")))?;
-    let put = validated_put(&state, vec![doc], &actor).await?;
-    Ok(Json(put_json(&put)))
+    serde_json::from_value(Value::Object(fields))
+        .map_err(|e| ApiError::bad_request(format!("invalid policy: {e}")))
 }
 
 /// Set `key` to `value`, or refuse when the body names something else.
@@ -286,7 +300,7 @@ fn serves(
 
 /// A name Postgres can store and no NUL byte anywhere in the document
 /// (`jsonb` refuses it).
-fn ensure_doc_text(doc: &PolicyDoc) -> Result<(), ApiError> {
+pub(crate) fn ensure_doc_text(doc: &PolicyDoc) -> Result<(), ApiError> {
     ensure_text("name", &doc.name, MAX_NAME_LEN)?;
     let value = serde_json::to_value(doc)
         .map_err(|e| ApiError::bad_request(format!("invalid policy: {e}")))?;

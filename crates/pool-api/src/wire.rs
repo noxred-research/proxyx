@@ -67,6 +67,9 @@ pub(crate) fn ensure_text(field: &str, value: &str, max: usize) -> Result<(), Ap
 
 /// The host as an IP literal without brackets or a plain DNS name; refuses
 /// anything that could smuggle a scheme, a path, a login or a second host.
+/// A name whose last label is a number (`127.1`, `host.0x0c`) is no DNS name: resolvers
+/// and URL parsers read it as an IPv4 number or refuse it, so it would not mean the same
+/// to the check and to the client that dials the exported URL.
 pub(crate) fn plain_host(raw: &str) -> Result<String, ApiError> {
     let host = raw.trim();
     let bare = host
@@ -84,7 +87,8 @@ pub(crate) fn plain_host(raw: &str) -> Result<String, ApiError> {
                 && label
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        });
+        })
+        && !host.rsplit('.').next().is_some_and(is_number_label);
     if name {
         Ok(host.to_ascii_lowercase())
     } else {
@@ -92,6 +96,16 @@ pub(crate) fn plain_host(raw: &str) -> Result<String, ApiError> {
             "host must be an IP address or a DNS name, without scheme, port or path",
         ))
     }
+}
+
+/// A label a URL parser reads as a number: decimal digits, or `0x` and any number of hex
+/// digits (`0x` alone counts).
+fn is_number_label(label: &str) -> bool {
+    label.bytes().all(|b| b.is_ascii_digit())
+        || label
+            .strip_prefix("0x")
+            .or_else(|| label.strip_prefix("0X"))
+            .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Refuse an address that can never be the exit of a rented or customer
