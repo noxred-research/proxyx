@@ -613,7 +613,7 @@ impl ProducerInner {
                         key: Some(key.to_vec()),
                         value: Some(payload.to_vec()),
                         headers: BTreeMap::new(),
-                        timestamp: record_timestamp(),
+                        timestamp: std::time::SystemTime::now(),
                     }
                 })
                 .collect();
@@ -716,20 +716,6 @@ fn fail_all(count: usize, why: &str) -> Vec<PublishOutcome> {
     (0..count)
         .map(|_| PublishOutcome::Failed(anyhow!("{why}")))
         .collect()
-}
-
-/// Timestamp of a produced record, from the system clock to the millisecond (all Kafka keeps).
-///
-/// `rskafka::record::Record::timestamp` is a `chrono::DateTime<Utc>`. The type comes from
-/// `rskafka`'s own re-export and no `chrono` clock feature is used, so this workspace has no
-/// direct `chrono` dependency (the crate is flagged unmaintained, RUSTSEC-2026-0543).
-fn record_timestamp() -> rskafka::chrono::DateTime<rskafka::chrono::Utc> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
-        });
-    rskafka::chrono::DateTime::from_timestamp_millis(millis).unwrap_or_default()
 }
 
 struct PartitionState {
@@ -1145,23 +1131,6 @@ mod tests {
     use super::*;
     use rskafka::client::error::Error as ClientError;
     use std::pin::Pin;
-
-    #[test]
-    fn record_timestamp_is_the_current_wall_clock_time() {
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let stamp = record_timestamp().timestamp_millis();
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        assert!(
-            (before..=after).contains(&stamp),
-            "{stamp} not in {before}..={after}"
-        );
-    }
 
     /// Partition client that records the values of each produce request and
     /// fails the requests whose 0-based number is in `fail_requests`.

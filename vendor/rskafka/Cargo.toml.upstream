@@ -1,0 +1,106 @@
+[package]
+name = "rskafka"
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = [
+    "api",
+    "async",
+    "kafka",
+    "protocol",
+]
+categories = ["api-bindings"]
+description = " A minimal Rust client for Apache Kafka "
+repository = "https://github.com/influxdata/rskafka/"
+documentation = "https://docs.rs/rskafka/"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-socks5 = { version = "0.6", optional = true }
+bytes = "1.1"
+chrono = { version = "0.4", default-features = false }
+crc32c = "0.6.5"
+flate2 = { version = "1", optional = true }
+futures = "0.3"
+integer-encoding = "4"
+lz4 = { version = "1.23", optional = true }
+parking_lot = "0.12"
+rand = "0.8"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["logging", "ring", "std", "tls12"] }
+snap = { version = "1", optional = true }
+thiserror = "1.0"
+tokio = { version = "1.19", default-features = false, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["logging", "ring", "tls12"] }
+tracing = "0.1"
+zstd = { version = "0.13", optional = true }
+rsasl = { version = "2.1", default-features = false, features = ["config_builder", "provider", "plain", "scram-sha-2", "oauthbearer"]}
+
+[dev-dependencies]
+assert_matches = "1.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
+dotenvy = "0.15.1"
+futures = "0.3"
+j4rs = "0.20.0"
+proptest = "1"
+proptest-derive = "0.5"
+rustls-pemfile = "2.0"
+rdkafka = { version = "0.35", default-features = false, features = ["libz", "tokio", "zstd"] }
+tokio = { version = "1.14", features = ["macros", "rt-multi-thread"] }
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+[features]
+default = [
+    "compression-gzip",
+    "compression-lz4",
+    "compression-snappy",
+    "compression-zstd",
+]
+
+full = [
+    "compression-gzip",
+    "compression-lz4",
+    "compression-snappy",
+    "compression-zstd",
+    "transport-socks5",
+    "transport-tls",
+]
+
+compression-gzip = ["flate2"]
+compression-lz4 = ["lz4"]
+compression-snappy = ["snap"]
+compression-zstd = ["zstd"]
+
+transport-socks5 = ["async-socks5"]
+transport-tls = ["rustls", "tokio-rustls"]
+
+unstable-fuzzing = []
+
+[lib]
+# For `cargo bench -- --save-baseline ...`
+# See https://github.com/bheisler/criterion.rs/issues/275.
+bench = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[workspace]
+members = [
+    ".",
+    "fuzz",
+]
+
+[profile.bench]
+debug = true
+
+# tune release profile for fuzzing
+[profile.release]
+debug = true
+
+[package.metadata.docs.rs]
+all-features = true

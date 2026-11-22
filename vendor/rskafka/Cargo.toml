@@ -1,0 +1,164 @@
+# Vendored rskafka 0.6.0 with `chrono` removed. The changes against the upstream 0.6.0 source:
+#  - `record::Record::timestamp` and `client::partition::OffsetAt::Timestamp` take a
+#    `std::time::SystemTime` instead of a `chrono::DateTime<Utc>`; the `chrono` re-export is gone.
+#    `record::unix_millis` and `record::from_unix_millis` (public here so the workspace can test
+#    them) convert to and from Kafka's epoch milliseconds, rounding toward negative infinity.
+#  - Produce requests compute each record's `timestamp_delta` as floor(ms) - floor(first ms); upstream
+#    truncated the nanosecond difference, which differs by 1 ms only for sub-millisecond inputs.
+#  - Tests, doc examples and the crate documentation follow the type change (the upstream README is
+#    not vendored, so `lib.rs` carries a short crate doc instead); four comments in
+#    `protocol/primitives.rs` are reworded for the repository's provenance lint.
+#  - `[lints.rust] dead_code = "allow"`: a path dependency is not subject to Cargo's lint cap, and
+#    CI builds with `-D warnings`; the dropped chrono paths and unused protocol code would fail it.
+# RUSTSEC-2026-0543 reports chrono as unmaintained and rskafka 0.6.0 (the newest release) cannot drop
+# it. The upstream manifest is kept as `Cargo.toml.upstream`; upstream tests, benches and CI files are
+# not vendored (the vendored crate is not a workspace member). Remove this directory and the
+# `[patch.crates-io]` entry once a release without chrono exists.
+
+[package]
+edition = "2024"
+rust-version = "1.85"
+name = "rskafka"
+version = "0.6.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = " A minimal Rust client for Apache Kafka "
+documentation = "https://docs.rs/rskafka/"
+keywords = [
+    "api",
+    "async",
+    "kafka",
+    "protocol",
+]
+categories = ["api-bindings"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/influxdata/rskafka/"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+compression-gzip = ["flate2"]
+compression-lz4 = ["lz4"]
+compression-snappy = ["snap"]
+compression-zstd = ["zstd"]
+default = [
+    "compression-gzip",
+    "compression-lz4",
+    "compression-snappy",
+    "compression-zstd",
+]
+full = [
+    "compression-gzip",
+    "compression-lz4",
+    "compression-snappy",
+    "compression-zstd",
+    "transport-socks5",
+    "transport-tls",
+]
+transport-socks5 = ["async-socks5"]
+transport-tls = [
+    "rustls",
+    "tokio-rustls",
+]
+unstable-fuzzing = []
+
+[lib]
+name = "rskafka"
+path = "src/lib.rs"
+bench = false
+
+[dependencies.async-socks5]
+version = "0.6"
+optional = true
+
+[dependencies.bytes]
+version = "1.1"
+
+[dependencies.crc32c]
+version = "0.6.5"
+
+[dependencies.flate2]
+version = "1"
+optional = true
+
+[dependencies.futures]
+version = "0.3"
+
+[dependencies.integer-encoding]
+version = "4"
+
+[dependencies.lz4]
+version = "1.23"
+optional = true
+
+[dependencies.parking_lot]
+version = "0.12"
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.rsasl]
+version = "2.1"
+features = [
+    "config_builder",
+    "provider",
+    "plain",
+    "scram-sha-2",
+    "oauthbearer",
+]
+default-features = false
+
+[dependencies.rustls]
+version = "0.23"
+features = [
+    "logging",
+    "ring",
+    "std",
+    "tls12",
+]
+optional = true
+default-features = false
+
+[dependencies.snap]
+version = "1"
+optional = true
+
+[dependencies.thiserror]
+version = "1.0"
+
+[dependencies.tokio]
+version = "1.19"
+features = [
+    "io-util",
+    "net",
+    "rt",
+    "sync",
+    "time",
+    "macros",
+]
+default-features = false
+
+[dependencies.tokio-rustls]
+version = "0.26"
+features = [
+    "logging",
+    "ring",
+    "tls12",
+]
+optional = true
+default-features = false
+
+[dependencies.tracing]
+version = "0.1"
+
+[dependencies.zstd]
+version = "0.13"
+optional = true
+
+[lints.rust]
+dead_code = "allow"
