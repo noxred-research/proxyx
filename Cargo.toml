@@ -177,7 +177,7 @@ hickory-resolver = "0.26"
 subtle = "2"
 rand = "0.10"
 libc = "0.2"
-nix = { version = "0.31", default-features = false, features = ["net", "socket"] }
+nix = { version = "0.32", default-features = false, features = ["net", "socket"] }
 socket2 = { version = "0.6", features = ["all"] }
 tikv-jemallocator = "0.7"
 
